@@ -1,0 +1,5 @@
+inc : i64 -> i64
+inc x = x + 1
+
+main : i64[n] -> i64[n]
+main xs = inc xs

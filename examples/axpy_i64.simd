@@ -1,0 +1,5 @@
+axpy : i64 -> i64 -> i64 -> i64
+axpy a x y = a * x + y
+
+main : i64 -> i64[n] -> i64[n] -> i64[n]
+main a xs ys = axpy a xs ys

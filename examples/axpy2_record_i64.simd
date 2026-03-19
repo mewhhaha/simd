@@ -1,0 +1,5 @@
+axpy2 : i64 -> {x:i64,y:i64} -> {x:i64,y:i64} -> {x:i64,y:i64}
+axpy2 a u v = { x = a * u.x + v.x, y = a * u.y + v.y }
+
+main : i64 -> {x:i64,y:i64}[n] -> {x:i64,y:i64}[n] -> {x:i64,y:i64}[n]
+main a us vs = axpy2 a us vs

@@ -1,0 +1,6 @@
+pow2 : i64 -> i64 -> i64
+pow2 0 x = x
+pow2 n x = pow2 (n - 1) (x * 2)
+
+main : i64[n] -> i64[n]
+main xs = pow2 3 xs

@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>simd wat inspector</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #0b1020;
+        --panel: #11182d;
+        --panel-alt: #162038;
+        --border: #27324d;
+        --text: #e5edf7;
+        --muted: #96a4bf;
+        --accent: #7dd3fc;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        color: var(--text);
+        background: var(--bg);
+      }
+
+      .app {
+        min-height: 100vh;
+        display: grid;
+        grid-template-rows: auto 1fr;
+      }
+
+      .toolbar {
+        display: flex;
+        gap: 12px;
+        align-items: center;
+        padding: 12px 16px;
+        border-bottom: 1px solid var(--border);
+        background: #0f172b;
+      }
+
+      .toolbar strong {
+        font-size: 14px;
+        color: var(--text);
+      }
+
+      .toolbar label,
+      .meta {
+        color: var(--muted);
+        font-size: 13px;
+      }
+
+      select {
+        min-width: 240px;
+        padding: 8px 10px;
+        border: 1px solid var(--border);
+        background: var(--panel);
+        color: var(--text);
+        font: inherit;
+        border-radius: 8px;
+        outline: none;
+      }
+
+      select:focus {
+        border-color: var(--accent);
+        box-shadow: 0 0 0 2px rgba(125, 211, 252, 0.18);
+      }
+
+      .panes {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        min-height: 0;
+      }
+
+      .pane {
+        min-width: 0;
+        display: grid;
+        grid-template-rows: auto 1fr;
+      }
+
+      .pane + .pane {
+        border-left: 1px solid var(--border);
+      }
+
+      .pane-header {
+        display: flex;
+        justify-content: space-between;
+        gap: 12px;
+        padding: 10px 14px;
+        border-bottom: 1px solid var(--border);
+        background: var(--panel-alt);
+        font-size: 12px;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        color: var(--muted);
+      }
+
+      pre {
+        margin: 0;
+        padding: 16px;
+        overflow: auto;
+        white-space: pre;
+        font-size: 13px;
+        line-height: 1.5;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+        background: var(--panel);
+        color: var(--text);
+      }
+
+      @media (max-width: 900px) {
+        .panes {
+          grid-template-columns: 1fr;
+        }
+
+        .pane + .pane {
+          border-left: 0;
+          border-top: 1px solid var(--border);
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main class="app">
+      <section class="toolbar">
+        <strong>simd wat inspector</strong>
+        <label for="preset">preset</label>
+        <select id="preset"></select>
+        <span id="summary" class="meta"></span>
+      </section>
+      <section class="panes">
+        <article class="pane">
+          <div class="pane-header">
+            <span>Source</span>
+            <span id="source-meta"></span>
+          </div>
+          <pre id="source"></pre>
+        </article>
+        <article class="pane">
+          <div class="pane-header">
+            <span>WAT</span>
+            <span id="wat-meta"></span>
+          </div>
+          <pre id="wat"></pre>
+        </article>
+      </section>
+    </main>
+    <script>
+      const presets = [
+  {"id":"inc-i64","label":"inc-i64","file":"examples/inc_i64.simd","main":"main","source":"inc : i64 -\u003e i64\ninc x = x + 1\n\nmain : i64[n] -\u003e i64[n]\nmain xs = inc xs\n","wat":"(module\n  (type (;0;) (func (param i64) (result i64)))\n  (type (;1;) (func (param i32 i32 i32 i32)))\n  (memory (;0;) 1)\n  (export \"memory\" (memory 0))\n  (export \"main\" (func 1))\n  (func (;0;) (type 0) (param i64) (result i64)\n    local.get 0\n    i64.const 1\n    i64.add\n    return\n    unreachable\n  )\n  (func (;1;) (type 1) (param i32 i32 i32 i32)\n    (local i32 i32 i64)\n    local.get 3\n    local.get 1\n    i32.ne\n    if ;; label = @1\n      unreachable\n    end\n    i32.const 0\n    local.set 4\n    block ;; label = @1\n      loop ;; label = @2\n        local.get 4\n        local.get 1\n        i32.ge_u\n        br_if 1 (;@1;)\n        local.get 0\n        local.get 4\n        i32.const 8\n        i32.mul\n        i32.add\n        i64.load\n        local.set 6\n        local.get 2\n        local.get 4\n        i32.const 8\n        i32.mul\n        i32.add\n        local.get 6\n        call 0\n        i64.store\n        local.get 4\n        i32.const 1\n        i32.add\n        local.set 4\n        br 0 (;@2;)\n        unreachable\n      end\n    end\n  )\n)\n"},
+  {"id":"square-f32","label":"square-f32","file":"examples/square_f32.simd","main":"main","source":"square : f32 -\u003e f32\nsquare x = x * x\n\nmain : f32[n] -\u003e f32[n]\nmain xs = square xs\n","wat":"(module\n  (type (;0;) (func (param f32) (result f32)))\n  (type (;1;) (func (param i32 i32 i32 i32)))\n  (memory (;0;) 1)\n  (export \"memory\" (memory 0))\n  (export \"main\" (func 1))\n  (func (;0;) (type 0) (param f32) (result f32)\n    local.get 0\n    local.get 0\n    f32.mul\n    return\n    unreachable\n  )\n  (func (;1;) (type 1) (param i32 i32 i32 i32)\n    (local i32 i32 f32)\n    local.get 3\n    local.get 1\n    i32.ne\n    if ;; label = @1\n      unreachable\n    end\n    i32.const 0\n    local.set 4\n    block ;; label = @1\n      loop ;; label = @2\n        local.get 4\n        local.get 1\n        i32.ge_u\n        br_if 1 (;@1;)\n        local.get 0\n        local.get 4\n        i32.const 4\n        i32.mul\n        i32.add\n        f32.load\n        local.set 6\n        local.get 2\n        local.get 4\n        i32.const 4\n        i32.mul\n        i32.add\n        local.get 6\n        call 0\n        f32.store\n        local.get 4\n        i32.const 1\n        i32.add\n        local.set 4\n        br 0 (;@2;)\n        unreachable\n      end\n    end\n  )\n)\n"},
+  {"id":"axpy-i64","label":"axpy-i64","file":"examples/axpy_i64.simd","main":"main","source":"axpy : i64 -\u003e i64 -\u003e i64 -\u003e i64\naxpy a x y = a * x + y\n\nmain : i64 -\u003e i64[n] -\u003e i64[n] -\u003e i64[n]\nmain a xs ys = axpy a xs ys\n","wat":"(module\n  (type (;0;) (func (param i64 i64 i64) (result i64)))\n  (type (;1;) (func (param i64 i32 i32 i32 i32 i32 i32)))\n  (memory (;0;) 1)\n  (export \"memory\" (memory 0))\n  (export \"main\" (func 1))\n  (func (;0;) (type 0) (param i64 i64 i64) (result i64)\n    local.get 0\n    local.get 1\n    i64.mul\n    local.get 2\n    i64.add\n    return\n    unreachable\n  )\n  (func (;1;) (type 1) (param i64 i32 i32 i32 i32 i32 i32)\n    (local i32 i32 i64 i64)\n    local.get 4\n    local.get 2\n    i32.ne\n    if ;; label = @1\n      unreachable\n    end\n    local.get 6\n    local.get 2\n    i32.ne\n    if ;; label = @1\n      unreachable\n    end\n    i32.const 0\n    local.set 7\n    block ;; label = @1\n      loop ;; label = @2\n        local.get 7\n        local.get 2\n        i32.ge_u\n        br_if 1 (;@1;)\n        local.get 1\n        local.get 7\n        i32.const 8\n        i32.mul\n        i32.add\n        i64.load\n        local.set 9\n        local.get 3\n        local.get 7\n        i32.const 8\n        i32.mul\n        i32.add\n        i64.load\n        local.set 10\n        local.get 5\n        local.get 7\n        i32.const 8\n        i32.mul\n        i32.add\n        local.get 0\n        local.get 9\n        local.get 10\n        call 0\n        i64.store\n        local.get 7\n        i32.const 1\n        i32.add\n        local.set 7\n        br 0 (;@2;)\n        unreachable\n      end\n    end\n  )\n)\n"},
+  {"id":"axpy2-record-i64","label":"axpy2-record-i64","file":"examples/axpy2_record_i64.simd","main":"main","source":"axpy2 : i64 -\u003e {x:i64,y:i64} -\u003e {x:i64,y:i64} -\u003e {x:i64,y:i64}\naxpy2 a u v = { x = a * u.x + v.x, y = a * u.y + v.y }\n\nmain : i64 -\u003e {x:i64,y:i64}[n] -\u003e {x:i64,y:i64}[n] -\u003e {x:i64,y:i64}[n]\nmain a us vs = axpy2 a us vs\n","wat":"(module\n  (type (;0;) (func (param i64 i64 i64 i64 i64) (result i64)))\n  (type (;1;) (func (param i64 i64 i64 i64 i64) (result i64)))\n  (type (;2;) (func (param i64 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32)))\n  (type (;3;) (func (param i64 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32)))\n  (type (;4;) (func (param i64 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32)))\n  (memory (;0;) 1)\n  (export \"memory\" (memory 0))\n  (export \"main$x\" (func 2))\n  (export \"main$y\" (func 3))\n  (export \"main\" (func 4))\n  (func (;0;) (type 0) (param i64 i64 i64 i64 i64) (result i64)\n    local.get 0\n    local.get 1\n    i64.mul\n    local.get 3\n    i64.add\n    return\n    unreachable\n  )\n  (func (;1;) (type 1) (param i64 i64 i64 i64 i64) (result i64)\n    local.get 0\n    local.get 2\n    i64.mul\n    local.get 4\n    i64.add\n    return\n    unreachable\n  )\n  (func (;2;) (type 2) (param i64 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32)\n    (local i32 i32 i64 i64 i64 i64)\n    local.get 4\n    local.get 2\n    i32.ne\n    if ;; label = @1\n      unreachable\n    end\n    local.get 6\n    local.get 2\n    i32.ne\n    if ;; label = @1\n      unreachable\n    end\n    local.get 8\n    local.get 2\n    i32.ne\n    if ;; label = @1\n      unreachable\n    end\n    local.get 10\n    local.get 2\n    i32.ne\n    if ;; label = @1\n      unreachable\n    end\n    i32.const 0\n    local.set 11\n    block ;; label = @1\n      loop ;; label = @2\n        local.get 11\n        local.get 2\n        i32.ge_u\n        br_if 1 (;@1;)\n        local.get 1\n        local.get 11\n        i32.const 8\n        i32.mul\n        i32.add\n        i64.load\n        local.set 13\n        local.get 3\n        local.get 11\n        i32.const 8\n        i32.mul\n        i32.add\n        i64.load\n        local.set 14\n        local.get 5\n        local.get 11\n        i32.const 8\n        i32.mul\n        i32.add\n        i64.load\n        local.set 15\n        local.get 7\n        local.get 11\n        i32.const 8\n        i32.mul\n        i32.add\n        i64.load\n        local.set 16\n        local.get 9\n        local.get 11\n        i32.const 8\n        i32.mul\n        i32.add\n        local.get 0\n        local.get 13\n        local.get 14\n        local.get 15\n        local.get 16\n        call 0\n        i64.store\n        local.get 11\n        i32.const 1\n        i32.add\n        local.set 11\n        br 0 (;@2;)\n        unreachable\n      end\n    end\n  )\n  (func (;3;) (type 3) (param i64 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32)\n    (local i32 i32 i64 i64 i64 i64)\n    local.get 4\n    local.get 2\n    i32.ne\n    if ;; label = @1\n      unreachable\n    end\n    local.get 6\n    local.get 2\n    i32.ne\n    if ;; label = @1\n      unreachable\n    end\n    local.get 8\n    local.get 2\n    i32.ne\n    if ;; label = @1\n      unreachable\n    end\n    local.get 10\n    local.get 2\n    i32.ne\n    if ;; label = @1\n      unreachable\n    end\n    i32.const 0\n    local.set 11\n    block ;; label = @1\n      loop ;; label = @2\n        local.get 11\n        local.get 2\n        i32.ge_u\n        br_if 1 (;@1;)\n        local.get 1\n        local.get 11\n        i32.const 8\n        i32.mul\n        i32.add\n        i64.load\n        local.set 13\n        local.get 3\n        local.get 11\n        i32.const 8\n        i32.mul\n        i32.add\n        i64.load\n        local.set 14\n        local.get 5\n        local.get 11\n        i32.const 8\n        i32.mul\n        i32.add\n        i64.load\n        local.set 15\n        local.get 7\n        local.get 11\n        i32.const 8\n        i32.mul\n        i32.add\n        i64.load\n        local.set 16\n        local.get 9\n        local.get 11\n        i32.const 8\n        i32.mul\n        i32.add\n        local.get 0\n        local.get 13\n        local.get 14\n        local.get 15\n        local.get 16\n        call 1\n        i64.store\n        local.get 11\n        i32.const 1\n        i32.add\n        local.set 11\n        br 0 (;@2;)\n        unreachable\n      end\n    end\n  )\n  (func (;4;) (type 4) (param i64 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32)\n    (local i32 i32 i32 i32)\n    local.get 9\n    local.set 13\n    local.get 10\n    local.set 14\n    local.get 0\n    local.get 1\n    local.get 2\n    local.get 3\n    local.get 4\n    local.get 5\n    local.get 6\n    local.get 7\n    local.get 8\n    local.get 13\n    local.get 14\n    call 2\n    local.get 11\n    local.set 15\n    local.get 12\n    local.set 16\n    local.get 0\n    local.get 1\n    local.get 2\n    local.get 3\n    local.get 4\n    local.get 5\n    local.get 6\n    local.get 7\n    local.get 8\n    local.get 15\n    local.get 16\n    call 3\n  )\n)\n"},
+  {"id":"pow2-i64","label":"pow2-i64","file":"examples/pow2_i64.simd","main":"main","source":"pow2 : i64 -\u003e i64 -\u003e i64\npow2 0 x = x\npow2 n x = pow2 (n - 1) (x * 2)\n\nmain : i64[n] -\u003e i64[n]\nmain xs = pow2 3 xs\n","wat":"(module\n  (type (;0;) (func (param i64 i64) (result i64)))\n  (type (;1;) (func (param i32 i32 i32 i32)))\n  (memory (;0;) 1)\n  (export \"memory\" (memory 0))\n  (export \"main\" (func 1))\n  (func (;0;) (type 0) (param i64 i64) (result i64)\n    (local i64 i64 i64)\n    block ;; label = @1\n      loop ;; label = @2\n        local.get 0\n        i64.const 0\n        i64.eq\n        if ;; label = @3\n          local.get 1\n          local.set 4\n          br 2 (;@1;)\n        end\n        i32.const 1\n        if ;; label = @3\n          local.get 0\n          i64.const 1\n          i64.sub\n          local.set 2\n          local.get 1\n          i64.const 2\n          i64.mul\n          local.set 3\n          local.get 2\n          local.set 0\n          local.get 3\n          local.set 1\n          br 1 (;@2;)\n        end\n        unreachable\n      end\n    end\n    local.get 4\n  )\n  (func (;1;) (type 1) (param i32 i32 i32 i32)\n    (local i32 i32 i64)\n    local.get 3\n    local.get 1\n    i32.ne\n    if ;; label = @1\n      unreachable\n    end\n    i32.const 0\n    local.set 4\n    block ;; label = @1\n      loop ;; label = @2\n        local.get 4\n        local.get 1\n        i32.ge_u\n        br_if 1 (;@1;)\n        local.get 0\n        local.get 4\n        i32.const 8\n        i32.mul\n        i32.add\n        i64.load\n        local.set 6\n        local.get 2\n        local.get 4\n        i32.const 8\n        i32.mul\n        i32.add\n        i64.const 3\n        local.get 6\n        call 0\n        i64.store\n        local.get 4\n        i32.const 1\n        i32.add\n        local.set 4\n        br 0 (;@2;)\n        unreachable\n      end\n    end\n  )\n)\n"}
+];
+      const select = document.getElementById("preset");
+      const source = document.getElementById("source");
+      const wat = document.getElementById("wat");
+      const summary = document.getElementById("summary");
+      const sourceMeta = document.getElementById("source-meta");
+      const watMeta = document.getElementById("wat-meta");
+
+      for (const preset of presets) {
+        const option = document.createElement("option");
+        option.value = preset.id;
+        option.textContent = preset.label;
+        select.appendChild(option);
+      }
+
+      function render(id) {
+        const preset = presets.find((item) => item.id === id) ?? presets[0];
+        select.value = preset.id;
+        source.textContent = preset.source;
+        wat.textContent = preset.wat;
+        summary.textContent = `${preset.file} • main=${preset.main}`;
+        sourceMeta.textContent = preset.file;
+        watMeta.textContent = `${preset.wat.split("\n").length} lines`;
+      }
+
+      select.addEventListener("change", (event) => render(event.target.value));
+      render(presets[0]?.id);
+    </script>
+  </body>
+</html>

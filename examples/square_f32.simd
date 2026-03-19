@@ -1,0 +1,5 @@
+square : f32 -> f32
+square x = x * x
+
+main : f32[n] -> f32[n]
+main xs = square xs
