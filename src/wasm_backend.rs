@@ -1912,6 +1912,7 @@ fn vector_plan_unroll(plan: VectorPlan) -> usize {
 fn choose_vector_plan(
     has_vector_clause: bool,
     vector_width: usize,
+    result_prim: Prim,
     op_count: usize,
     load_streams: usize,
     store_streams: usize,
@@ -1925,9 +1926,18 @@ fn choose_vector_plan(
     let total_streams = load_streams.saturating_add(store_streams);
     let stream_weight = total_streams.max(1);
     let weighted_ops = op_count.saturating_mul(stream_weight);
-    if vector_width >= 2 && weighted_ops >= 24 && total_streams <= 6 {
+    let vec4_ready = match result_prim {
+        Prim::I32 | Prim::F32 => weighted_ops >= 18 && total_streams <= 8,
+        Prim::I64 | Prim::F64 => weighted_ops >= 28 && total_streams <= 5,
+    };
+    let vec2_ready = match result_prim {
+        Prim::I32 | Prim::F32 => weighted_ops >= 8 || op_count >= 6,
+        Prim::I64 | Prim::F64 => weighted_ops >= 10 || op_count >= 7,
+    };
+
+    if vector_width >= 2 && vec4_ready {
         (VectorPlan::VectorUnroll4, None)
-    } else if vector_width >= 2 && weighted_ops >= 10 {
+    } else if vector_width >= 2 && vec2_ready {
         (VectorPlan::VectorUnroll2, None)
     } else {
         (VectorPlan::VectorSingle, None)
@@ -2129,19 +2139,32 @@ fn compile_grouped_kernel_function(
     let (vector_plan, fallback_reason) = choose_vector_plan(
         vector_clause.is_some(),
         *vector_width,
+        reference.result_prim,
         op_count,
         load_streams,
         outputs.len(),
     );
+    let vector_acc_local = if vector_clause.is_some() {
+        let local = next_local;
+        local_decls.push((1, ValType::V128));
+        next_local += 1;
+        Some(local)
+    } else {
+        None
+    };
     let variant_locals = kernel_variant_locals(&reference.clauses, &abi_params);
     let vector_hoists = vector_clause
         .as_ref()
         .map(|vector_clause| {
-            collect_hoisted_exprs(
-                vector_clause.bodies.iter().copied(),
-                &variant_locals,
-                HoistMode::Vector,
-            )
+            if vector_clause.clauses.len() == 1 {
+                collect_hoisted_exprs(
+                    vector_clause.clauses[0].bodies.iter().copied(),
+                    &variant_locals,
+                    HoistMode::Vector,
+                )
+            } else {
+                Vec::new()
+            }
         })
         .unwrap_or_default();
     for _ in &vector_hoists {
@@ -2249,7 +2272,11 @@ fn compile_grouped_kernel_function(
                 lane_offset_elems: 0,
             },
             scalar_indices,
-            &vector_clause.locals,
+            &vector_clause
+                .clauses
+                .first()
+                .ok_or_else(|| SimdError::new("vectorized grouped kernel had no clauses"))?
+                .locals,
         )?;
         function.instruction(&Instruction::LocalGet(first_len_local));
         function.instruction(&Instruction::LocalGet(first_len_local));
@@ -2274,23 +2301,23 @@ fn compile_grouped_kernel_function(
             function.instruction(&Instruction::BrIf(1));
 
             for chunk in 0..4u32 {
-                for ((body, output), output_ptr_loop_local) in vector_clause
-                    .bodies
-                    .iter()
-                    .zip(&outputs)
-                    .zip(&output_ptr_loop_locals)
+                for (output_index, (output, output_ptr_loop_local)) in
+                    outputs.iter().zip(&output_ptr_loop_locals).enumerate()
                 {
                     function.instruction(&Instruction::LocalGet(*output_ptr_loop_local));
-                    compile_vector_ir_expr(
+                    compile_grouped_vectorized_clause_chain(
                         &mut function,
-                        body,
-                        &vector_clause.locals,
+                        &vector_clause.clauses,
+                        output_index,
                         &vector_params,
                         VectorAddressing::Pointer {
                             lane_offset_elems: *vector_width as u32 * chunk,
                         },
                         scalar_indices,
                         Some(&vector_hoisted_locals),
+                        vector_acc_local.ok_or_else(|| {
+                            SimdError::new("vectorized grouped kernel missing accumulator local")
+                        })?,
                     )?;
                     function.instruction(&Instruction::V128Store(memarg(
                         u64::from(byte_width(output.prim)) * (*vector_width as u64) * chunk as u64,
@@ -2347,23 +2374,23 @@ fn compile_grouped_kernel_function(
             function.instruction(&Instruction::BrIf(1));
 
             for chunk in 0..2u32 {
-                for ((body, output), output_ptr_loop_local) in vector_clause
-                    .bodies
-                    .iter()
-                    .zip(&outputs)
-                    .zip(&output_ptr_loop_locals)
+                for (output_index, (output, output_ptr_loop_local)) in
+                    outputs.iter().zip(&output_ptr_loop_locals).enumerate()
                 {
                     function.instruction(&Instruction::LocalGet(*output_ptr_loop_local));
-                    compile_vector_ir_expr(
+                    compile_grouped_vectorized_clause_chain(
                         &mut function,
-                        body,
-                        &vector_clause.locals,
+                        &vector_clause.clauses,
+                        output_index,
                         &vector_params,
                         VectorAddressing::Pointer {
                             lane_offset_elems: *vector_width as u32 * chunk,
                         },
                         scalar_indices,
                         Some(&vector_hoisted_locals),
+                        vector_acc_local.ok_or_else(|| {
+                            SimdError::new("vectorized grouped kernel missing accumulator local")
+                        })?,
                     )?;
                     function.instruction(&Instruction::V128Store(memarg(
                         u64::from(byte_width(output.prim)) * (*vector_width as u64) * chunk as u64,
@@ -2409,23 +2436,21 @@ fn compile_grouped_kernel_function(
             function.instruction(&Instruction::I32GeU);
             function.instruction(&Instruction::BrIf(1));
 
-            for ((body, _output), output_ptr_loop_local) in vector_clause
-                .bodies
-                .iter()
-                .zip(&outputs)
-                .zip(&output_ptr_loop_locals)
-            {
+            for (output_index, output_ptr_loop_local) in output_ptr_loop_locals.iter().enumerate() {
                 function.instruction(&Instruction::LocalGet(*output_ptr_loop_local));
-                compile_vector_ir_expr(
+                compile_grouped_vectorized_clause_chain(
                     &mut function,
-                    body,
-                    &vector_clause.locals,
+                    &vector_clause.clauses,
+                    output_index,
                     &vector_params,
                     VectorAddressing::Pointer {
                         lane_offset_elems: 0,
                     },
                     scalar_indices,
                     Some(&vector_hoisted_locals),
+                    vector_acc_local.ok_or_else(|| {
+                        SimdError::new("vectorized grouped kernel missing accumulator local")
+                    })?,
                 )?;
                 function.instruction(&Instruction::V128Store(memarg(0, 4)));
             }
@@ -2608,43 +2633,68 @@ fn compile_grouped_kernel_function(
 }
 
 struct VectorizableGroupedClause<'a> {
+    patterns: &'a [TypedPattern],
     bodies: Vec<&'a IrExpr>,
     locals: BTreeMap<String, usize>,
+}
+
+struct VectorizableGroupedKernel<'a> {
+    clauses: Vec<VectorizableGroupedClause<'a>>,
 }
 
 fn vectorizable_grouped_kernel_clause<'a>(
     leaves: &'a [PreparedGroupedLeaf],
     params: &'a [KernelParam],
-) -> Option<VectorizableGroupedClause<'a>> {
+) -> Option<VectorizableGroupedKernel<'a>> {
     let reference = leaves.first()?;
-    if reference.clauses.len() != 1 {
+    if reference.clauses.is_empty() {
         return None;
     }
-    let clause = &reference.clauses[0];
-    if clause
-        .patterns
+    if leaves
         .iter()
-        .any(|pattern| matches!(pattern.pattern, Pattern::Int(_) | Pattern::Float(_)))
+        .any(|leaf| leaf.result_prim.lane_width() != reference.result_prim.lane_width())
     {
         return None;
     }
-    let mut locals = BTreeMap::new();
-    for (index, (pattern, param)) in clause.patterns.iter().zip(params).enumerate() {
-        if let Pattern::Name(name) = &pattern.pattern
-            && matches!(param, KernelParam::Same { .. } | KernelParam::Lane { .. })
-        {
-            locals.insert(name.clone(), index);
+    if clause_has_condition(&reference.clauses.last()?.patterns) {
+        return None;
+    }
+
+    let mut grouped_clauses = Vec::with_capacity(reference.clauses.len());
+    for clause_index in 0..reference.clauses.len() {
+        let reference_clause = &reference.clauses[clause_index];
+        let mut locals = BTreeMap::new();
+        for (index, (pattern, param)) in reference_clause.patterns.iter().zip(params).enumerate() {
+            if let Pattern::Name(name) = &pattern.pattern
+                && matches!(param, KernelParam::Same { .. } | KernelParam::Lane { .. })
+            {
+                locals.insert(name.clone(), index);
+            }
         }
+
+        if !patterns_are_vectorizable(&reference_clause.patterns, params, reference.result_prim) {
+            return None;
+        }
+        let mut bodies = Vec::with_capacity(leaves.len());
+        for leaf in leaves {
+            let clause = leaf.clauses.get(clause_index)?;
+            if clause.patterns != reference_clause.patterns {
+                return None;
+            }
+            if !is_vectorizable_expr(&clause.body, &locals, leaf.result_prim) {
+                return None;
+            }
+            bodies.push(&clause.body);
+        }
+        grouped_clauses.push(VectorizableGroupedClause {
+            patterns: &reference_clause.patterns,
+            bodies,
+            locals,
+        });
     }
-    if !leaves
-        .iter()
-        .all(|leaf| is_vectorizable_expr(&leaf.clauses[0].body, &locals, leaf.result_prim))
-    {
-        return None;
-    }
-    Some(VectorizableGroupedClause {
-        bodies: leaves.iter().map(|leaf| &leaf.clauses[0].body).collect(),
-        locals,
+
+    Some(VectorizableGroupedKernel {
+        clauses: grouped_clauses,
     })
 }
 
@@ -2709,6 +2759,7 @@ fn try_inline_grouped_leaf_call(
     lowered_map: &BTreeMap<String, &LoweredFunction>,
     visiting: &mut BTreeSet<String>,
 ) -> Result<Option<IrExpr>> {
+    const INLINE_HELPER_NODE_BUDGET: usize = 48;
     if visiting.contains(name) {
         return Ok(None);
     }
@@ -2737,6 +2788,9 @@ fn try_inline_grouped_leaf_call(
     visiting.insert(name.to_string());
     let body = inline_grouped_kernel_expr(&clause.body, lowered_map, visiting)?;
     visiting.remove(name);
+    if ir_expr_node_count(&body) > INLINE_HELPER_NODE_BUDGET {
+        return Ok(None);
+    }
 
     let mut substitutions = BTreeMap::new();
     for (pattern, arg) in clause.patterns.iter().zip(args) {
@@ -2745,6 +2799,20 @@ fn try_inline_grouped_leaf_call(
         }
     }
     Ok(Some(substitute_ir_expr(&body, &substitutions)))
+}
+
+fn ir_expr_node_count(expr: &IrExpr) -> usize {
+    match &expr.kind {
+        IrExprKind::Local(_) | IrExprKind::Int(_, _) | IrExprKind::Float(_, _) => 1,
+        IrExprKind::Let { bindings, body } => {
+            1 + bindings
+                .iter()
+                .map(|binding| ir_expr_node_count(&binding.expr))
+                .sum::<usize>()
+                + ir_expr_node_count(body)
+        }
+        IrExprKind::Call { args, .. } => 1 + args.iter().map(ir_expr_node_count).sum::<usize>(),
+    }
 }
 
 fn expr_contains_non_scalar_calls(expr: &IrExpr, scalar_indices: &BTreeMap<String, u32>) -> bool {
@@ -2992,15 +3060,13 @@ fn compile_scalar_function(
                         function.instruction(&Instruction::Br(1));
                     }
                     TailAction::Return { expr } => {
-                        compile_scalar_ir_expr(
+                        emit_tail_position_scalar_return(
                             &mut function,
                             expr,
                             &pattern_local_map(&clause.patterns),
                             scalar_indices,
                             signatures,
                         )?;
-                        function.instruction(&Instruction::LocalSet(result_local));
-                        function.instruction(&Instruction::Br(2));
                     }
                 }
                 function.instruction(&Instruction::End);
@@ -3172,19 +3238,32 @@ fn compile_kernel_entry(
     let (vector_plan, fallback_reason) = choose_vector_plan(
         vector_clause.is_some(),
         *vector_width,
+        result_prim,
         op_count,
         load_streams,
         1,
     );
+    let vector_acc_local = if vector_clause.is_some() {
+        let local = next_local;
+        local_decls.push((1, ValType::V128));
+        next_local += 1;
+        Some(local)
+    } else {
+        None
+    };
     let variant_locals = kernel_variant_locals(&clauses, &abi_params);
     let vector_hoists = vector_clause
         .as_ref()
         .map(|vector_clause| {
-            collect_hoisted_exprs(
-                std::iter::once(vector_clause.body),
-                &variant_locals,
-                HoistMode::Vector,
-            )
+            if vector_clause.clauses.len() == 1 {
+                collect_hoisted_exprs(
+                    std::iter::once(vector_clause.clauses[0].body),
+                    &variant_locals,
+                    HoistMode::Vector,
+                )
+            } else {
+                Vec::new()
+            }
         })
         .unwrap_or_default();
     for _ in &vector_hoists {
@@ -3286,7 +3365,11 @@ fn compile_kernel_entry(
                 lane_offset_elems: 0,
             },
             scalar_indices,
-            &vector_clause.locals,
+            &vector_clause
+                .clauses
+                .first()
+                .ok_or_else(|| SimdError::new("vectorized kernel had no clauses"))?
+                .locals,
         )?;
         function.instruction(&Instruction::LocalGet(first_len_local));
         function.instruction(&Instruction::LocalGet(first_len_local));
@@ -3312,16 +3395,18 @@ fn compile_kernel_entry(
 
             for chunk in 0..4u32 {
                 function.instruction(&Instruction::LocalGet(output_ptr_loop_local));
-                compile_vector_ir_expr(
+                compile_vectorized_clause_chain(
                     &mut function,
-                    &vector_clause.body,
-                    &vector_clause.locals,
+                    &vector_clause.clauses,
                     &vector_params,
                     VectorAddressing::Pointer {
                         lane_offset_elems: *vector_width as u32 * chunk,
                     },
                     scalar_indices,
                     Some(&vector_hoisted_locals),
+                    vector_acc_local.ok_or_else(|| {
+                        SimdError::new("vectorized kernel missing accumulator local")
+                    })?,
                 )?;
                 function.instruction(&Instruction::V128Store(memarg(
                     u64::from(byte_width(result_prim)) * (*vector_width as u64) * chunk as u64,
@@ -3376,16 +3461,18 @@ fn compile_kernel_entry(
 
             for chunk in 0..2u32 {
                 function.instruction(&Instruction::LocalGet(output_ptr_loop_local));
-                compile_vector_ir_expr(
+                compile_vectorized_clause_chain(
                     &mut function,
-                    &vector_clause.body,
-                    &vector_clause.locals,
+                    &vector_clause.clauses,
                     &vector_params,
                     VectorAddressing::Pointer {
                         lane_offset_elems: *vector_width as u32 * chunk,
                     },
                     scalar_indices,
                     Some(&vector_hoisted_locals),
+                    vector_acc_local.ok_or_else(|| {
+                        SimdError::new("vectorized kernel missing accumulator local")
+                    })?,
                 )?;
                 function.instruction(&Instruction::V128Store(memarg(
                     u64::from(byte_width(result_prim)) * (*vector_width as u64) * chunk as u64,
@@ -3429,16 +3516,17 @@ fn compile_kernel_entry(
             function.instruction(&Instruction::BrIf(1));
 
             function.instruction(&Instruction::LocalGet(output_ptr_loop_local));
-            compile_vector_ir_expr(
+            compile_vectorized_clause_chain(
                 &mut function,
-                &vector_clause.body,
-                &vector_clause.locals,
+                &vector_clause.clauses,
                 &vector_params,
                 VectorAddressing::Pointer {
                     lane_offset_elems: 0,
                 },
                 scalar_indices,
                 Some(&vector_hoisted_locals),
+                vector_acc_local
+                    .ok_or_else(|| SimdError::new("vectorized kernel missing accumulator local"))?,
             )?;
             function.instruction(&Instruction::V128Store(memarg(0, 4)));
 
@@ -4035,6 +4123,40 @@ fn emit_tail_position_scalar_return(
     scalar_indices: &BTreeMap<String, u32>,
     signatures: &BTreeMap<String, &CheckedFunction>,
 ) -> Result<()> {
+    let inline_bindings = BTreeMap::<String, IrExpr>::new();
+    emit_tail_position_scalar_return_with_bindings(
+        function,
+        expr,
+        locals,
+        scalar_indices,
+        signatures,
+        &inline_bindings,
+    )
+}
+
+fn emit_tail_position_scalar_return_with_bindings(
+    function: &mut Function,
+    expr: &IrExpr,
+    locals: &BTreeMap<String, u32>,
+    scalar_indices: &BTreeMap<String, u32>,
+    signatures: &BTreeMap<String, &CheckedFunction>,
+    inline_bindings: &BTreeMap<String, IrExpr>,
+) -> Result<()> {
+    if let IrExprKind::Let { bindings, body } = &expr.kind {
+        let mut extended = inline_bindings.clone();
+        for binding in bindings {
+            extended.insert(binding.name.clone(), binding.expr.clone());
+        }
+        return emit_tail_position_scalar_return_with_bindings(
+            function,
+            body,
+            locals,
+            scalar_indices,
+            signatures,
+            &extended,
+        );
+    }
+
     if let IrExprKind::Call {
         callee: Callee::Function(name),
         args,
@@ -4060,7 +4182,15 @@ fn emit_tail_position_scalar_return(
             )));
         }
         for (arg, ty) in args.iter().zip(params.iter()) {
-            compile_scalar_ir_expr(function, arg, locals, scalar_indices, signatures)?;
+            compile_scalar_ir_expr_with_hoists(
+                function,
+                arg,
+                locals,
+                scalar_indices,
+                signatures,
+                &BTreeMap::new(),
+                inline_bindings,
+            )?;
             if &arg.ty != ty {
                 return Err(SimdError::new(format!(
                     "Wasm scalar tail call '{}' received {:?}, expected {:?}",
@@ -4076,7 +4206,15 @@ fn emit_tail_position_scalar_return(
         return Ok(());
     }
 
-    compile_scalar_ir_expr(function, expr, locals, scalar_indices, signatures)?;
+    compile_scalar_ir_expr_with_hoists(
+        function,
+        expr,
+        locals,
+        scalar_indices,
+        signatures,
+        &BTreeMap::new(),
+        inline_bindings,
+    )?;
     function.instruction(&Instruction::Return);
     Ok(())
 }
@@ -4357,42 +4495,87 @@ fn emit_scalar_primitive(
 }
 
 struct VectorizableClause<'a> {
+    patterns: &'a [TypedPattern],
     body: &'a IrExpr,
     locals: BTreeMap<String, usize>,
+}
+
+struct VectorizableKernel<'a> {
+    clauses: Vec<VectorizableClause<'a>>,
 }
 
 fn vectorizable_kernel_clause<'a>(
     clauses: &'a [LoweredClause],
     params: &'a [KernelParam],
     result_prim: Prim,
-) -> Option<VectorizableClause<'a>> {
-    if clauses.len() != 1 {
+) -> Option<VectorizableKernel<'a>> {
+    if clauses.is_empty() {
         return None;
     }
-    let clause = &clauses[0];
-    if clause
-        .patterns
-        .iter()
-        .any(|pattern| matches!(pattern.pattern, Pattern::Int(_) | Pattern::Float(_)))
-    {
+    if clause_has_condition(&clauses.last()?.patterns) {
         return None;
     }
-    let mut locals = BTreeMap::new();
-    for (index, (pattern, param)) in clause.patterns.iter().zip(params).enumerate() {
-        if let Pattern::Name(name) = &pattern.pattern {
-            if matches!(param, KernelParam::Same { .. } | KernelParam::Lane { .. }) {
+
+    let mut vectorizable = Vec::with_capacity(clauses.len());
+    for clause in clauses {
+        let mut locals = BTreeMap::new();
+        for (index, (pattern, param)) in clause.patterns.iter().zip(params).enumerate() {
+            if let Pattern::Name(name) = &pattern.pattern
+                && matches!(param, KernelParam::Same { .. } | KernelParam::Lane { .. })
+            {
                 locals.insert(name.clone(), index);
             }
         }
-    }
-    if is_vectorizable_expr(&clause.body, &locals, result_prim) {
-        Some(VectorizableClause {
+        if !patterns_are_vectorizable(&clause.patterns, params, result_prim) {
+            return None;
+        }
+        if !is_vectorizable_expr(&clause.body, &locals, result_prim) {
+            return None;
+        }
+        vectorizable.push(VectorizableClause {
+            patterns: &clause.patterns,
             body: &clause.body,
             locals,
-        })
-    } else {
-        None
+        });
     }
+
+    Some(VectorizableKernel {
+        clauses: vectorizable,
+    })
+}
+
+fn patterns_are_vectorizable(
+    patterns: &[TypedPattern],
+    params: &[KernelParam],
+    result_prim: Prim,
+) -> bool {
+    for (index, pattern) in patterns.iter().enumerate() {
+        let Some(param) = params.get(index) else {
+            return false;
+        };
+        let prim = match param {
+            KernelParam::Same { prim, .. } | KernelParam::Lane { prim, .. } => *prim,
+        };
+        if matches!(param, KernelParam::Lane { .. })
+            && prim.lane_width() != result_prim.lane_width()
+        {
+            return false;
+        }
+        match pattern.pattern {
+            Pattern::Int(_) => {
+                if !prim.is_int() {
+                    return false;
+                }
+            }
+            Pattern::Float(_) => {
+                if !prim.is_float() {
+                    return false;
+                }
+            }
+            Pattern::Name(_) | Pattern::Wildcard => {}
+        }
+    }
+    true
 }
 
 fn is_vectorizable_expr(
@@ -4421,10 +4604,236 @@ fn is_vectorizable_expr(
                         .all(|arg| is_vectorizable_expr(arg, locals, result_prim))
                         && matches!(result_prim, Prim::F32 | Prim::F64)
                 }
+                PrimOp::Eq | PrimOp::Lt | PrimOp::Gt | PrimOp::Le | PrimOp::Ge => {
+                    if !args
+                        .iter()
+                        .all(|arg| is_vectorizable_expr(arg, locals, result_prim))
+                    {
+                        return false;
+                    }
+                    let Some(operand_prim) = args[0].ty.prim() else {
+                        return false;
+                    };
+                    result_prim == Prim::I64 && matches!(operand_prim, Prim::I64 | Prim::F64)
+                }
                 _ => false,
             },
         },
     }
+}
+
+fn emit_vector_clause_mask(
+    function: &mut Function,
+    patterns: &[TypedPattern],
+    params: &[KernelParam],
+    addressing: VectorAddressing,
+) -> Result<()> {
+    let mut terms = 0usize;
+    for (index, typed_pattern) in patterns.iter().enumerate() {
+        match &typed_pattern.pattern {
+            Pattern::Wildcard | Pattern::Name(_) => {}
+            Pattern::Int(expected) => {
+                let prim = emit_vector_pattern_value(function, params, index, addressing)?;
+                emit_vector_splat_int(function, prim, *expected)?;
+                emit_vector_pattern_eq(function, prim, false)?;
+                if terms > 0 {
+                    function.instruction(&Instruction::V128And);
+                }
+                terms += 1;
+            }
+            Pattern::Float(expected) => {
+                let prim = emit_vector_pattern_value(function, params, index, addressing)?;
+                emit_vector_splat_float(function, prim, *expected)?;
+                emit_vector_pattern_eq(function, prim, true)?;
+                if terms > 0 {
+                    function.instruction(&Instruction::V128And);
+                }
+                terms += 1;
+            }
+        }
+    }
+    if terms == 0 {
+        emit_vector_all_ones_mask(function);
+    }
+    Ok(())
+}
+
+fn emit_vector_pattern_value(
+    function: &mut Function,
+    params: &[KernelParam],
+    index: usize,
+    addressing: VectorAddressing,
+) -> Result<Prim> {
+    let param = params
+        .get(index)
+        .ok_or_else(|| SimdError::new("pattern arity mismatch in vector codegen"))?;
+    match param {
+        KernelParam::Same { prim, value_local } => {
+            emit_vector_splat_local(function, *prim, *value_local);
+            Ok(*prim)
+        }
+        KernelParam::Lane {
+            prim, ptr_local, ..
+        } => {
+            emit_vector_load(function, *prim, *ptr_local, addressing);
+            Ok(*prim)
+        }
+    }
+}
+
+fn emit_vector_pattern_eq(function: &mut Function, prim: Prim, float_bits: bool) -> Result<()> {
+    match (prim, float_bits) {
+        (Prim::I32, false) => {
+            function.instruction(&Instruction::I32x4Eq);
+        }
+        (Prim::I64, false) => {
+            function.instruction(&Instruction::I64x2Eq);
+        }
+        // Float patterns use bit-equality semantics to match scalar evaluator behavior.
+        (Prim::F32, true) => {
+            function.instruction(&Instruction::I32x4Eq);
+        }
+        (Prim::F64, true) => {
+            function.instruction(&Instruction::I64x2Eq);
+        }
+        _ => {
+            return Err(SimdError::new(format!(
+                "vector pattern equality mismatch for {:?}",
+                prim
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn emit_vector_all_ones_mask(function: &mut Function) {
+    function.instruction(&Instruction::I32Const(-1));
+    function.instruction(&Instruction::I32x4Splat);
+}
+
+fn compile_vectorized_clause_chain(
+    function: &mut Function,
+    clauses: &[VectorizableClause<'_>],
+    params: &[KernelParam],
+    addressing: VectorAddressing,
+    scalar_indices: &BTreeMap<String, u32>,
+    hoisted_locals: Option<&BTreeMap<HoistExprKey, u32>>,
+    acc_local: u32,
+) -> Result<()> {
+    let last = clauses
+        .last()
+        .ok_or_else(|| SimdError::new("vectorized kernel missing clauses"))?;
+    compile_vector_ir_expr(
+        function,
+        last.body,
+        &last.locals,
+        params,
+        addressing,
+        scalar_indices,
+        hoisted_locals,
+    )?;
+    function.instruction(&Instruction::LocalSet(acc_local));
+
+    for clause in clauses.iter().rev().skip(1) {
+        if !clause_has_condition(clause.patterns) {
+            compile_vector_ir_expr(
+                function,
+                clause.body,
+                &clause.locals,
+                params,
+                addressing,
+                scalar_indices,
+                hoisted_locals,
+            )?;
+            function.instruction(&Instruction::LocalSet(acc_local));
+            continue;
+        }
+        compile_vector_ir_expr(
+            function,
+            clause.body,
+            &clause.locals,
+            params,
+            addressing,
+            scalar_indices,
+            hoisted_locals,
+        )?;
+        function.instruction(&Instruction::LocalGet(acc_local));
+        emit_vector_clause_mask(function, clause.patterns, params, addressing)?;
+        function.instruction(&Instruction::V128Bitselect);
+        function.instruction(&Instruction::LocalSet(acc_local));
+    }
+
+    function.instruction(&Instruction::LocalGet(acc_local));
+    Ok(())
+}
+
+fn compile_grouped_vectorized_clause_chain(
+    function: &mut Function,
+    clauses: &[VectorizableGroupedClause<'_>],
+    output_index: usize,
+    params: &[KernelParam],
+    addressing: VectorAddressing,
+    scalar_indices: &BTreeMap<String, u32>,
+    hoisted_locals: Option<&BTreeMap<HoistExprKey, u32>>,
+    acc_local: u32,
+) -> Result<()> {
+    let last = clauses
+        .last()
+        .ok_or_else(|| SimdError::new("vectorized grouped kernel missing clauses"))?;
+    let body = last
+        .bodies
+        .get(output_index)
+        .ok_or_else(|| SimdError::new("vectorized grouped kernel missing output body"))?;
+    compile_vector_ir_expr(
+        function,
+        body,
+        &last.locals,
+        params,
+        addressing,
+        scalar_indices,
+        hoisted_locals,
+    )?;
+    function.instruction(&Instruction::LocalSet(acc_local));
+
+    for clause in clauses.iter().rev().skip(1) {
+        if !clause_has_condition(clause.patterns) {
+            let body = clause
+                .bodies
+                .get(output_index)
+                .ok_or_else(|| SimdError::new("vectorized grouped kernel missing output body"))?;
+            compile_vector_ir_expr(
+                function,
+                body,
+                &clause.locals,
+                params,
+                addressing,
+                scalar_indices,
+                hoisted_locals,
+            )?;
+            function.instruction(&Instruction::LocalSet(acc_local));
+            continue;
+        }
+        let body = clause
+            .bodies
+            .get(output_index)
+            .ok_or_else(|| SimdError::new("vectorized grouped kernel missing output body"))?;
+        compile_vector_ir_expr(
+            function,
+            body,
+            &clause.locals,
+            params,
+            addressing,
+            scalar_indices,
+            hoisted_locals,
+        )?;
+        function.instruction(&Instruction::LocalGet(acc_local));
+        emit_vector_clause_mask(function, clause.patterns, params, addressing)?;
+        function.instruction(&Instruction::V128Bitselect);
+        function.instruction(&Instruction::LocalSet(acc_local));
+    }
+
+    function.instruction(&Instruction::LocalGet(acc_local));
+    Ok(())
 }
 
 fn compile_vector_ir_expr(
@@ -4537,7 +4946,12 @@ fn compile_vector_ir_expr_with_hoists(
                     hoisted_locals,
                     inline_bindings,
                 )?;
-                emit_vector_primitive(function, *op, args[0].ty.prim().unwrap())?;
+                emit_vector_primitive(
+                    function,
+                    *op,
+                    args[0].ty.prim().unwrap(),
+                    expr.ty.prim().unwrap_or(args[0].ty.prim().unwrap()),
+                )?;
             }
         },
     }
@@ -4614,8 +5028,13 @@ fn emit_vector_load(
     }
 }
 
-fn emit_vector_primitive(function: &mut Function, op: PrimOp, prim: Prim) -> Result<()> {
-    match (op, prim) {
+fn emit_vector_primitive(
+    function: &mut Function,
+    op: PrimOp,
+    operand_prim: Prim,
+    result_prim: Prim,
+) -> Result<()> {
+    match (op, operand_prim) {
         (PrimOp::Add, Prim::I32) => {
             function.instruction(&Instruction::I32x4Add);
         }
@@ -4658,13 +5077,80 @@ fn emit_vector_primitive(function: &mut Function, op: PrimOp, prim: Prim) -> Res
         (PrimOp::Div, Prim::F64) => {
             function.instruction(&Instruction::F64x2Div);
         }
+        (PrimOp::Eq, Prim::I64) => {
+            function.instruction(&Instruction::I64x2Eq);
+            if result_prim == Prim::I64 {
+                emit_vector_bool_to_i64(function)?;
+            }
+        }
+        (PrimOp::Lt, Prim::I64) => {
+            function.instruction(&Instruction::I64x2LtS);
+            if result_prim == Prim::I64 {
+                emit_vector_bool_to_i64(function)?;
+            }
+        }
+        (PrimOp::Gt, Prim::I64) => {
+            function.instruction(&Instruction::I64x2GtS);
+            if result_prim == Prim::I64 {
+                emit_vector_bool_to_i64(function)?;
+            }
+        }
+        (PrimOp::Le, Prim::I64) => {
+            function.instruction(&Instruction::I64x2LeS);
+            if result_prim == Prim::I64 {
+                emit_vector_bool_to_i64(function)?;
+            }
+        }
+        (PrimOp::Ge, Prim::I64) => {
+            function.instruction(&Instruction::I64x2GeS);
+            if result_prim == Prim::I64 {
+                emit_vector_bool_to_i64(function)?;
+            }
+        }
+        (PrimOp::Eq, Prim::F64) => {
+            function.instruction(&Instruction::F64x2Eq);
+            if result_prim == Prim::I64 {
+                emit_vector_bool_to_i64(function)?;
+            }
+        }
+        (PrimOp::Lt, Prim::F64) => {
+            function.instruction(&Instruction::F64x2Lt);
+            if result_prim == Prim::I64 {
+                emit_vector_bool_to_i64(function)?;
+            }
+        }
+        (PrimOp::Gt, Prim::F64) => {
+            function.instruction(&Instruction::F64x2Gt);
+            if result_prim == Prim::I64 {
+                emit_vector_bool_to_i64(function)?;
+            }
+        }
+        (PrimOp::Le, Prim::F64) => {
+            function.instruction(&Instruction::F64x2Le);
+            if result_prim == Prim::I64 {
+                emit_vector_bool_to_i64(function)?;
+            }
+        }
+        (PrimOp::Ge, Prim::F64) => {
+            function.instruction(&Instruction::F64x2Ge);
+            if result_prim == Prim::I64 {
+                emit_vector_bool_to_i64(function)?;
+            }
+        }
         _ => {
             return Err(SimdError::new(format!(
                 "Wasm SIMD backend does not support vector primitive {:?} on {:?}",
-                op, prim
+                op, operand_prim
             )));
         }
     }
+    Ok(())
+}
+
+fn emit_vector_bool_to_i64(function: &mut Function) -> Result<()> {
+    emit_int_const(function, Prim::I64, 1)?;
+    function.instruction(&Instruction::I64x2Splat);
+    function.instruction(&Instruction::V128And);
     Ok(())
 }
 
@@ -6438,6 +6924,14 @@ mod tests {
     }
 
     #[test]
+    fn wat_uses_return_call_for_tail_let_wrapped_call() {
+        let src = "id : i64 -> i64\nid x = x\nforward : i64 -> i64\nforward x = let y = x in id y\nmain : i64 -> i64\nmain x = forward x\n";
+        let wat = wat_main(src, "main").expect("WAT should be printable");
+        assert!(wat.contains("return_call"));
+        assert_eq!(wasm_run(src, "main", "[7]"), "7");
+    }
+
+    #[test]
     fn dense_kernel_can_select_vec4_unroll() {
         let src = "mix : i64 -> i64 -> i64 -> i64 -> i64 -> i64 -> i64\nmix a b c d x y = ((a * x + y) * (b * x + y)) + ((c * x + y) * (d * x + y))\nmain : i64 -> i64 -> i64 -> i64 -> i64[n] -> i64[n] -> i64[n]\nmain a b c d xs ys = mix a b c d xs ys\n";
         let artifact = compile_wasm_main(src, "main").expect("artifact should compile");
@@ -6447,6 +6941,35 @@ mod tests {
             .find(|report| report.function == "main")
             .expect("main optimizer report should exist");
         assert_eq!(report.vector_unroll, 4);
+    }
+
+    #[test]
+    fn multiclausal_kernel_vectorizes_with_bitselect() {
+        let src = "main : i64 -> i64[n] -> i64[n]\nmain 0 xs = xs * 0\nmain a xs = a * xs\n";
+        let artifact = compile_wasm_main(src, "main").expect("artifact should compile");
+        let report = artifact
+            .optimizer_reports
+            .iter()
+            .find(|report| report.function == "main")
+            .expect("main optimizer report should exist");
+        assert!(report.vectorizable);
+        let wat = wat_main(src, "main").expect("WAT should be printable");
+        assert!(wat.contains("v128.bitselect"));
+        assert_eq!(wasm_run(src, "main", "[0,[1,2,3,4]]"), "[0,0,0,0]");
+        assert_eq!(wasm_run(src, "main", "[3,[1,2,3,4]]"), "[3,6,9,12]");
+    }
+
+    #[test]
+    fn i64_comparison_kernel_vectorizes() {
+        let src = "lt : i64 -> i64 -> i64\nlt x y = x < y\nmain : i64[n] -> i64[n] -> i64[n]\nmain xs ys = lt xs ys\n";
+        let artifact = compile_wasm_main(src, "main").expect("artifact should compile");
+        let report = artifact
+            .optimizer_reports
+            .iter()
+            .find(|report| report.function == "main")
+            .expect("main optimizer report should exist");
+        assert!(report.vectorizable);
+        assert_eq!(wasm_run(src, "main", "[[1,9],[2,3]]"), "[1,0]");
     }
 
     #[test]
