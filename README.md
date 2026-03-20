@@ -5,6 +5,12 @@
 This file tracks benchmark snapshots so we can compare progress over time.
 All numbers are machine-dependent and should be compared on the same host.
 
+## Web Demos
+
+- [WAT Inspector](./docs/inspector.html)
+- [Mouse Shader Demo](./docs/canvas_mouse_demo.html)
+- [Image Upload Shader Lab](./docs/image_upload_shader_demo.html)
+
 ### Latest Snapshot (2026-03-20)
 
 Commands used:
