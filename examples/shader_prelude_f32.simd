@@ -1,0 +1,38 @@
+square : f32 -> f32
+square x = x * x
+
+negate : f32 -> f32
+negate x = 0.0 - x
+
+dist2 : f32 -> f32 -> f32 -> f32 -> f32
+dist2 x y cx cy = let
+  dx = x - cx
+  dy = y - cy
+  in square dx + square dy
+
+inv1 : f32 -> f32
+inv1 x = 1.0 / (1.0 + x)
+
+glow : f32 -> f32 -> f32 -> f32
+glow amp falloff d2 = amp * inv1 (falloff * d2)
+
+rings : f32 -> f32 -> f32 -> f32
+rings amp freq phase = amp * inv1 (freq * phase * phase)
+
+mix : f32 -> f32 -> f32 -> f32
+mix a b t = a * (1.0 - t) + b * t
+
+bias_centered : f32 -> f32 -> f32
+bias_centered k x = x + k * (0.5 - x)
+
+tone_reinhard : f32 -> f32
+tone_reinhard x = x / (1.0 + x)
+
+tone_exposure : f32 -> f32 -> f32
+tone_exposure exposure x = 1.0 - inv1 (exposure * x)
+
+vignette : f32 -> f32 -> f32
+vignette strength d2 = inv1 (strength * d2)
+
+scanline : f32 -> f32 -> f32 -> f32
+scanline amount line01 color = color * (1.0 - amount * line01)

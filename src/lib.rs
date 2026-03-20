@@ -4,10 +4,14 @@ use std::fs;
 use std::rc::Rc;
 
 mod benchmarks;
+mod formatter;
+mod lsp;
 mod wasm_backend;
 
 pub use benchmarks::bench_command;
 pub use benchmarks::{BenchOptions, bench_command_with_options};
+pub use formatter::{fmt_command, format_program, format_source_text};
+pub use lsp::lsp_command;
 pub use wasm_backend::{
     BoundPreparedRun, PreparedLayout, PreparedSlotKind, PreparedSlotMetadata, PreparedSlotRole,
     PreparedWasmMain, WasmArtifact, WasmExecutable, WasmParamAbi, WasmResultAbi, compile_wasm_main,
@@ -45,8 +49,15 @@ pub struct SurfaceProgram {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Decl {
+    Import(ImportDecl),
     Signature(Signature),
     Clause(Clause),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportDecl {
+    pub path: String,
+    pub alias: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -158,6 +169,7 @@ pub enum Dim {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Module {
+    pub imports: Vec<ImportDecl>,
     pub functions: Vec<FunctionDef>,
 }
 
@@ -301,6 +313,41 @@ pub struct GroupedLoweredProgram {
     pub functions: Vec<GroupedLoweredFunction>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IntentAnalysis {
+    pub reports: Vec<KernelIntentReport>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KernelIntentReport {
+    pub source_name: String,
+    pub leaf_paths: Vec<LeafPath>,
+    pub intent: IntentClass,
+    pub features: KernelFeatures,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IntentClass {
+    MapUnary,
+    MapBinaryBroadcast,
+    MapTernaryBroadcast,
+    GroupedMap,
+    ScalarTailRec,
+    Fallback,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KernelFeatures {
+    pub op_count: usize,
+    pub load_streams: usize,
+    pub store_streams: usize,
+    pub scalar_broadcast_count: usize,
+    pub record_leaf_count: usize,
+    pub rank: usize,
+    pub shape_size: Option<usize>,
+    pub primitive_width_bytes: usize,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct GroupedLoweredFunction {
     pub source_name: String,
@@ -405,6 +452,7 @@ pub struct CompiledProgram {
     pub normalized: NormalizedProgram,
     pub lowered: LoweredProgram,
     pub grouped: GroupedLoweredProgram,
+    pub intents: IntentAnalysis,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -475,6 +523,13 @@ impl Prim {
         match self {
             Self::I32 | Self::F32 => 4,
             Self::I64 | Self::F64 => 2,
+        }
+    }
+
+    fn byte_width(self) -> usize {
+        match self {
+            Self::I32 | Self::F32 => 4,
+            Self::I64 | Self::F64 => 8,
         }
     }
 }
@@ -808,11 +863,14 @@ fn format_float(value: f64) -> String {
 struct Token {
     kind: TokenKind,
     text: String,
+    leading_space: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 enum TokenKind {
     Ident,
+    Import,
+    As,
     Let,
     In,
     Int,
@@ -852,11 +910,29 @@ fn lex(source: &str) -> Result<Vec<Token>> {
             tokens.push(Token {
                 kind: TokenKind::Newline,
                 text: "\\n".to_string(),
+                leading_space: false,
             });
             index += 1;
             continue;
         }
+        let mut leading_space = false;
         if ch.is_whitespace() {
+            leading_space = true;
+            index += 1;
+            while index < chars.len() && chars[index].is_whitespace() && chars[index] != '\n' {
+                index += 1;
+            }
+            if index >= chars.len() {
+                break;
+            }
+        }
+        let ch = chars[index];
+        if ch == '\n' {
+            tokens.push(Token {
+                kind: TokenKind::Newline,
+                text: "\\n".to_string(),
+                leading_space: false,
+            });
             index += 1;
             continue;
         }
@@ -870,17 +946,24 @@ fn lex(source: &str) -> Result<Vec<Token>> {
             }
             let text: String = chars[start..index].iter().collect();
             let kind = match text.as_str() {
+                "import" => TokenKind::Import,
+                "as" => TokenKind::As,
                 "let" => TokenKind::Let,
                 "in" => TokenKind::In,
                 _ => TokenKind::Ident,
             };
-            tokens.push(Token { kind, text });
+            tokens.push(Token {
+                kind,
+                text,
+                leading_space,
+            });
             continue;
         }
         if ch == '_' {
             tokens.push(Token {
                 kind: TokenKind::Ident,
                 text: "_".to_string(),
+                leading_space,
             });
             index += 1;
             continue;
@@ -903,7 +986,11 @@ fn lex(source: &str) -> Result<Vec<Token>> {
                 }
             }
             let text: String = chars[start..index].iter().collect();
-            tokens.push(Token { kind, text });
+            tokens.push(Token {
+                kind,
+                text,
+                leading_space,
+            });
             continue;
         }
         let (kind, width) = match ch {
@@ -957,7 +1044,11 @@ fn lex(source: &str) -> Result<Vec<Token>> {
             }
         };
         let text: String = chars[index..index + width].iter().collect();
-        tokens.push(Token { kind, text });
+        tokens.push(Token {
+            kind,
+            text,
+            leading_space,
+        });
         index += width;
     }
     Ok(tokens)
@@ -966,11 +1057,18 @@ fn lex(source: &str) -> Result<Vec<Token>> {
 struct Parser {
     tokens: Vec<Token>,
     pos: usize,
+    import_aliases: BTreeMap<String, String>,
+    saw_non_import_decl: bool,
 }
 
 impl Parser {
     fn new(tokens: Vec<Token>) -> Self {
-        Self { tokens, pos: 0 }
+        Self {
+            tokens,
+            pos: 0,
+            import_aliases: BTreeMap::new(),
+            saw_non_import_decl: false,
+        }
     }
 
     fn parse_program(&mut self) -> Result<SurfaceProgram> {
@@ -984,6 +1082,15 @@ impl Parser {
     }
 
     fn parse_decl(&mut self) -> Result<Decl> {
+        if self.peek_is(TokenKind::Import) {
+            if self.saw_non_import_decl {
+                return Err(SimdError::new(
+                    "imports must appear before function signatures and clauses",
+                ));
+            }
+            return self.parse_import_decl();
+        }
+        self.saw_non_import_decl = true;
         let name = self.expect_ident()?;
         if self.eat(TokenKind::Colon) {
             let ty = self.parse_type()?;
@@ -999,6 +1106,35 @@ impl Parser {
             patterns,
             body,
         }))
+    }
+
+    fn parse_import_decl(&mut self) -> Result<Decl> {
+        self.expect(TokenKind::Import)?;
+        let mut segments = vec![self.expect_ident()?];
+        while self.eat(TokenKind::Slash) {
+            segments.push(self.expect_ident()?);
+        }
+        let path = segments.join("/");
+        let default_alias = segments
+            .last()
+            .cloned()
+            .ok_or_else(|| SimdError::new("import path cannot be empty"))?;
+        let alias = if self.eat(TokenKind::As) {
+            self.expect_ident()?
+        } else {
+            default_alias
+        };
+        if alias == "_" {
+            return Err(SimdError::new("import alias '_' is not allowed"));
+        }
+        if self.import_aliases.contains_key(&alias) {
+            return Err(SimdError::new(format!(
+                "import alias '{}' is declared more than once",
+                alias
+            )));
+        }
+        self.import_aliases.insert(alias.clone(), path.clone());
+        Ok(Decl::Import(ImportDecl { path, alias }))
     }
 
     fn parse_pattern(&mut self) -> Result<Pattern> {
@@ -1156,6 +1292,11 @@ impl Parser {
             TokenKind::Let => self.parse_let_expr(),
             TokenKind::Ident => {
                 self.pos += 1;
+                if self.can_parse_qualified_name(&token.text) {
+                    self.pos += 1;
+                    let member = self.expect_ident()?;
+                    return Ok(Expr::Name(format!("{}/{}", token.text, member)));
+                }
                 Ok(Expr::Name(token.text))
             }
             TokenKind::Int => {
@@ -1230,6 +1371,7 @@ impl Parser {
 
     fn parse_let_expr(&mut self) -> Result<Expr> {
         self.expect(TokenKind::Let)?;
+        self.skip_newlines();
         let mut bindings = Vec::new();
         loop {
             let name = match self
@@ -1240,6 +1382,7 @@ impl Parser {
                 Token {
                     kind: TokenKind::Ident,
                     text,
+                    ..
                 } => {
                     self.pos += 1;
                     text
@@ -1247,6 +1390,7 @@ impl Parser {
                 Token {
                     kind: TokenKind::Let | TokenKind::In,
                     text,
+                    ..
                 } => {
                     return Err(SimdError::new(format!(
                         "unexpected keyword '{}' in let binding",
@@ -1263,12 +1407,25 @@ impl Parser {
             self.expect(TokenKind::Eq)?;
             let expr = self.parse_expr(0)?;
             bindings.push(LetBinding { name, expr });
+            self.skip_newlines();
             if self.eat(TokenKind::Semicolon) {
+                self.skip_newlines();
+                if self.peek_is(TokenKind::In) {
+                    break;
+                }
+                continue;
+            }
+            if self.peek_is(TokenKind::In) {
+                break;
+            }
+            if self.peek_is(TokenKind::Ident) {
                 continue;
             }
             break;
         }
+        self.skip_newlines();
         self.expect(TokenKind::In)?;
+        self.skip_newlines();
         let body = self.parse_expr(0)?;
         Ok(Expr::Let {
             bindings,
@@ -1317,6 +1474,22 @@ impl Parser {
 
     fn peek_is(&self, kind: TokenKind) -> bool {
         self.peek().map(|token| token.kind.clone()) == Some(kind)
+    }
+
+    fn can_parse_qualified_name(&self, alias: &str) -> bool {
+        if !self.import_aliases.contains_key(alias) {
+            return false;
+        }
+        let Some(slash) = self.peek() else {
+            return false;
+        };
+        let Some(member) = self.tokens.get(self.pos + 1) else {
+            return false;
+        };
+        slash.kind == TokenKind::Slash
+            && member.kind == TokenKind::Ident
+            && !slash.leading_space
+            && !member.leading_space
     }
 
     fn peek(&self) -> Option<&Token> {
@@ -1368,8 +1541,9 @@ pub fn read_source_file(path: &str) -> Result<String> {
 pub fn compile_source(source: &str) -> Result<CompiledProgram> {
     let (surface, module, checked) = compile_frontend(source)?;
     let normalized = normalize_records(&checked)?;
-    let lowered = lower_program(&normalized)?;
+    let lowered = optimize_lowered_program(&lower_program(&normalized)?);
     let grouped = group_lowered_program(&normalized, &lowered)?;
+    let intents = analyze_intents(&grouped);
     Ok(CompiledProgram {
         surface,
         module,
@@ -1377,6 +1551,7 @@ pub fn compile_source(source: &str) -> Result<CompiledProgram> {
         normalized,
         lowered,
         grouped,
+        intents,
     })
 }
 
@@ -1389,12 +1564,23 @@ pub(crate) fn compile_frontend(source: &str) -> Result<(SurfaceProgram, Module, 
 }
 
 fn group_program(surface: &SurfaceProgram) -> Result<Module> {
+    let mut imports = Vec::<ImportDecl>::new();
+    let mut import_aliases = BTreeSet::<String>::new();
     let mut order = Vec::<String>::new();
     let mut signatures = BTreeMap::<String, Signature>::new();
     let mut clauses = BTreeMap::<String, Vec<Clause>>::new();
 
     for decl in &surface.decls {
         match decl {
+            Decl::Import(import_decl) => {
+                if !import_aliases.insert(import_decl.alias.clone()) {
+                    return Err(SimdError::new(format!(
+                        "import alias '{}' is declared more than once",
+                        import_decl.alias
+                    )));
+                }
+                imports.push(import_decl.clone());
+            }
             Decl::Signature(signature) => {
                 if !order.contains(&signature.name) {
                     order.push(signature.name.clone());
@@ -1456,7 +1642,7 @@ fn group_program(surface: &SurfaceProgram) -> Result<Module> {
         )));
     }
 
-    Ok(Module { functions })
+    Ok(Module { imports, functions })
 }
 
 fn validate_signature_shape_contract(signature: &Signature) -> Result<()> {
@@ -1552,6 +1738,11 @@ fn check_program(module: &Module, pointwise: &BTreeMap<String, bool>) -> Result<
         .iter()
         .map(|function| (function.name.clone(), function.signature.clone()))
         .collect();
+    let import_aliases = module
+        .imports
+        .iter()
+        .map(|import| (import.alias.clone(), import.path.clone()))
+        .collect::<BTreeMap<_, _>>();
 
     let mut checked_functions = Vec::new();
     for function in &module.functions {
@@ -1570,6 +1761,7 @@ fn check_program(module: &Module, pointwise: &BTreeMap<String, bool>) -> Result<
             let context = TypeContext {
                 locals: &locals,
                 signatures: &signatures,
+                imports: &import_aliases,
                 pointwise,
             };
             let body = infer_expr(&clause.body, &context, Some(&ret_type))?;
@@ -1630,6 +1822,7 @@ fn check_pattern(pattern: &Pattern, ty: &Type, locals: &mut BTreeMap<String, Typ
 struct TypeContext<'a> {
     locals: &'a BTreeMap<String, Type>,
     signatures: &'a BTreeMap<String, Signature>,
+    imports: &'a BTreeMap<String, String>,
     pointwise: &'a BTreeMap<String, bool>,
 }
 
@@ -1646,7 +1839,7 @@ fn infer_expr(
                     kind: TypedExprKind::Local(name.clone()),
                 });
             }
-            if context.signatures.contains_key(name) {
+            if resolve_signature_name(name, context).is_some() {
                 return Err(SimdError::new(format!(
                     "function '{}' must be called directly; first-class functions are not in v0",
                     name
@@ -1711,6 +1904,7 @@ fn infer_let_expr(
         let binding_context = TypeContext {
             locals: &locals,
             signatures: context.signatures,
+            imports: context.imports,
             pointwise: context.pointwise,
         };
         let typed = infer_expr(&binding.expr, &binding_context, None)?;
@@ -1727,6 +1921,7 @@ fn infer_let_expr(
     let body_context = TypeContext {
         locals: &locals,
         signatures: context.signatures,
+        imports: context.imports,
         pointwise: context.pointwise,
     };
     let typed_body = infer_expr(body, &body_context, expected)?;
@@ -1993,7 +2188,7 @@ fn infer_function_call(
     expected: Option<&Type>,
 ) -> Result<TypedExpr> {
     let (head, args_exprs) = flatten_apps(expr);
-    let name = match head {
+    let raw_name = match head {
         Expr::Name(name) => name,
         _ => {
             return Err(SimdError::new(
@@ -2001,9 +2196,16 @@ fn infer_function_call(
             ));
         }
     };
+    let name = resolve_signature_name(raw_name, context).ok_or_else(|| {
+        SimdError::new(format!(
+            "unknown function '{}'{}",
+            raw_name,
+            render_import_resolution_suffix(raw_name, context)
+        ))
+    })?;
     let signature = context
         .signatures
-        .get(name)
+        .get(&name)
         .ok_or_else(|| SimdError::new(format!("unknown function '{}'", name)))?;
     let (param_types, ret_type) = signature.ty.fun_parts();
     if args_exprs.len() != param_types.len() {
@@ -2025,7 +2227,7 @@ fn infer_function_call(
             AccessKind::Same
         } else {
             let mut trial_shape = lifted_shape.clone();
-            if *context.pointwise.get(name).unwrap_or(&false) {
+            if *context.pointwise.get(&name).unwrap_or(&false) {
                 match unify_lifted_type(&mut trial_shape, param_ty, &typed_arg.ty) {
                     Ok(()) => {
                         lifted_shape = trial_shape;
@@ -2062,11 +2264,45 @@ fn infer_function_call(
     Ok(TypedExpr {
         ty,
         kind: TypedExprKind::Call {
-            callee: Callee::Function(name.clone()),
+            callee: Callee::Function(name),
             args,
             lifted_shape,
         },
     })
+}
+
+fn resolve_signature_name(name: &str, context: &TypeContext<'_>) -> Option<String> {
+    if context.signatures.contains_key(name) {
+        return Some(name.to_string());
+    }
+    let (alias, member) = split_qualified_name(name)?;
+    let path = context.imports.get(alias)?;
+    let qualified = format!("{}/{}", path, member);
+    if context.signatures.contains_key(&qualified) {
+        return Some(qualified);
+    }
+    if context.signatures.contains_key(member) {
+        return Some(member.to_string());
+    }
+    None
+}
+
+fn render_import_resolution_suffix(name: &str, context: &TypeContext<'_>) -> String {
+    let Some((alias, member)) = split_qualified_name(name) else {
+        return String::new();
+    };
+    let Some(path) = context.imports.get(alias) else {
+        return String::new();
+    };
+    format!(" (import '{}' resolves to '{}/{}')", alias, path, member)
+}
+
+fn split_qualified_name(name: &str) -> Option<(&str, &str)> {
+    let (alias, member) = name.split_once('/')?;
+    if alias.is_empty() || member.is_empty() || member.contains('/') {
+        return None;
+    }
+    Some((alias, member))
 }
 
 fn infer_primitive_call(
@@ -3035,6 +3271,341 @@ fn group_lowered_program(
             })
             .collect(),
     })
+}
+
+fn optimize_lowered_program(program: &LoweredProgram) -> LoweredProgram {
+    LoweredProgram {
+        functions: program
+            .functions
+            .iter()
+            .map(optimize_lowered_function)
+            .collect(),
+    }
+}
+
+fn optimize_lowered_function(function: &LoweredFunction) -> LoweredFunction {
+    let kind = match &function.kind {
+        LoweredKind::Scalar { clauses } => LoweredKind::Scalar {
+            clauses: clauses.iter().map(optimize_lowered_clause).collect(),
+        },
+        LoweredKind::Kernel {
+            shape,
+            vector_width,
+            cleanup,
+            clauses,
+        } => LoweredKind::Kernel {
+            shape: shape.clone(),
+            vector_width: *vector_width,
+            cleanup: *cleanup,
+            clauses: clauses.iter().map(optimize_lowered_clause).collect(),
+        },
+    };
+    let tail_loop = function.tail_loop.as_ref().map(optimize_tail_loop);
+    LoweredFunction {
+        name: function.name.clone(),
+        param_access: function.param_access.clone(),
+        result: function.result.clone(),
+        kind,
+        tail_loop,
+    }
+}
+
+fn optimize_tail_loop(tail_loop: &TailLoop) -> TailLoop {
+    TailLoop {
+        clauses: tail_loop
+            .clauses
+            .iter()
+            .map(|clause| TailLoopClause {
+                patterns: clause.patterns.clone(),
+                action: match &clause.action {
+                    TailAction::Continue { args } => TailAction::Continue {
+                        args: args.iter().map(optimize_ir_expr).collect(),
+                    },
+                    TailAction::Return { expr } => TailAction::Return {
+                        expr: optimize_ir_expr(expr),
+                    },
+                },
+            })
+            .collect(),
+    }
+}
+
+fn optimize_lowered_clause(clause: &LoweredClause) -> LoweredClause {
+    LoweredClause {
+        patterns: clause.patterns.clone(),
+        body: optimize_ir_expr(&clause.body),
+    }
+}
+
+fn optimize_ir_expr(expr: &IrExpr) -> IrExpr {
+    let kind = match &expr.kind {
+        IrExprKind::Local(name) => IrExprKind::Local(name.clone()),
+        IrExprKind::Int(value, prim) => IrExprKind::Int(*value, *prim),
+        IrExprKind::Float(value, prim) => IrExprKind::Float(*value, *prim),
+        IrExprKind::Call { callee, args } => {
+            let args = args.iter().map(optimize_ir_expr).collect::<Vec<_>>();
+            fold_int_prim_call(expr.ty.clone(), callee.clone(), args)
+        }
+        IrExprKind::Let { bindings, body } => {
+            let mut optimized_bindings = Vec::<IrLetBinding>::new();
+            let mut alias = BTreeMap::<String, String>::new();
+            for binding in bindings {
+                let mut binding_expr = optimize_ir_expr(&binding.expr);
+                rewrite_locals(&mut binding_expr, &alias);
+                if let Some(existing) = optimized_bindings
+                    .iter()
+                    .find(|existing| existing.expr == binding_expr)
+                    .map(|existing| existing.name.clone())
+                {
+                    alias.insert(binding.name.clone(), existing);
+                    continue;
+                }
+                optimized_bindings.push(IrLetBinding {
+                    name: binding.name.clone(),
+                    expr: binding_expr,
+                });
+            }
+            let mut optimized_body = optimize_ir_expr(body);
+            rewrite_locals(&mut optimized_body, &alias);
+            let pruned = prune_ir_let_bindings(optimized_bindings, &optimized_body);
+            if pruned.is_empty() {
+                return optimized_body;
+            }
+            IrExprKind::Let {
+                bindings: pruned,
+                body: Box::new(optimized_body),
+            }
+        }
+    };
+    IrExpr {
+        ty: expr.ty.clone(),
+        kind,
+    }
+}
+
+fn fold_int_prim_call(ty: Type, callee: Callee, args: Vec<IrExpr>) -> IrExprKind {
+    let Callee::Prim(op) = callee else {
+        return IrExprKind::Call {
+            callee: callee.clone(),
+            args,
+        };
+    };
+    if args.len() != 2 {
+        return IrExprKind::Call {
+            callee: Callee::Prim(op),
+            args,
+        };
+    }
+    let lhs_int = match args[0].kind {
+        IrExprKind::Int(value, prim) if prim.is_int() => Some((value, prim)),
+        _ => None,
+    };
+    let rhs_int = match args[1].kind {
+        IrExprKind::Int(value, prim) if prim.is_int() => Some((value, prim)),
+        _ => None,
+    };
+    if let (Some((lhs, lhs_prim)), Some((rhs, rhs_prim))) = (lhs_int, rhs_int)
+        && lhs_prim == rhs_prim
+    {
+        let folded = match op {
+            PrimOp::Add => lhs.checked_add(rhs),
+            PrimOp::Sub => lhs.checked_sub(rhs),
+            PrimOp::Mul => lhs.checked_mul(rhs),
+            PrimOp::Div => {
+                if rhs == 0 {
+                    None
+                } else {
+                    lhs.checked_div(rhs)
+                }
+            }
+            PrimOp::Mod => {
+                if rhs == 0 {
+                    None
+                } else {
+                    lhs.checked_rem(rhs)
+                }
+            }
+            PrimOp::Eq => Some((lhs == rhs) as i64),
+            PrimOp::Lt => Some((lhs < rhs) as i64),
+            PrimOp::Gt => Some((lhs > rhs) as i64),
+            PrimOp::Le => Some((lhs <= rhs) as i64),
+            PrimOp::Ge => Some((lhs >= rhs) as i64),
+        };
+        if let Some(value) = folded {
+            let result_prim = ty.prim().unwrap_or(lhs_prim);
+            return IrExprKind::Int(value, result_prim);
+        }
+    }
+    IrExprKind::Call {
+        callee: Callee::Prim(op),
+        args,
+    }
+}
+
+fn rewrite_locals(expr: &mut IrExpr, alias: &BTreeMap<String, String>) {
+    match &mut expr.kind {
+        IrExprKind::Local(name) => {
+            if let Some(target) = alias.get(name) {
+                *name = target.clone();
+            }
+        }
+        IrExprKind::Let { bindings, body } => {
+            for binding in bindings {
+                rewrite_locals(&mut binding.expr, alias);
+            }
+            rewrite_locals(body, alias);
+        }
+        IrExprKind::Call { args, .. } => {
+            for arg in args {
+                rewrite_locals(arg, alias);
+            }
+        }
+        IrExprKind::Int(_, _) | IrExprKind::Float(_, _) => {}
+    }
+}
+
+fn prune_ir_let_bindings(bindings: Vec<IrLetBinding>, body: &IrExpr) -> Vec<IrLetBinding> {
+    let mut demanded = collect_ir_local_names(body);
+    let mut kept = Vec::<IrLetBinding>::new();
+    for binding in bindings.into_iter().rev() {
+        if demanded.remove(&binding.name) {
+            demanded.extend(collect_ir_local_names(&binding.expr));
+            kept.push(binding);
+        }
+    }
+    kept.reverse();
+    kept
+}
+
+fn collect_ir_local_names(expr: &IrExpr) -> BTreeSet<String> {
+    let mut names = BTreeSet::<String>::new();
+    collect_ir_local_names_into(expr, &mut names);
+    names
+}
+
+fn collect_ir_local_names_into(expr: &IrExpr, names: &mut BTreeSet<String>) {
+    match &expr.kind {
+        IrExprKind::Local(name) => {
+            names.insert(name.clone());
+        }
+        IrExprKind::Let { bindings, body } => {
+            for binding in bindings {
+                collect_ir_local_names_into(&binding.expr, names);
+            }
+            collect_ir_local_names_into(body, names);
+        }
+        IrExprKind::Call { args, .. } => {
+            for arg in args {
+                collect_ir_local_names_into(arg, names);
+            }
+        }
+        IrExprKind::Int(_, _) | IrExprKind::Float(_, _) => {}
+    }
+}
+
+fn analyze_intents(grouped: &GroupedLoweredProgram) -> IntentAnalysis {
+    IntentAnalysis {
+        reports: grouped
+            .functions
+            .iter()
+            .map(analyze_grouped_function_intent)
+            .collect(),
+    }
+}
+
+fn analyze_grouped_function_intent(function: &GroupedLoweredFunction) -> KernelIntentReport {
+    let lane_inputs = function
+        .param_access
+        .iter()
+        .filter(|access| **access == AccessKind::Lane)
+        .count();
+    let same_inputs = function
+        .param_access
+        .iter()
+        .filter(|access| **access == AccessKind::Same)
+        .count();
+    let record_leaf_count = function.leaf_paths.len();
+    let intent = match &function.kind {
+        GroupedLoweredKind::Scalar { .. } => {
+            if function.tail_loop.is_some() {
+                IntentClass::ScalarTailRec
+            } else {
+                IntentClass::Fallback
+            }
+        }
+        GroupedLoweredKind::Kernel { .. } if record_leaf_count > 1 => IntentClass::GroupedMap,
+        GroupedLoweredKind::Kernel { .. } if lane_inputs == 1 && same_inputs == 0 => {
+            IntentClass::MapUnary
+        }
+        GroupedLoweredKind::Kernel { .. } if lane_inputs == 1 && same_inputs == 1 => {
+            IntentClass::MapBinaryBroadcast
+        }
+        GroupedLoweredKind::Kernel { .. } if lane_inputs == 2 && same_inputs == 1 => {
+            IntentClass::MapTernaryBroadcast
+        }
+        GroupedLoweredKind::Kernel { .. } => IntentClass::Fallback,
+    };
+    let (rank, shape_size) = match &function.kind {
+        GroupedLoweredKind::Kernel { shape, .. } => {
+            let rank = shape.0.len();
+            let shape_size = shape.0.iter().try_fold(1usize, |acc, dim| match dim {
+                Dim::Const(value) => acc.checked_mul(*value),
+                Dim::Var(_) => None,
+            });
+            (rank, shape_size)
+        }
+        GroupedLoweredKind::Scalar { .. } => (0, None),
+    };
+    let op_count = function
+        .leaves
+        .iter()
+        .flat_map(|leaf| match &leaf.kind {
+            LoweredKind::Scalar { clauses } | LoweredKind::Kernel { clauses, .. } => clauses,
+        })
+        .map(|clause| count_primitive_ops(&clause.body))
+        .sum::<usize>();
+    let primitive_width_bytes = function
+        .result_leaves
+        .first()
+        .and_then(|leaf| leaf.ty.prim())
+        .map(|prim| prim.byte_width())
+        .unwrap_or(8);
+    KernelIntentReport {
+        source_name: function.source_name.clone(),
+        leaf_paths: function.leaf_paths.clone(),
+        intent,
+        features: KernelFeatures {
+            op_count,
+            load_streams: lane_inputs,
+            store_streams: record_leaf_count.max(1),
+            scalar_broadcast_count: same_inputs,
+            record_leaf_count,
+            rank,
+            shape_size,
+            primitive_width_bytes,
+        },
+    }
+}
+
+fn count_primitive_ops(expr: &IrExpr) -> usize {
+    match &expr.kind {
+        IrExprKind::Call {
+            callee: Callee::Prim(_),
+            args,
+        } => 1 + args.iter().map(count_primitive_ops).sum::<usize>(),
+        IrExprKind::Call {
+            callee: Callee::Function(_),
+            args,
+        } => args.iter().map(count_primitive_ops).sum(),
+        IrExprKind::Let { bindings, body } => {
+            bindings
+                .iter()
+                .map(|binding| count_primitive_ops(&binding.expr))
+                .sum::<usize>()
+                + count_primitive_ops(body)
+        }
+        IrExprKind::Local(_) | IrExprKind::Int(_, _) | IrExprKind::Float(_, _) => 0,
+    }
 }
 
 fn lower_function(function: &NormalizedFunction) -> Result<LoweredFunction> {
@@ -4343,12 +4914,22 @@ pub fn parse_command(path: &str) -> Result<String> {
 pub fn check_command(path: &str) -> Result<String> {
     let source = read_source_file(path)?;
     let (_surface, _module, checked) = compile_frontend(&source)?;
-    match normalize_records(&checked)
-        .and_then(|normalized| lower_program(&normalized).map(|lowered| (normalized, lowered)))
-    {
-        Ok((normalized, lowered)) => Ok(format!(
-            "Checked Program\n{:#?}\n\nNormalized Program\n{:#?}\n\nLowered Program\n{:#?}",
-            checked, normalized, lowered
+    match normalize_records(&checked).and_then(|normalized| {
+        lower_program(&normalized)
+            .map(|lowered| optimize_lowered_program(&lowered))
+            .map(|lowered| {
+                let grouped = group_lowered_program(&normalized, &lowered).ok();
+                let intents = grouped.as_ref().map(analyze_intents);
+                (normalized, lowered, grouped, intents)
+            })
+    }) {
+        Ok((normalized, lowered, grouped, intents)) => Ok(format!(
+            "Checked Program\n{:#?}\n\nNormalized Program\n{:#?}\n\nLowered Program\n{:#?}\n\nGrouped Program\n{:#?}\n\nIntent Analysis\n{:#?}",
+            checked,
+            normalized,
+            lowered,
+            grouped.unwrap_or(GroupedLoweredProgram { functions: vec![] }),
+            intents.unwrap_or(IntentAnalysis { reports: vec![] }),
         )),
         Err(error) => Ok(format!(
             "Checked Program\n{:#?}\n\nNormalized Program / Lowered Program\n<unavailable: {}>",
@@ -4418,6 +4999,20 @@ fn bundled_examples_inspector_html() -> Result<String> {
             "examples/pow2_i64.simd",
             "main",
             include_str!("../examples/pow2_i64.simd"),
+        ),
+        (
+            "mouse-glow-f32",
+            "mouse-glow-f32",
+            "examples/mouse_glow_f32.simd",
+            "main",
+            include_str!("../examples/mouse_glow_f32.simd"),
+        ),
+        (
+            "mouse-rings-f32",
+            "mouse-rings-f32",
+            "examples/mouse_rings_f32.simd",
+            "main",
+            include_str!("../examples/mouse_rings_f32.simd"),
         ),
     ];
 
@@ -4680,6 +5275,27 @@ mod tests {
     }
 
     #[test]
+    fn parses_import_and_qualified_call() {
+        let program = parse_source(
+            "import math/scalar as scalar\naxpy : i64 -> i64 -> i64 -> i64\naxpy a x y = a * x + y\nmain : i64 -> i64[n] -> i64[n] -> i64[n]\nmain a xs ys = scalar/axpy a xs ys\n",
+        )
+        .unwrap();
+        assert_eq!(program.decls.len(), 5);
+        assert!(matches!(program.decls[0], Decl::Import(_)));
+    }
+
+    #[test]
+    fn rejects_import_after_function_declaration() {
+        let error = parse_source("main : i64 -> i64\nmain x = x\nimport math/scalar as scalar\n")
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("imports must appear before function signatures and clauses")
+        );
+    }
+
+    #[test]
     fn rejects_clause_arity_mismatch() {
         let error = compile_source("f : i64 -> i64\nf x = x\nf x y = y\n").unwrap_err();
         assert!(error.to_string().contains("arity"));
@@ -4717,6 +5333,19 @@ mod tests {
     fn evaluates_broadcast_axpy() {
         let src = "axpy : i64 -> i64 -> i64 -> i64\naxpy a x y = a * x + y\nmain : i64 -> i64[n] -> i64[n] -> i64[n]\nmain a xs ys = axpy a xs ys\n";
         assert_eq!(run(src, "main", "[2,[1,2,3],[10,20,30]]"), "[12,24,36]");
+    }
+
+    #[test]
+    fn evaluates_qualified_alias_call() {
+        let src = "import math/scalar as scalar\naxpy : i64 -> i64 -> i64 -> i64\naxpy a x y = a * x + y\nmain : i64 -> i64[n] -> i64[n] -> i64[n]\nmain a xs ys = scalar/axpy a xs ys\n";
+        assert_eq!(run(src, "main", "[2,[1,2,3],[10,20,30]]"), "[12,24,36]");
+    }
+
+    #[test]
+    fn spaced_slash_stays_division_even_with_import_alias() {
+        let src =
+            "import math/scalar as scalar\nmain : i64 -> i64 -> i64\nmain scalar x = scalar / x\n";
+        assert_eq!(run(src, "main", "[8,2]"), "4");
     }
 
     #[test]
@@ -4894,13 +5523,49 @@ mod tests {
     }
 
     #[test]
+    fn intent_analysis_classifies_broadcast_kernel() {
+        let compiled = compile(
+            "axpy : i64 -> i64 -> i64 -> i64\naxpy a x y = a * x + y\nmain : i64 -> i64[n] -> i64[n] -> i64[n]\nmain a xs ys = axpy a xs ys\n",
+        );
+        let report = compiled
+            .intents
+            .reports
+            .iter()
+            .find(|report| report.source_name == "main")
+            .expect("intent report for main");
+        assert_eq!(report.intent, IntentClass::MapTernaryBroadcast);
+    }
+
+    #[test]
+    fn intent_analysis_classifies_scalar_tailrec() {
+        let compiled =
+            compile("pow2 : i64 -> i64 -> i64\npow2 0 x = x\npow2 n x = pow2 (n - 1) (x * 2)\n");
+        let report = compiled
+            .intents
+            .reports
+            .iter()
+            .find(|report| report.source_name == "pow2")
+            .expect("intent report for pow2");
+        assert_eq!(report.intent, IntentClass::ScalarTailRec);
+    }
+
+    #[test]
     fn inspector_html_embeds_examples_and_wat() {
         let html = bundled_examples_inspector_html().unwrap();
         assert!(html.contains("simd wat inspector"));
         assert!(html.contains("axpy2-record-i64"));
+        assert!(html.contains("mouse-glow-f32"));
+        assert!(html.contains("mouse-rings-f32"));
         assert!(html.contains("(module"));
         assert!(html.contains("color-scheme: dark"));
         assert!(html.contains("--bg: #0b1020"));
         assert!(!html.contains("color-scheme: light"));
+    }
+
+    #[test]
+    fn shader_prelude_example_compiles() {
+        let source = include_str!("../examples/shader_prelude_f32.simd");
+        let compiled = compile_source(source).expect("shader prelude should compile");
+        assert!(!compiled.checked.functions.is_empty());
     }
 }
