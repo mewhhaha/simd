@@ -20,6 +20,16 @@ pub struct WasmArtifact {
     pub result: WasmResultAbi,
     pub grouped_export: Option<WasmGroupedExport>,
     pub leaf_exports: Vec<WasmLeafExport>,
+    pub optimizer_reports: Vec<WasmOptimizationReport>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WasmOptimizationReport {
+    pub function: String,
+    pub intent: IntentClass,
+    pub vectorizable: bool,
+    pub vector_unroll: usize,
+    pub fallback_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -282,8 +292,13 @@ pub fn wasm_command(path: &str, main: &str, out: Option<&str>) -> Result<String>
 
 pub fn wat_main(source: &str, main: &str) -> Result<String> {
     let artifact = compile_wasm_main(source, main)?;
-    wasmprinter::print_bytes(&artifact.bytes)
-        .map_err(|error| SimdError::new(format!("failed to print WAT: {error}")))
+    let wat = wasmprinter::print_bytes(&artifact.bytes)
+        .map_err(|error| SimdError::new(format!("failed to print WAT: {error}")))?;
+    Ok(format!(
+        "{}\n{}",
+        render_optimizer_report_comments(&artifact.optimizer_reports),
+        wat
+    ))
 }
 
 pub fn wat_command(path: &str, main: &str) -> Result<String> {
@@ -295,6 +310,32 @@ pub fn run_wasm_command(path: &str, main: &str, args_json: &str) -> Result<Strin
     let source = read_source_file(path)?;
     let value = run_wasm_main(&source, main, args_json)?;
     Ok(value.to_json_string())
+}
+
+fn render_optimizer_report_comments(reports: &[WasmOptimizationReport]) -> String {
+    if reports.is_empty() {
+        return ";; optimizer: none".to_string();
+    }
+    let mut lines = vec![";; optimizer reports:".to_string()];
+    for report in reports {
+        let plan = match report.vector_unroll {
+            0 => "scalar",
+            1 => "vec1",
+            2 => "vec2",
+            4 => "vec4",
+            _ => "vecN",
+        };
+        let fallback = report
+            .fallback_reason
+            .as_ref()
+            .map(|reason| format!(" fallback={reason}"))
+            .unwrap_or_default();
+        lines.push(format!(
+            ";; - fn={} intent={:?} plan={}{}",
+            report.function, report.intent, plan, fallback
+        ));
+    }
+    lines.join("\n")
 }
 
 impl WasmExecutable {
@@ -1248,10 +1289,19 @@ fn read_output_bulk_i32(bound: &BoundPreparedRun, slot: usize, out: &mut [i32]) 
     }
     let runtime = bound.runtime.borrow();
     let data = runtime.memory.data(&runtime.store);
+    let byte_len = len * 4;
+    let start = ptr;
+    let end = start + byte_len;
+    if cfg!(target_endian = "little") {
+        let out_bytes =
+            unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr().cast::<u8>(), byte_len) };
+        out_bytes.copy_from_slice(&data[start..end]);
+        return Ok(());
+    }
     for (index, item) in out.iter_mut().enumerate() {
-        let start = ptr + (index * 4);
+        let lane_start = ptr + (index * 4);
         let mut bytes = [0u8; 4];
-        bytes.copy_from_slice(&data[start..start + 4]);
+        bytes.copy_from_slice(&data[lane_start..lane_start + 4]);
         *item = i32::from_le_bytes(bytes);
     }
     Ok(())
@@ -1283,10 +1333,19 @@ fn read_output_bulk_i64(bound: &BoundPreparedRun, slot: usize, out: &mut [i64]) 
     }
     let runtime = bound.runtime.borrow();
     let data = runtime.memory.data(&runtime.store);
+    let byte_len = len * 8;
+    let start = ptr;
+    let end = start + byte_len;
+    if cfg!(target_endian = "little") {
+        let out_bytes =
+            unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr().cast::<u8>(), byte_len) };
+        out_bytes.copy_from_slice(&data[start..end]);
+        return Ok(());
+    }
     for (index, item) in out.iter_mut().enumerate() {
-        let start = ptr + (index * 8);
+        let lane_start = ptr + (index * 8);
         let mut bytes = [0u8; 8];
-        bytes.copy_from_slice(&data[start..start + 8]);
+        bytes.copy_from_slice(&data[lane_start..lane_start + 8]);
         *item = i64::from_le_bytes(bytes);
     }
     Ok(())
@@ -1318,10 +1377,19 @@ fn read_output_bulk_f32(bound: &BoundPreparedRun, slot: usize, out: &mut [f32]) 
     }
     let runtime = bound.runtime.borrow();
     let data = runtime.memory.data(&runtime.store);
+    let byte_len = len * 4;
+    let start = ptr;
+    let end = start + byte_len;
+    if cfg!(target_endian = "little") {
+        let out_bytes =
+            unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr().cast::<u8>(), byte_len) };
+        out_bytes.copy_from_slice(&data[start..end]);
+        return Ok(());
+    }
     for (index, item) in out.iter_mut().enumerate() {
-        let start = ptr + (index * 4);
+        let lane_start = ptr + (index * 4);
         let mut bytes = [0u8; 4];
-        bytes.copy_from_slice(&data[start..start + 4]);
+        bytes.copy_from_slice(&data[lane_start..lane_start + 4]);
         *item = f32::from_bits(u32::from_le_bytes(bytes));
     }
     Ok(())
@@ -1353,10 +1421,19 @@ fn read_output_bulk_f64(bound: &BoundPreparedRun, slot: usize, out: &mut [f64]) 
     }
     let runtime = bound.runtime.borrow();
     let data = runtime.memory.data(&runtime.store);
+    let byte_len = len * 8;
+    let start = ptr;
+    let end = start + byte_len;
+    if cfg!(target_endian = "little") {
+        let out_bytes =
+            unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr().cast::<u8>(), byte_len) };
+        out_bytes.copy_from_slice(&data[start..end]);
+        return Ok(());
+    }
     for (index, item) in out.iter_mut().enumerate() {
-        let start = ptr + (index * 8);
+        let lane_start = ptr + (index * 8);
         let mut bytes = [0u8; 8];
-        bytes.copy_from_slice(&data[start..start + 8]);
+        bytes.copy_from_slice(&data[lane_start..lane_start + 8]);
         *item = f64::from_bits(u64::from_le_bytes(bytes));
     }
     Ok(())
@@ -1385,13 +1462,29 @@ fn compile_wasm_artifact_checked(
 ) -> Result<WasmArtifact> {
     let mut plan = build_wasm_plan(checked_program, main)?;
     let normalized = normalize_records(&plan.checked)?;
-    let lowered_program = lower_program(&normalized)?;
+    let lowered_program = optimize_lowered_program(&lower_program(&normalized)?);
     let grouped_program = group_lowered_program(&normalized, &lowered_program)?;
+    let intent_analysis = analyze_intents(&grouped_program);
     let lowered_map: BTreeMap<_, _> = lowered_program
         .functions
         .iter()
         .map(|function| (function.name.clone(), function))
         .collect();
+    let mut intent_by_leaf = BTreeMap::<String, KernelIntentReport>::new();
+    for group in &grouped_program.functions {
+        if let Some(report) = intent_analysis
+            .reports
+            .iter()
+            .find(|report| {
+                report.source_name == group.source_name && report.leaf_paths == group.leaf_paths
+            })
+            .cloned()
+        {
+            for leaf in &group.leaves {
+                intent_by_leaf.insert(leaf.name.clone(), report.clone());
+            }
+        }
+    }
     let flat_param_abis = flatten_wasm_param_abis(&plan.params)?;
     let param_use_summaries = summarize_param_uses(&lowered_program);
     for leaf in &mut plan.leaf_exports {
@@ -1433,6 +1526,7 @@ fn compile_wasm_artifact_checked(
     let mut memory_section = MemorySection::new();
     let mut export_section = ExportSection::new();
     let mut code_section = CodeSection::new();
+    let mut optimizer_reports = Vec::<WasmOptimizationReport>::new();
 
     for function in &plan.checked.functions {
         let lowered = lowered_map.get(&function.name).copied().ok_or_else(|| {
@@ -1465,17 +1559,37 @@ fn compile_wasm_artifact_checked(
         let lowered = lowered_map.get(&function.name).copied().ok_or_else(|| {
             SimdError::new(format!("missing lowered function '{}'", function.name))
         })?;
+        let intent = intent_by_leaf
+            .get(&function.name)
+            .map(|report| report.intent.clone())
+            .unwrap_or(IntentClass::Fallback);
         let wasm_function = match lowered.kind {
             LoweredKind::Scalar { .. } => {
+                optimizer_reports.push(WasmOptimizationReport {
+                    function: function.name.clone(),
+                    intent: if lowered.tail_loop.is_some() {
+                        IntentClass::ScalarTailRec
+                    } else {
+                        intent
+                    },
+                    vectorizable: false,
+                    vector_unroll: 0,
+                    fallback_reason: None,
+                });
                 compile_scalar_function(lowered, function, &scalar_indices, &signatures)?
             }
-            LoweredKind::Kernel { .. } => compile_kernel_entry(
-                lowered,
-                function,
-                &lowered_map,
-                &scalar_indices,
-                &signatures,
-            )?,
+            LoweredKind::Kernel { .. } => {
+                let compiled = compile_kernel_entry(
+                    lowered,
+                    function,
+                    &lowered_map,
+                    &scalar_indices,
+                    &signatures,
+                    intent,
+                )?;
+                optimizer_reports.push(compiled.report);
+                compiled.function
+            }
         };
         code_section.function(&wasm_function);
     }
@@ -1487,8 +1601,20 @@ fn compile_wasm_artifact_checked(
         .iter()
         .filter(|group| group.source_name == main)
     {
-        let Some(compiled_group) =
-            compile_grouped_kernel_function(group, &lowered_map, &scalar_indices, &signatures)?
+        let Some(compiled_group) = compile_grouped_kernel_function(
+            group,
+            &lowered_map,
+            &scalar_indices,
+            &signatures,
+            intent_analysis
+                .reports
+                .iter()
+                .find(|report| {
+                    report.source_name == group.source_name && report.leaf_paths == group.leaf_paths
+                })
+                .map(|report| report.intent.clone())
+                .unwrap_or(IntentClass::GroupedMap),
+        )?
         else {
             continue;
         };
@@ -1501,6 +1627,7 @@ fn compile_wasm_artifact_checked(
         let func_index = next_function_index;
         next_function_index += 1;
         code_section.function(&compiled_group.function);
+        optimizer_reports.push(compiled_group.report);
         grouped_kernel_calls.push(GroupedKernelCall {
             leaf_paths: compiled_group.leaf_paths,
             func_index,
@@ -1543,6 +1670,7 @@ fn compile_wasm_artifact_checked(
         result: plan.result,
         grouped_export,
         leaf_exports: plan.leaf_exports,
+        optimizer_reports,
     })
 }
 
@@ -1732,10 +1860,17 @@ struct GroupedKernelCall {
 }
 
 #[derive(Debug)]
+struct CompiledKernelEntry {
+    function: Function,
+    report: WasmOptimizationReport,
+}
+
+#[derive(Debug)]
 struct CompiledGroupedKernel {
     leaf_paths: Vec<LeafPath>,
     function: Function,
     signature: (Vec<ValType>, Option<ValType>),
+    report: WasmOptimizationReport,
 }
 
 #[derive(Debug, Clone)]
@@ -1750,6 +1885,53 @@ struct GroupedKernelOutput {
     prim: Prim,
     ptr_local: u32,
     len_local: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VectorPlan {
+    ScalarOnly,
+    VectorSingle,
+    VectorUnroll2,
+    VectorUnroll4,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum VectorAddressing {
+    Pointer { lane_offset_elems: u32 },
+}
+
+fn vector_plan_unroll(plan: VectorPlan) -> usize {
+    match plan {
+        VectorPlan::ScalarOnly => 0,
+        VectorPlan::VectorSingle => 1,
+        VectorPlan::VectorUnroll2 => 2,
+        VectorPlan::VectorUnroll4 => 4,
+    }
+}
+
+fn choose_vector_plan(
+    has_vector_clause: bool,
+    vector_width: usize,
+    op_count: usize,
+    load_streams: usize,
+    store_streams: usize,
+) -> (VectorPlan, Option<String>) {
+    if !has_vector_clause {
+        return (
+            VectorPlan::ScalarOnly,
+            Some("non-vectorizable clause".to_string()),
+        );
+    }
+    let total_streams = load_streams.saturating_add(store_streams);
+    let stream_weight = total_streams.max(1);
+    let weighted_ops = op_count.saturating_mul(stream_weight);
+    if vector_width >= 2 && weighted_ops >= 24 && total_streams <= 6 {
+        (VectorPlan::VectorUnroll4, None)
+    } else if vector_width >= 2 && weighted_ops >= 10 {
+        (VectorPlan::VectorUnroll2, None)
+    } else {
+        (VectorPlan::VectorSingle, None)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1783,6 +1965,7 @@ fn compile_grouped_kernel_function(
     lowered_map: &BTreeMap<String, &LoweredFunction>,
     scalar_indices: &BTreeMap<String, u32>,
     signatures: &BTreeMap<String, &CheckedFunction>,
+    intent: IntentClass,
 ) -> Result<Option<CompiledGroupedKernel>> {
     let GroupedLoweredKind::Kernel { vector_width, .. } = &group.kind else {
         return Ok(None);
@@ -1897,19 +2080,32 @@ fn compile_grouped_kernel_function(
     let index_local = wasm_param_index;
     let vector_end_local = wasm_param_index + 1;
     let vector_unrolled_end_local = wasm_param_index + 2;
-    let vector_second_index_local = wasm_param_index + 3;
+    let vector_unrolled4_end_local = wasm_param_index + 3;
     let mut next_local = wasm_param_index + 4;
 
     let mut lane_locals = Vec::<Option<u32>>::new();
+    let mut lane_ptr_locals = Vec::<Option<u32>>::new();
     for param in &abi_params {
         match param {
-            KernelParam::Same { .. } => lane_locals.push(None),
+            KernelParam::Same { .. } => {
+                lane_locals.push(None);
+                lane_ptr_locals.push(None);
+            }
             KernelParam::Lane { prim, .. } => {
                 local_decls.push((1, wasm_val_type(*prim)));
                 lane_locals.push(Some(next_local));
                 next_local += 1;
+                local_decls.push((1, ValType::I32));
+                lane_ptr_locals.push(Some(next_local));
+                next_local += 1;
             }
         }
+    }
+    let mut output_ptr_loop_locals = Vec::with_capacity(outputs.len());
+    for _ in &outputs {
+        local_decls.push((1, ValType::I32));
+        output_ptr_loop_locals.push(next_local);
+        next_local += 1;
     }
 
     let first_len_local = abi_params
@@ -1921,6 +2117,22 @@ fn compile_grouped_kernel_function(
         .ok_or_else(|| SimdError::new("grouped kernel requires at least one bulk parameter"))?;
 
     let vector_clause = vectorizable_grouped_kernel_clause(&prepared_leaves, &abi_params);
+    let op_count = prepared_leaves
+        .iter()
+        .flat_map(|leaf| leaf.clauses.iter())
+        .map(|clause| count_primitive_ops(&clause.body))
+        .sum::<usize>();
+    let load_streams = abi_params
+        .iter()
+        .filter(|param| matches!(param, KernelParam::Lane { .. }))
+        .count();
+    let (vector_plan, fallback_reason) = choose_vector_plan(
+        vector_clause.is_some(),
+        *vector_width,
+        op_count,
+        load_streams,
+        outputs.len(),
+    );
     let variant_locals = kernel_variant_locals(&reference.clauses, &abi_params);
     let vector_hoists = vector_clause
         .as_ref()
@@ -1993,13 +2205,49 @@ fn compile_grouped_kernel_function(
     function.instruction(&Instruction::I32Const(0));
     function.instruction(&Instruction::LocalSet(index_local));
 
+    for (param, loop_ptr_local) in abi_params.iter().zip(&lane_ptr_locals) {
+        if let (KernelParam::Lane { ptr_local, .. }, Some(loop_ptr_local)) = (param, loop_ptr_local)
+        {
+            function.instruction(&Instruction::LocalGet(*ptr_local));
+            function.instruction(&Instruction::LocalSet(*loop_ptr_local));
+        }
+    }
+    for (output, output_ptr_loop_local) in outputs.iter().zip(&output_ptr_loop_locals) {
+        function.instruction(&Instruction::LocalGet(output.ptr_local));
+        function.instruction(&Instruction::LocalSet(*output_ptr_loop_local));
+    }
+
+    let vector_params = abi_params
+        .iter()
+        .zip(&lane_ptr_locals)
+        .map(|(param, ptr_local)| match (param, ptr_local) {
+            (KernelParam::Same { prim, value_local }, _) => KernelParam::Same {
+                prim: *prim,
+                value_local: *value_local,
+            },
+            (
+                KernelParam::Lane {
+                    prim, len_local, ..
+                },
+                Some(loop_ptr_local),
+            ) => KernelParam::Lane {
+                prim: *prim,
+                ptr_local: *loop_ptr_local,
+                len_local: *len_local,
+            },
+            (KernelParam::Lane { .. }, None) => *param,
+        })
+        .collect::<Vec<_>>();
+
     if let Some(vector_clause) = &vector_clause {
         emit_vector_hoists(
             &mut function,
             &vector_hoists,
             &vector_hoisted_locals,
-            &abi_params,
-            index_local,
+            &vector_params,
+            VectorAddressing::Pointer {
+                lane_offset_elems: 0,
+            },
             scalar_indices,
             &vector_clause.locals,
         )?;
@@ -2010,104 +2258,206 @@ fn compile_grouped_kernel_function(
         function.instruction(&Instruction::I32Sub);
         function.instruction(&Instruction::LocalSet(vector_end_local));
 
-        function.instruction(&Instruction::LocalGet(vector_end_local));
-        function.instruction(&Instruction::LocalGet(vector_end_local));
-        function.instruction(&Instruction::I32Const((*vector_width as i32) * 2));
-        function.instruction(&Instruction::I32RemU);
-        function.instruction(&Instruction::I32Sub);
-        function.instruction(&Instruction::LocalSet(vector_unrolled_end_local));
+        if matches!(vector_plan, VectorPlan::VectorUnroll4) {
+            function.instruction(&Instruction::LocalGet(vector_end_local));
+            function.instruction(&Instruction::LocalGet(vector_end_local));
+            function.instruction(&Instruction::I32Const((*vector_width as i32) * 4));
+            function.instruction(&Instruction::I32RemU);
+            function.instruction(&Instruction::I32Sub);
+            function.instruction(&Instruction::LocalSet(vector_unrolled4_end_local));
 
-        function.instruction(&Instruction::Block(BlockType::Empty));
-        function.instruction(&Instruction::Loop(BlockType::Empty));
-        function.instruction(&Instruction::LocalGet(index_local));
-        function.instruction(&Instruction::LocalGet(vector_unrolled_end_local));
-        function.instruction(&Instruction::I32GeU);
-        function.instruction(&Instruction::BrIf(1));
+            function.instruction(&Instruction::Block(BlockType::Empty));
+            function.instruction(&Instruction::Loop(BlockType::Empty));
+            function.instruction(&Instruction::LocalGet(index_local));
+            function.instruction(&Instruction::LocalGet(vector_unrolled4_end_local));
+            function.instruction(&Instruction::I32GeU);
+            function.instruction(&Instruction::BrIf(1));
 
-        for (body, output) in vector_clause.bodies.iter().zip(&outputs) {
-            emit_store_address(
-                &mut function,
-                output.ptr_local,
-                index_local,
-                byte_width(output.prim),
-            );
-            compile_vector_ir_expr(
-                &mut function,
-                body,
-                &vector_clause.locals,
-                &abi_params,
-                index_local,
-                scalar_indices,
-                Some(&vector_hoisted_locals),
-            )?;
-            function.instruction(&Instruction::V128Store(memarg(0, 4)));
+            for chunk in 0..4u32 {
+                for ((body, output), output_ptr_loop_local) in vector_clause
+                    .bodies
+                    .iter()
+                    .zip(&outputs)
+                    .zip(&output_ptr_loop_locals)
+                {
+                    function.instruction(&Instruction::LocalGet(*output_ptr_loop_local));
+                    compile_vector_ir_expr(
+                        &mut function,
+                        body,
+                        &vector_clause.locals,
+                        &vector_params,
+                        VectorAddressing::Pointer {
+                            lane_offset_elems: *vector_width as u32 * chunk,
+                        },
+                        scalar_indices,
+                        Some(&vector_hoisted_locals),
+                    )?;
+                    function.instruction(&Instruction::V128Store(memarg(
+                        u64::from(byte_width(output.prim)) * (*vector_width as u64) * chunk as u64,
+                        4,
+                    )));
+                }
+            }
+
+            for param in &vector_params {
+                if let KernelParam::Lane {
+                    prim, ptr_local, ..
+                } = param
+                {
+                    emit_pointer_bump(
+                        &mut function,
+                        *ptr_local,
+                        byte_width(*prim) * (*vector_width as u32) * 4,
+                    );
+                }
+            }
+            for (output, output_ptr_loop_local) in outputs.iter().zip(&output_ptr_loop_locals) {
+                emit_pointer_bump(
+                    &mut function,
+                    *output_ptr_loop_local,
+                    byte_width(output.prim) * (*vector_width as u32) * 4,
+                );
+            }
+
+            function.instruction(&Instruction::LocalGet(index_local));
+            function.instruction(&Instruction::I32Const((*vector_width as i32) * 4));
+            function.instruction(&Instruction::I32Add);
+            function.instruction(&Instruction::LocalSet(index_local));
+            function.instruction(&Instruction::Br(0));
+            function.instruction(&Instruction::End);
+            function.instruction(&Instruction::End);
         }
 
-        function.instruction(&Instruction::LocalGet(index_local));
-        function.instruction(&Instruction::I32Const(*vector_width as i32));
-        function.instruction(&Instruction::I32Add);
-        function.instruction(&Instruction::LocalSet(vector_second_index_local));
+        if matches!(
+            vector_plan,
+            VectorPlan::VectorUnroll2 | VectorPlan::VectorUnroll4
+        ) {
+            function.instruction(&Instruction::LocalGet(vector_end_local));
+            function.instruction(&Instruction::LocalGet(vector_end_local));
+            function.instruction(&Instruction::I32Const((*vector_width as i32) * 2));
+            function.instruction(&Instruction::I32RemU);
+            function.instruction(&Instruction::I32Sub);
+            function.instruction(&Instruction::LocalSet(vector_unrolled_end_local));
 
-        for (body, output) in vector_clause.bodies.iter().zip(&outputs) {
-            emit_store_address(
-                &mut function,
-                output.ptr_local,
-                vector_second_index_local,
-                byte_width(output.prim),
-            );
-            compile_vector_ir_expr(
-                &mut function,
-                body,
-                &vector_clause.locals,
-                &abi_params,
-                vector_second_index_local,
-                scalar_indices,
-                Some(&vector_hoisted_locals),
-            )?;
-            function.instruction(&Instruction::V128Store(memarg(0, 4)));
+            function.instruction(&Instruction::Block(BlockType::Empty));
+            function.instruction(&Instruction::Loop(BlockType::Empty));
+            function.instruction(&Instruction::LocalGet(index_local));
+            function.instruction(&Instruction::LocalGet(vector_unrolled_end_local));
+            function.instruction(&Instruction::I32GeU);
+            function.instruction(&Instruction::BrIf(1));
+
+            for chunk in 0..2u32 {
+                for ((body, output), output_ptr_loop_local) in vector_clause
+                    .bodies
+                    .iter()
+                    .zip(&outputs)
+                    .zip(&output_ptr_loop_locals)
+                {
+                    function.instruction(&Instruction::LocalGet(*output_ptr_loop_local));
+                    compile_vector_ir_expr(
+                        &mut function,
+                        body,
+                        &vector_clause.locals,
+                        &vector_params,
+                        VectorAddressing::Pointer {
+                            lane_offset_elems: *vector_width as u32 * chunk,
+                        },
+                        scalar_indices,
+                        Some(&vector_hoisted_locals),
+                    )?;
+                    function.instruction(&Instruction::V128Store(memarg(
+                        u64::from(byte_width(output.prim)) * (*vector_width as u64) * chunk as u64,
+                        4,
+                    )));
+                }
+            }
+
+            for param in &vector_params {
+                if let KernelParam::Lane {
+                    prim, ptr_local, ..
+                } = param
+                {
+                    emit_pointer_bump(
+                        &mut function,
+                        *ptr_local,
+                        byte_width(*prim) * (*vector_width as u32) * 2,
+                    );
+                }
+            }
+            for (output, output_ptr_loop_local) in outputs.iter().zip(&output_ptr_loop_locals) {
+                emit_pointer_bump(
+                    &mut function,
+                    *output_ptr_loop_local,
+                    byte_width(output.prim) * (*vector_width as u32) * 2,
+                );
+            }
+
+            function.instruction(&Instruction::LocalGet(index_local));
+            function.instruction(&Instruction::I32Const((*vector_width as i32) * 2));
+            function.instruction(&Instruction::I32Add);
+            function.instruction(&Instruction::LocalSet(index_local));
+            function.instruction(&Instruction::Br(0));
+            function.instruction(&Instruction::End);
+            function.instruction(&Instruction::End);
         }
 
-        function.instruction(&Instruction::LocalGet(index_local));
-        function.instruction(&Instruction::I32Const((*vector_width as i32) * 2));
-        function.instruction(&Instruction::I32Add);
-        function.instruction(&Instruction::LocalSet(index_local));
-        function.instruction(&Instruction::Br(0));
-        function.instruction(&Instruction::End);
-        function.instruction(&Instruction::End);
+        if !matches!(vector_plan, VectorPlan::ScalarOnly) {
+            function.instruction(&Instruction::Block(BlockType::Empty));
+            function.instruction(&Instruction::Loop(BlockType::Empty));
+            function.instruction(&Instruction::LocalGet(index_local));
+            function.instruction(&Instruction::LocalGet(vector_end_local));
+            function.instruction(&Instruction::I32GeU);
+            function.instruction(&Instruction::BrIf(1));
 
-        function.instruction(&Instruction::Block(BlockType::Empty));
-        function.instruction(&Instruction::Loop(BlockType::Empty));
-        function.instruction(&Instruction::LocalGet(index_local));
-        function.instruction(&Instruction::LocalGet(vector_end_local));
-        function.instruction(&Instruction::I32GeU);
-        function.instruction(&Instruction::BrIf(1));
+            for ((body, _output), output_ptr_loop_local) in vector_clause
+                .bodies
+                .iter()
+                .zip(&outputs)
+                .zip(&output_ptr_loop_locals)
+            {
+                function.instruction(&Instruction::LocalGet(*output_ptr_loop_local));
+                compile_vector_ir_expr(
+                    &mut function,
+                    body,
+                    &vector_clause.locals,
+                    &vector_params,
+                    VectorAddressing::Pointer {
+                        lane_offset_elems: 0,
+                    },
+                    scalar_indices,
+                    Some(&vector_hoisted_locals),
+                )?;
+                function.instruction(&Instruction::V128Store(memarg(0, 4)));
+            }
 
-        for (body, output) in vector_clause.bodies.iter().zip(&outputs) {
-            emit_store_address(
-                &mut function,
-                output.ptr_local,
-                index_local,
-                byte_width(output.prim),
-            );
-            compile_vector_ir_expr(
-                &mut function,
-                body,
-                &vector_clause.locals,
-                &abi_params,
-                index_local,
-                scalar_indices,
-                Some(&vector_hoisted_locals),
-            )?;
-            function.instruction(&Instruction::V128Store(memarg(0, 4)));
+            for param in &vector_params {
+                if let KernelParam::Lane {
+                    prim, ptr_local, ..
+                } = param
+                {
+                    emit_pointer_bump(
+                        &mut function,
+                        *ptr_local,
+                        byte_width(*prim) * (*vector_width as u32),
+                    );
+                }
+            }
+            for (output, output_ptr_loop_local) in outputs.iter().zip(&output_ptr_loop_locals) {
+                emit_pointer_bump(
+                    &mut function,
+                    *output_ptr_loop_local,
+                    byte_width(output.prim) * (*vector_width as u32),
+                );
+            }
+
+            function.instruction(&Instruction::LocalGet(index_local));
+            function.instruction(&Instruction::I32Const(*vector_width as i32));
+            function.instruction(&Instruction::I32Add);
+            function.instruction(&Instruction::LocalSet(index_local));
+            function.instruction(&Instruction::Br(0));
+            function.instruction(&Instruction::End);
+            function.instruction(&Instruction::End);
         }
-
-        function.instruction(&Instruction::LocalGet(index_local));
-        function.instruction(&Instruction::I32Const(*vector_width as i32));
-        function.instruction(&Instruction::I32Add);
-        function.instruction(&Instruction::LocalSet(index_local));
-        function.instruction(&Instruction::Br(0));
-        function.instruction(&Instruction::End);
-        function.instruction(&Instruction::End);
     }
 
     let scalar_invariant_locals = kernel_same_locals(&reference.clauses, &abi_params);
@@ -2128,15 +2478,13 @@ fn compile_grouped_kernel_function(
     function.instruction(&Instruction::I32GeU);
     function.instruction(&Instruction::BrIf(1));
 
-    for (param, lane_local) in abi_params.iter().zip(&lane_locals) {
-        if let (
-            KernelParam::Lane {
-                prim, ptr_local, ..
-            },
-            Some(local),
-        ) = (param, lane_local)
+    for ((param, lane_local), loop_ptr_local) in
+        abi_params.iter().zip(&lane_locals).zip(&lane_ptr_locals)
+    {
+        if let (KernelParam::Lane { prim, .. }, Some(local), Some(loop_ptr_local)) =
+            (param, lane_local, loop_ptr_local)
         {
-            emit_lane_load_scalar(&mut function, *ptr_local, index_local, *prim);
+            emit_lane_load_scalar_at_ptr(&mut function, *loop_ptr_local, *prim);
             function.instruction(&Instruction::LocalSet(*local));
         }
     }
@@ -2165,13 +2513,12 @@ fn compile_grouped_kernel_function(
                 &param_prims,
                 Some(&locals),
             )?;
-            for (leaf, output) in prepared_leaves.iter().zip(&outputs) {
-                emit_store_address(
-                    &mut function,
-                    output.ptr_local,
-                    index_local,
-                    byte_width(output.prim),
-                );
+            for ((leaf, output), output_ptr_loop_local) in prepared_leaves
+                .iter()
+                .zip(&outputs)
+                .zip(&output_ptr_loop_locals)
+            {
+                function.instruction(&Instruction::LocalGet(*output_ptr_loop_local));
                 compile_scalar_ir_expr_with_hoists(
                     &mut function,
                     &leaf.clauses[clause_index].body,
@@ -2183,17 +2530,31 @@ fn compile_grouped_kernel_function(
                 )?;
                 emit_scalar_store(&mut function, output.prim);
             }
+            for param in &vector_params {
+                if let KernelParam::Lane {
+                    prim, ptr_local, ..
+                } = param
+                {
+                    emit_pointer_bump(&mut function, *ptr_local, byte_width(*prim));
+                }
+            }
+            for (output, output_ptr_loop_local) in outputs.iter().zip(&output_ptr_loop_locals) {
+                emit_pointer_bump(
+                    &mut function,
+                    *output_ptr_loop_local,
+                    byte_width(output.prim),
+                );
+            }
             emit_scalar_index_bump(&mut function, index_local);
             function.instruction(&Instruction::Br(1));
             function.instruction(&Instruction::End);
         } else {
-            for (leaf, output) in prepared_leaves.iter().zip(&outputs) {
-                emit_store_address(
-                    &mut function,
-                    output.ptr_local,
-                    index_local,
-                    byte_width(output.prim),
-                );
+            for ((leaf, output), output_ptr_loop_local) in prepared_leaves
+                .iter()
+                .zip(&outputs)
+                .zip(&output_ptr_loop_locals)
+            {
+                function.instruction(&Instruction::LocalGet(*output_ptr_loop_local));
                 compile_scalar_ir_expr_with_hoists(
                     &mut function,
                     &leaf.clauses[clause_index].body,
@@ -2204,6 +2565,21 @@ fn compile_grouped_kernel_function(
                     &cleanup_inline_bindings,
                 )?;
                 emit_scalar_store(&mut function, output.prim);
+            }
+            for param in &vector_params {
+                if let KernelParam::Lane {
+                    prim, ptr_local, ..
+                } = param
+                {
+                    emit_pointer_bump(&mut function, *ptr_local, byte_width(*prim));
+                }
+            }
+            for (output, output_ptr_loop_local) in outputs.iter().zip(&output_ptr_loop_locals) {
+                emit_pointer_bump(
+                    &mut function,
+                    *output_ptr_loop_local,
+                    byte_width(output.prim),
+                );
             }
             emit_scalar_index_bump(&mut function, index_local);
             function.instruction(&Instruction::Br(0));
@@ -2221,6 +2597,13 @@ fn compile_grouped_kernel_function(
             .collect(),
         function,
         signature: (wasm_params, None),
+        report: WasmOptimizationReport {
+            function: format!("{}{:?}", group.source_name, group.leaf_paths),
+            intent,
+            vectorizable: !matches!(vector_plan, VectorPlan::ScalarOnly),
+            vector_unroll: vector_plan_unroll(vector_plan),
+            fallback_reason,
+        },
     }))
 }
 
@@ -2632,24 +3015,22 @@ fn compile_scalar_function(
                 let locals = pattern_local_map(&clause.patterns);
                 if clause_has_condition(&clause.patterns) {
                     emit_matching_if(&mut function, &clause.patterns, &param_prims, None)?;
-                    compile_scalar_ir_expr(
+                    emit_tail_position_scalar_return(
                         &mut function,
                         &clause.body,
                         &locals,
                         scalar_indices,
                         signatures,
                     )?;
-                    function.instruction(&Instruction::Return);
                     function.instruction(&Instruction::End);
                 } else {
-                    compile_scalar_ir_expr(
+                    emit_tail_position_scalar_return(
                         &mut function,
                         &clause.body,
                         &locals,
                         scalar_indices,
                         signatures,
                     )?;
-                    function.instruction(&Instruction::Return);
                     break;
                 }
             }
@@ -2673,7 +3054,8 @@ fn compile_kernel_entry(
     lowered_map: &BTreeMap<String, &LoweredFunction>,
     scalar_indices: &BTreeMap<String, u32>,
     signatures: &BTreeMap<String, &CheckedFunction>,
-) -> Result<Function> {
+    intent: IntentClass,
+) -> Result<CompiledKernelEntry> {
     let (param_types, result_ty) = checked.signature.ty.fun_parts();
     let Type::Bulk(result_prim, _) = result_ty else {
         return Err(SimdError::new(format!(
@@ -2745,20 +3127,30 @@ fn compile_kernel_entry(
     let index_local = wasm_param_index + 2;
     let vector_end_local = wasm_param_index + 3;
     let vector_unrolled_end_local = wasm_param_index + 4;
-    let vector_second_index_local = wasm_param_index + 5;
+    let vector_unrolled4_end_local = wasm_param_index + 5;
     let mut next_local = wasm_param_index + 6;
 
     let mut lane_locals = Vec::<Option<u32>>::new();
+    let mut lane_ptr_locals = Vec::<Option<u32>>::new();
     for param in &abi_params {
         match param {
-            KernelParam::Same { .. } => lane_locals.push(None),
+            KernelParam::Same { .. } => {
+                lane_locals.push(None);
+                lane_ptr_locals.push(None);
+            }
             KernelParam::Lane { prim, .. } => {
                 local_decls.push((1, wasm_val_type(*prim)));
                 lane_locals.push(Some(next_local));
                 next_local += 1;
+                local_decls.push((1, ValType::I32));
+                lane_ptr_locals.push(Some(next_local));
+                next_local += 1;
             }
         }
     }
+    local_decls.push((1, ValType::I32));
+    let output_ptr_loop_local = next_local;
+    next_local += 1;
 
     let first_len_local = abi_params
         .iter()
@@ -2769,6 +3161,21 @@ fn compile_kernel_entry(
         .ok_or_else(|| SimdError::new("kernel entry requires at least one bulk parameter"))?;
 
     let vector_clause = vectorizable_kernel_clause(&clauses, &abi_params, result_prim);
+    let op_count = clauses
+        .iter()
+        .map(|clause| count_primitive_ops(&clause.body))
+        .sum::<usize>();
+    let load_streams = abi_params
+        .iter()
+        .filter(|param| matches!(param, KernelParam::Lane { .. }))
+        .count();
+    let (vector_plan, fallback_reason) = choose_vector_plan(
+        vector_clause.is_some(),
+        *vector_width,
+        op_count,
+        load_streams,
+        1,
+    );
     let variant_locals = kernel_variant_locals(&clauses, &abi_params);
     let vector_hoists = vector_clause
         .as_ref()
@@ -2837,13 +3244,47 @@ fn compile_kernel_entry(
     function.instruction(&Instruction::I32Const(0));
     function.instruction(&Instruction::LocalSet(index_local));
 
+    for (param, loop_ptr_local) in abi_params.iter().zip(&lane_ptr_locals) {
+        if let (KernelParam::Lane { ptr_local, .. }, Some(loop_ptr_local)) = (param, loop_ptr_local)
+        {
+            function.instruction(&Instruction::LocalGet(*ptr_local));
+            function.instruction(&Instruction::LocalSet(*loop_ptr_local));
+        }
+    }
+    function.instruction(&Instruction::LocalGet(output_ptr_local));
+    function.instruction(&Instruction::LocalSet(output_ptr_loop_local));
+
+    let vector_params = abi_params
+        .iter()
+        .zip(&lane_ptr_locals)
+        .map(|(param, ptr_local)| match (param, ptr_local) {
+            (KernelParam::Same { prim, value_local }, _) => KernelParam::Same {
+                prim: *prim,
+                value_local: *value_local,
+            },
+            (
+                KernelParam::Lane {
+                    prim, len_local, ..
+                },
+                Some(loop_ptr_local),
+            ) => KernelParam::Lane {
+                prim: *prim,
+                ptr_local: *loop_ptr_local,
+                len_local: *len_local,
+            },
+            (KernelParam::Lane { .. }, None) => *param,
+        })
+        .collect::<Vec<_>>();
+
     if let Some(vector_clause) = vector_clause {
         emit_vector_hoists(
             &mut function,
             &vector_hoists,
             &vector_hoisted_locals,
-            &abi_params,
-            index_local,
+            &vector_params,
+            VectorAddressing::Pointer {
+                lane_offset_elems: 0,
+            },
             scalar_indices,
             &vector_clause.locals,
         )?;
@@ -2854,97 +3295,179 @@ fn compile_kernel_entry(
         function.instruction(&Instruction::I32Sub);
         function.instruction(&Instruction::LocalSet(vector_end_local));
 
-        function.instruction(&Instruction::LocalGet(vector_end_local));
-        function.instruction(&Instruction::LocalGet(vector_end_local));
-        function.instruction(&Instruction::I32Const((*vector_width as i32) * 2));
-        function.instruction(&Instruction::I32RemU);
-        function.instruction(&Instruction::I32Sub);
-        function.instruction(&Instruction::LocalSet(vector_unrolled_end_local));
+        if matches!(vector_plan, VectorPlan::VectorUnroll4) {
+            function.instruction(&Instruction::LocalGet(vector_end_local));
+            function.instruction(&Instruction::LocalGet(vector_end_local));
+            function.instruction(&Instruction::I32Const((*vector_width as i32) * 4));
+            function.instruction(&Instruction::I32RemU);
+            function.instruction(&Instruction::I32Sub);
+            function.instruction(&Instruction::LocalSet(vector_unrolled4_end_local));
 
-        function.instruction(&Instruction::Block(BlockType::Empty));
-        function.instruction(&Instruction::Loop(BlockType::Empty));
-        function.instruction(&Instruction::LocalGet(index_local));
-        function.instruction(&Instruction::LocalGet(vector_unrolled_end_local));
-        function.instruction(&Instruction::I32GeU);
-        function.instruction(&Instruction::BrIf(1));
+            function.instruction(&Instruction::Block(BlockType::Empty));
+            function.instruction(&Instruction::Loop(BlockType::Empty));
+            function.instruction(&Instruction::LocalGet(index_local));
+            function.instruction(&Instruction::LocalGet(vector_unrolled4_end_local));
+            function.instruction(&Instruction::I32GeU);
+            function.instruction(&Instruction::BrIf(1));
 
-        emit_store_address(
-            &mut function,
-            output_ptr_local,
-            index_local,
-            byte_width(result_prim),
-        );
-        compile_vector_ir_expr(
-            &mut function,
-            &vector_clause.body,
-            &vector_clause.locals,
-            &abi_params,
-            index_local,
-            scalar_indices,
-            Some(&vector_hoisted_locals),
-        )?;
-        function.instruction(&Instruction::V128Store(memarg(0, 4)));
+            for chunk in 0..4u32 {
+                function.instruction(&Instruction::LocalGet(output_ptr_loop_local));
+                compile_vector_ir_expr(
+                    &mut function,
+                    &vector_clause.body,
+                    &vector_clause.locals,
+                    &vector_params,
+                    VectorAddressing::Pointer {
+                        lane_offset_elems: *vector_width as u32 * chunk,
+                    },
+                    scalar_indices,
+                    Some(&vector_hoisted_locals),
+                )?;
+                function.instruction(&Instruction::V128Store(memarg(
+                    u64::from(byte_width(result_prim)) * (*vector_width as u64) * chunk as u64,
+                    4,
+                )));
+            }
 
-        function.instruction(&Instruction::LocalGet(index_local));
-        function.instruction(&Instruction::I32Const(*vector_width as i32));
-        function.instruction(&Instruction::I32Add);
-        function.instruction(&Instruction::LocalSet(vector_second_index_local));
-        emit_store_address(
-            &mut function,
-            output_ptr_local,
-            vector_second_index_local,
-            byte_width(result_prim),
-        );
-        compile_vector_ir_expr(
-            &mut function,
-            &vector_clause.body,
-            &vector_clause.locals,
-            &abi_params,
-            vector_second_index_local,
-            scalar_indices,
-            Some(&vector_hoisted_locals),
-        )?;
-        function.instruction(&Instruction::V128Store(memarg(0, 4)));
+            for param in &vector_params {
+                if let KernelParam::Lane {
+                    prim, ptr_local, ..
+                } = param
+                {
+                    emit_pointer_bump(
+                        &mut function,
+                        *ptr_local,
+                        byte_width(*prim) * (*vector_width as u32) * 4,
+                    );
+                }
+            }
+            emit_pointer_bump(
+                &mut function,
+                output_ptr_loop_local,
+                byte_width(result_prim) * (*vector_width as u32) * 4,
+            );
 
-        function.instruction(&Instruction::LocalGet(index_local));
-        function.instruction(&Instruction::I32Const((*vector_width as i32) * 2));
-        function.instruction(&Instruction::I32Add);
-        function.instruction(&Instruction::LocalSet(index_local));
-        function.instruction(&Instruction::Br(0));
-        function.instruction(&Instruction::End);
-        function.instruction(&Instruction::End);
+            function.instruction(&Instruction::LocalGet(index_local));
+            function.instruction(&Instruction::I32Const((*vector_width as i32) * 4));
+            function.instruction(&Instruction::I32Add);
+            function.instruction(&Instruction::LocalSet(index_local));
+            function.instruction(&Instruction::Br(0));
+            function.instruction(&Instruction::End);
+            function.instruction(&Instruction::End);
+        }
 
-        function.instruction(&Instruction::Block(BlockType::Empty));
-        function.instruction(&Instruction::Loop(BlockType::Empty));
-        function.instruction(&Instruction::LocalGet(index_local));
-        function.instruction(&Instruction::LocalGet(vector_end_local));
-        function.instruction(&Instruction::I32GeU);
-        function.instruction(&Instruction::BrIf(1));
+        if matches!(
+            vector_plan,
+            VectorPlan::VectorUnroll2 | VectorPlan::VectorUnroll4
+        ) {
+            function.instruction(&Instruction::LocalGet(vector_end_local));
+            function.instruction(&Instruction::LocalGet(vector_end_local));
+            function.instruction(&Instruction::I32Const((*vector_width as i32) * 2));
+            function.instruction(&Instruction::I32RemU);
+            function.instruction(&Instruction::I32Sub);
+            function.instruction(&Instruction::LocalSet(vector_unrolled_end_local));
 
-        emit_store_address(
-            &mut function,
-            output_ptr_local,
-            index_local,
-            byte_width(result_prim),
-        );
-        compile_vector_ir_expr(
-            &mut function,
-            &vector_clause.body,
-            &vector_clause.locals,
-            &abi_params,
-            index_local,
-            scalar_indices,
-            Some(&vector_hoisted_locals),
-        )?;
-        function.instruction(&Instruction::V128Store(memarg(0, 4)));
+            function.instruction(&Instruction::Block(BlockType::Empty));
+            function.instruction(&Instruction::Loop(BlockType::Empty));
+            function.instruction(&Instruction::LocalGet(index_local));
+            function.instruction(&Instruction::LocalGet(vector_unrolled_end_local));
+            function.instruction(&Instruction::I32GeU);
+            function.instruction(&Instruction::BrIf(1));
 
-        function.instruction(&Instruction::LocalGet(index_local));
-        function.instruction(&Instruction::I32Const(*vector_width as i32));
-        function.instruction(&Instruction::I32Add);
-        function.instruction(&Instruction::LocalSet(index_local));
-        function.instruction(&Instruction::Br(0));
-        function.instruction(&Instruction::End);
-        function.instruction(&Instruction::End);
+            for chunk in 0..2u32 {
+                function.instruction(&Instruction::LocalGet(output_ptr_loop_local));
+                compile_vector_ir_expr(
+                    &mut function,
+                    &vector_clause.body,
+                    &vector_clause.locals,
+                    &vector_params,
+                    VectorAddressing::Pointer {
+                        lane_offset_elems: *vector_width as u32 * chunk,
+                    },
+                    scalar_indices,
+                    Some(&vector_hoisted_locals),
+                )?;
+                function.instruction(&Instruction::V128Store(memarg(
+                    u64::from(byte_width(result_prim)) * (*vector_width as u64) * chunk as u64,
+                    4,
+                )));
+            }
+
+            for param in &vector_params {
+                if let KernelParam::Lane {
+                    prim, ptr_local, ..
+                } = param
+                {
+                    emit_pointer_bump(
+                        &mut function,
+                        *ptr_local,
+                        byte_width(*prim) * (*vector_width as u32) * 2,
+                    );
+                }
+            }
+            emit_pointer_bump(
+                &mut function,
+                output_ptr_loop_local,
+                byte_width(result_prim) * (*vector_width as u32) * 2,
+            );
+
+            function.instruction(&Instruction::LocalGet(index_local));
+            function.instruction(&Instruction::I32Const((*vector_width as i32) * 2));
+            function.instruction(&Instruction::I32Add);
+            function.instruction(&Instruction::LocalSet(index_local));
+            function.instruction(&Instruction::Br(0));
+            function.instruction(&Instruction::End);
+            function.instruction(&Instruction::End);
+        }
+
+        if !matches!(vector_plan, VectorPlan::ScalarOnly) {
+            function.instruction(&Instruction::Block(BlockType::Empty));
+            function.instruction(&Instruction::Loop(BlockType::Empty));
+            function.instruction(&Instruction::LocalGet(index_local));
+            function.instruction(&Instruction::LocalGet(vector_end_local));
+            function.instruction(&Instruction::I32GeU);
+            function.instruction(&Instruction::BrIf(1));
+
+            function.instruction(&Instruction::LocalGet(output_ptr_loop_local));
+            compile_vector_ir_expr(
+                &mut function,
+                &vector_clause.body,
+                &vector_clause.locals,
+                &vector_params,
+                VectorAddressing::Pointer {
+                    lane_offset_elems: 0,
+                },
+                scalar_indices,
+                Some(&vector_hoisted_locals),
+            )?;
+            function.instruction(&Instruction::V128Store(memarg(0, 4)));
+
+            for param in &vector_params {
+                if let KernelParam::Lane {
+                    prim, ptr_local, ..
+                } = param
+                {
+                    emit_pointer_bump(
+                        &mut function,
+                        *ptr_local,
+                        byte_width(*prim) * (*vector_width as u32),
+                    );
+                }
+            }
+            emit_pointer_bump(
+                &mut function,
+                output_ptr_loop_local,
+                byte_width(result_prim) * (*vector_width as u32),
+            );
+
+            function.instruction(&Instruction::LocalGet(index_local));
+            function.instruction(&Instruction::I32Const(*vector_width as i32));
+            function.instruction(&Instruction::I32Add);
+            function.instruction(&Instruction::LocalSet(index_local));
+            function.instruction(&Instruction::Br(0));
+            function.instruction(&Instruction::End);
+            function.instruction(&Instruction::End);
+        }
     }
 
     let scalar_invariant_locals = kernel_same_locals(&clauses, &abi_params);
@@ -2965,15 +3488,13 @@ fn compile_kernel_entry(
     function.instruction(&Instruction::I32GeU);
     function.instruction(&Instruction::BrIf(1));
 
-    for (param, lane_local) in abi_params.iter().zip(&lane_locals) {
-        if let (
-            KernelParam::Lane {
-                prim, ptr_local, ..
-            },
-            Some(local),
-        ) = (param, lane_local)
+    for ((param, lane_local), loop_ptr_local) in
+        abi_params.iter().zip(&lane_locals).zip(&lane_ptr_locals)
+    {
+        if let (KernelParam::Lane { prim, .. }, Some(local), Some(loop_ptr_local)) =
+            (param, lane_local, loop_ptr_local)
         {
-            emit_lane_load_scalar(&mut function, *ptr_local, index_local, *prim);
+            emit_lane_load_scalar_at_ptr(&mut function, *loop_ptr_local, *prim);
             function.instruction(&Instruction::LocalSet(*local));
         }
     }
@@ -2999,12 +3520,7 @@ fn compile_kernel_entry(
                     .collect::<Result<Vec<_>>>()?,
                 Some(&locals),
             )?;
-            emit_store_address(
-                &mut function,
-                output_ptr_local,
-                index_local,
-                byte_width(result_prim),
-            );
+            function.instruction(&Instruction::LocalGet(output_ptr_loop_local));
             compile_scalar_ir_expr_with_hoists(
                 &mut function,
                 &clause.body,
@@ -3015,16 +3531,24 @@ fn compile_kernel_entry(
                 &cleanup_inline_bindings,
             )?;
             emit_scalar_store(&mut function, result_prim);
+            for param in &vector_params {
+                if let KernelParam::Lane {
+                    prim, ptr_local, ..
+                } = param
+                {
+                    emit_pointer_bump(&mut function, *ptr_local, byte_width(*prim));
+                }
+            }
+            emit_pointer_bump(
+                &mut function,
+                output_ptr_loop_local,
+                byte_width(result_prim),
+            );
             emit_scalar_index_bump(&mut function, index_local);
             function.instruction(&Instruction::Br(1));
             function.instruction(&Instruction::End);
         } else {
-            emit_store_address(
-                &mut function,
-                output_ptr_local,
-                index_local,
-                byte_width(result_prim),
-            );
+            function.instruction(&Instruction::LocalGet(output_ptr_loop_local));
             compile_scalar_ir_expr_with_hoists(
                 &mut function,
                 &clause.body,
@@ -3035,6 +3559,19 @@ fn compile_kernel_entry(
                 &cleanup_inline_bindings,
             )?;
             emit_scalar_store(&mut function, result_prim);
+            for param in &vector_params {
+                if let KernelParam::Lane {
+                    prim, ptr_local, ..
+                } = param
+                {
+                    emit_pointer_bump(&mut function, *ptr_local, byte_width(*prim));
+                }
+            }
+            emit_pointer_bump(
+                &mut function,
+                output_ptr_loop_local,
+                byte_width(result_prim),
+            );
             emit_scalar_index_bump(&mut function, index_local);
             function.instruction(&Instruction::Br(0));
         }
@@ -3043,7 +3580,16 @@ fn compile_kernel_entry(
     function.instruction(&Instruction::End);
     function.instruction(&Instruction::End);
     function.instruction(&Instruction::End);
-    Ok(function)
+    Ok(CompiledKernelEntry {
+        function,
+        report: WasmOptimizationReport {
+            function: checked.name.clone(),
+            intent,
+            vectorizable: !matches!(vector_plan, VectorPlan::ScalarOnly),
+            vector_unroll: vector_plan_unroll(vector_plan),
+            fallback_reason,
+        },
+    })
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3213,7 +3759,10 @@ fn collect_hoisted_expr<'a>(
 
 fn should_hoist_expr(expr: &IrExpr, mode: HoistMode) -> bool {
     match mode {
-        HoistMode::Vector => true,
+        HoistMode::Vector => !matches!(
+            expr.kind,
+            IrExprKind::Local(_) | IrExprKind::Int(_, _) | IrExprKind::Float(_, _)
+        ),
         HoistMode::ScalarCleanup => !matches!(
             expr.kind,
             IrExprKind::Local(_) | IrExprKind::Int(_, _) | IrExprKind::Float(_, _)
@@ -3267,7 +3816,7 @@ fn emit_vector_hoists(
     hoisted: &[HoistedExpr<'_>],
     hoisted_locals: &BTreeMap<HoistExprKey, u32>,
     params: &[KernelParam],
-    index_local: u32,
+    addressing: VectorAddressing,
     scalar_indices: &BTreeMap<String, u32>,
     locals: &BTreeMap<String, usize>,
 ) -> Result<()> {
@@ -3282,7 +3831,7 @@ fn emit_vector_hoists(
             hoisted_expr.expr,
             locals,
             params,
-            index_local,
+            addressing,
             scalar_indices,
             &emitted,
             &inline_bindings,
@@ -3477,6 +4026,59 @@ fn compile_scalar_ir_expr(
         &BTreeMap::new(),
         &inline_bindings,
     )
+}
+
+fn emit_tail_position_scalar_return(
+    function: &mut Function,
+    expr: &IrExpr,
+    locals: &BTreeMap<String, u32>,
+    scalar_indices: &BTreeMap<String, u32>,
+    signatures: &BTreeMap<String, &CheckedFunction>,
+) -> Result<()> {
+    if let IrExprKind::Call {
+        callee: Callee::Function(name),
+        args,
+    } = &expr.kind
+    {
+        let checked = signatures
+            .get(name)
+            .copied()
+            .ok_or_else(|| SimdError::new(format!("missing checked signature for '{}'", name)))?;
+        let (params, result) = checked.signature.ty.fun_parts();
+        if result != expr.ty {
+            return Err(SimdError::new(format!(
+                "Wasm scalar tail call '{}' returns {:?}, expected {:?}",
+                name, result, expr.ty
+            )));
+        }
+        if params.len() != args.len() {
+            return Err(SimdError::new(format!(
+                "Wasm scalar tail call '{}' received {} args, expected {}",
+                name,
+                args.len(),
+                params.len()
+            )));
+        }
+        for (arg, ty) in args.iter().zip(params.iter()) {
+            compile_scalar_ir_expr(function, arg, locals, scalar_indices, signatures)?;
+            if &arg.ty != ty {
+                return Err(SimdError::new(format!(
+                    "Wasm scalar tail call '{}' received {:?}, expected {:?}",
+                    name, arg.ty, ty
+                )));
+            }
+        }
+        let index = scalar_indices
+            .get(name)
+            .copied()
+            .ok_or_else(|| SimdError::new(format!("missing Wasm function index for '{}'", name)))?;
+        function.instruction(&Instruction::ReturnCall(index));
+        return Ok(());
+    }
+
+    compile_scalar_ir_expr(function, expr, locals, scalar_indices, signatures)?;
+    function.instruction(&Instruction::Return);
+    Ok(())
 }
 
 fn compile_scalar_ir_expr_with_hoists(
@@ -3830,7 +4432,7 @@ fn compile_vector_ir_expr(
     expr: &IrExpr,
     locals: &BTreeMap<String, usize>,
     params: &[KernelParam],
-    index_local: u32,
+    addressing: VectorAddressing,
     scalar_indices: &BTreeMap<String, u32>,
     hoisted_locals: Option<&BTreeMap<HoistExprKey, u32>>,
 ) -> Result<()> {
@@ -3841,7 +4443,7 @@ fn compile_vector_ir_expr(
         expr,
         locals,
         params,
-        index_local,
+        addressing,
         scalar_indices,
         hoisted_locals.unwrap_or(&empty),
         &inline_bindings,
@@ -3853,7 +4455,7 @@ fn compile_vector_ir_expr_with_hoists(
     expr: &IrExpr,
     locals: &BTreeMap<String, usize>,
     params: &[KernelParam],
-    index_local: u32,
+    addressing: VectorAddressing,
     scalar_indices: &BTreeMap<String, u32>,
     hoisted_locals: &BTreeMap<HoistExprKey, u32>,
     inline_bindings: &BTreeMap<String, IrExpr>,
@@ -3872,7 +4474,7 @@ fn compile_vector_ir_expr_with_hoists(
                     }
                     KernelParam::Lane {
                         prim, ptr_local, ..
-                    } => emit_vector_load(function, prim, ptr_local, index_local),
+                    } => emit_vector_load(function, prim, ptr_local, addressing),
                 }
             } else if let Some(inline_expr) = inline_bindings.get(name) {
                 compile_vector_ir_expr_with_hoists(
@@ -3880,7 +4482,7 @@ fn compile_vector_ir_expr_with_hoists(
                     inline_expr,
                     locals,
                     params,
-                    index_local,
+                    addressing,
                     scalar_indices,
                     hoisted_locals,
                     inline_bindings,
@@ -3901,7 +4503,7 @@ fn compile_vector_ir_expr_with_hoists(
                 body,
                 locals,
                 params,
-                index_local,
+                addressing,
                 scalar_indices,
                 hoisted_locals,
                 &extended,
@@ -3920,7 +4522,7 @@ fn compile_vector_ir_expr_with_hoists(
                     &args[0],
                     locals,
                     params,
-                    index_local,
+                    addressing,
                     scalar_indices,
                     hoisted_locals,
                     inline_bindings,
@@ -3930,7 +4532,7 @@ fn compile_vector_ir_expr_with_hoists(
                     &args[1],
                     locals,
                     params,
-                    index_local,
+                    addressing,
                     scalar_indices,
                     hoisted_locals,
                     inline_bindings,
@@ -3997,10 +4599,19 @@ fn emit_vector_splat_float(function: &mut Function, prim: Prim, value: f64) -> R
     Ok(())
 }
 
-fn emit_vector_load(function: &mut Function, prim: Prim, ptr_local: u32, index_local: u32) {
-    emit_store_address(function, ptr_local, index_local, byte_width(prim));
-    let _ = prim;
-    function.instruction(&Instruction::V128Load(memarg(0, 4)));
+fn emit_vector_load(
+    function: &mut Function,
+    prim: Prim,
+    ptr_local: u32,
+    addressing: VectorAddressing,
+) {
+    match addressing {
+        VectorAddressing::Pointer { lane_offset_elems } => {
+            function.instruction(&Instruction::LocalGet(ptr_local));
+            let offset = (lane_offset_elems as u64) * u64::from(byte_width(prim));
+            function.instruction(&Instruction::V128Load(memarg(offset, 4)));
+        }
+    }
 }
 
 fn emit_vector_primitive(function: &mut Function, op: PrimOp, prim: Prim) -> Result<()> {
@@ -4057,8 +4668,8 @@ fn emit_vector_primitive(function: &mut Function, op: PrimOp, prim: Prim) -> Res
     Ok(())
 }
 
-fn emit_lane_load_scalar(function: &mut Function, ptr_local: u32, index_local: u32, prim: Prim) {
-    emit_store_address(function, ptr_local, index_local, byte_width(prim));
+fn emit_lane_load_scalar_at_ptr(function: &mut Function, ptr_local: u32, prim: Prim) {
+    function.instruction(&Instruction::LocalGet(ptr_local));
     match prim {
         Prim::I32 => {
             function.instruction(&Instruction::I32Load(memarg(0, 2)));
@@ -4073,16 +4684,6 @@ fn emit_lane_load_scalar(function: &mut Function, ptr_local: u32, index_local: u
             function.instruction(&Instruction::F64Load(memarg(0, 3)));
         }
     }
-}
-
-fn emit_store_address(function: &mut Function, base_local: u32, index_local: u32, elem_size: u32) {
-    function.instruction(&Instruction::LocalGet(base_local));
-    function.instruction(&Instruction::LocalGet(index_local));
-    if elem_size != 1 {
-        function.instruction(&Instruction::I32Const(elem_size as i32));
-        function.instruction(&Instruction::I32Mul);
-    }
-    function.instruction(&Instruction::I32Add);
 }
 
 fn emit_scalar_store(function: &mut Function, prim: Prim) {
@@ -4100,6 +4701,13 @@ fn emit_scalar_store(function: &mut Function, prim: Prim) {
             function.instruction(&Instruction::F64Store(memarg(0, 3)));
         }
     }
+}
+
+fn emit_pointer_bump(function: &mut Function, ptr_local: u32, bytes: u32) {
+    function.instruction(&Instruction::LocalGet(ptr_local));
+    function.instruction(&Instruction::I32Const(bytes as i32));
+    function.instruction(&Instruction::I32Add);
+    function.instruction(&Instruction::LocalSet(ptr_local));
 }
 
 fn emit_scalar_index_bump(function: &mut Function, index_local: u32) {
@@ -4196,8 +4804,10 @@ fn build_wasm_plan(checked_program: &CheckedProgram, main: &str) -> Result<WasmP
         })
         .collect::<Result<Vec<_>>>()?;
 
-    let params = wasm_param_abi_from_type(&main_function.signature.ty.fun_parts().0)?;
-    let result = wasm_result_abi_from_type(&main_function.signature.ty.fun_parts().1)?;
+    let main_param_types = main_function.signature.ty.fun_parts().0;
+    let params = wasm_param_abi_from_type(&main_param_types)?;
+    let result =
+        wasm_result_abi_from_type(&main_function.signature.ty.fun_parts().1, &main_param_types)?;
 
     Ok(WasmPlan {
         checked: CheckedProgram {
@@ -4565,22 +5175,44 @@ fn wasm_param_abi_from_single_type(ty: &Type) -> Result<WasmParamAbi> {
     }
 }
 
-fn wasm_result_abi_from_type(ty: &Type) -> Result<WasmResultAbi> {
+fn wasm_result_abi_from_type(ty: &Type, param_types: &[Type]) -> Result<WasmResultAbi> {
     match ty {
         Type::Scalar(prim) => Ok(WasmResultAbi::Scalar { prim: *prim }),
         Type::Bulk(prim, _) => Ok(WasmResultAbi::Bulk {
             prim: *prim,
-            shape_param: 0,
+            shape_param: param_types
+                .iter()
+                .position(type_contains_bulk_leaf)
+                .ok_or_else(|| {
+                    SimdError::new(
+                        "Wasm bulk entry result requires a top-level bulk input shape source",
+                    )
+                })?,
         }),
         Type::Record(fields) => Ok(WasmResultAbi::Record {
             fields: fields
                 .iter()
-                .map(|(name, field_ty)| Ok((name.clone(), wasm_result_abi_from_type(field_ty)?)))
+                .map(|(name, field_ty)| {
+                    Ok((
+                        name.clone(),
+                        wasm_result_abi_from_type(field_ty, param_types)?,
+                    ))
+                })
                 .collect::<Result<Vec<_>>>()?,
         }),
         Type::Fun(_, _) => Err(SimdError::new(
             "Wasm backend does not support higher-order entry results",
         )),
+    }
+}
+
+fn type_contains_bulk_leaf(ty: &Type) -> bool {
+    match ty {
+        Type::Bulk(_, _) => true,
+        Type::Record(fields) => fields
+            .iter()
+            .any(|(_, field_ty)| type_contains_bulk_leaf(field_ty)),
+        Type::Scalar(_) | Type::Fun(_, _) => false,
     }
 }
 
@@ -4645,6 +5277,7 @@ fn type_at_leaf_path(ty: &Type, leaf_path: &LeafPath) -> Result<Type> {
 fn build_engine() -> Result<Engine> {
     let mut config = Config::new();
     config.wasm_simd(true);
+    config.wasm_tail_call(true);
     config.cranelift_opt_level(OptLevel::Speed);
     Engine::new(&config).map_err(|error| SimdError::new(format!("wasmtime engine error: {error}")))
 }
@@ -5763,6 +6396,60 @@ mod tests {
     }
 
     #[test]
+    fn wat_includes_optimizer_report_comments() {
+        let src = "axpy : i64 -> i64 -> i64 -> i64\naxpy a x y = a * x + y\nmain : i64 -> i64[n] -> i64[n] -> i64[n]\nmain a xs ys = axpy a xs ys\n";
+        let wat = wat_main(src, "main").expect("WAT should be printable");
+        assert!(wat.contains(";; optimizer reports:"));
+        assert!(wat.contains("fn=main"));
+        assert!(
+            wat.contains("plan=vec1") || wat.contains("plan=vec2") || wat.contains("plan=vec4")
+        );
+    }
+
+    #[test]
+    fn artifact_includes_vector_plan_fallback_reason() {
+        let src = "pow2 : i64 -> i64 -> i64\npow2 0 x = x\npow2 n x = pow2 (n - 1) (x * 2)\nmain : i64[n] -> i64[n]\nmain xs = pow2 3 xs\n";
+        let artifact = compile_wasm_main(src, "main").expect("artifact should compile");
+        let main_report = artifact
+            .optimizer_reports
+            .iter()
+            .find(|report| report.function == "main")
+            .expect("main optimizer report should be present");
+        assert_eq!(main_report.vector_unroll, 0);
+        assert_eq!(
+            main_report.fallback_reason.as_deref(),
+            Some("non-vectorizable clause")
+        );
+    }
+
+    #[test]
+    fn wat_uses_pointer_induction_without_index_stride_multiply() {
+        let src = "axpy : i64 -> i64 -> i64 -> i64\naxpy a x y = a * x + y\nmain : i64 -> i64[n] -> i64[n] -> i64[n]\nmain a xs ys = axpy a xs ys\n";
+        let wat = wat_main(src, "main").expect("WAT should be printable");
+        assert!(!wat.contains("i32.mul"));
+    }
+
+    #[test]
+    fn wat_uses_return_call_for_scalar_tail_position_call() {
+        let src = "id : i64 -> i64\nid x = x\nforward : i64 -> i64\nforward x = id x\nmain : i64 -> i64\nmain x = forward x\n";
+        let wat = wat_main(src, "main").expect("WAT should be printable");
+        assert!(wat.contains("return_call"));
+        assert_eq!(wasm_run(src, "main", "[41]"), "41");
+    }
+
+    #[test]
+    fn dense_kernel_can_select_vec4_unroll() {
+        let src = "mix : i64 -> i64 -> i64 -> i64 -> i64 -> i64 -> i64\nmix a b c d x y = ((a * x + y) * (b * x + y)) + ((c * x + y) * (d * x + y))\nmain : i64 -> i64 -> i64 -> i64 -> i64[n] -> i64[n] -> i64[n]\nmain a b c d xs ys = mix a b c d xs ys\n";
+        let artifact = compile_wasm_main(src, "main").expect("artifact should compile");
+        let report = artifact
+            .optimizer_reports
+            .iter()
+            .find(|report| report.function == "main")
+            .expect("main optimizer report should exist");
+        assert_eq!(report.vector_unroll, 4);
+    }
+
+    #[test]
     fn wasm_direct_path_eligibility_is_structural() {
         let artifact = WasmArtifact {
             bytes: Vec::new(),
@@ -5777,12 +6464,27 @@ mod tests {
                 used_param_leaves: Vec::new(),
                 reusable_param_leaf: None,
             }],
+            optimizer_reports: Vec::new(),
         };
         assert!(can_use_direct_wasm_path(&artifact));
 
         let mut grouped = artifact.clone();
         grouped.leaf_exports[0].leaf_path = LeafPath(vec!["x".to_string()]);
         assert!(!can_use_direct_wasm_path(&grouped));
+    }
+
+    #[test]
+    fn wasm_bulk_result_shape_param_uses_top_level_bulk_index() {
+        let src = "axpy : i64 -> i64 -> i64 -> i64\naxpy a x y = a * x + y\nmain : i64 -> i64[n] -> i64[n] -> i64[n]\nmain a xs ys = axpy a xs ys\n";
+        let artifact = compile_wasm_main(src, "main").expect("axpy artifact should compile");
+        assert_eq!(
+            artifact.result,
+            WasmResultAbi::Bulk {
+                prim: Prim::I64,
+                shape_param: 1,
+            }
+        );
+        assert!(can_use_direct_wasm_path(&artifact));
     }
 
     #[test]
@@ -6178,9 +6880,14 @@ mod tests {
             .iter()
             .find(|group| group.source_name == "main" && group.leaf_paths.len() == 2)
             .expect("expected grouped record kernel for main");
-        let compiled =
-            compile_grouped_kernel_function(group, &lowered_map, &scalar_indices, &signatures)
-                .unwrap();
+        let compiled = compile_grouped_kernel_function(
+            group,
+            &lowered_map,
+            &scalar_indices,
+            &signatures,
+            IntentClass::GroupedMap,
+        )
+        .unwrap();
         assert!(compiled.is_some());
     }
 
