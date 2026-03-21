@@ -64,3 +64,24 @@ Notable optimizer plans observed:
 cargo run --release -- bench all --size 262144 --iters 3
 cargo run --release -- bench matrix --iters 1
 ```
+
+## Type Witness Dispatch (`Type t`)
+
+Use `Type t` parameters when you want compile-time style branching in pure source:
+
+```simd
+my_func : Type t -> t -> t
+my_func i64 x = x + 1
+my_func i32 x = x + 2
+my_func _ x = x
+```
+
+Run through the evaluator path with JSON type witness args:
+
+```sh
+cargo run -- run examples/type_dispatch.simd --main main --args '["i64", 41]'
+```
+
+Current backend status:
+- evaluator path supports `Type t` witness arguments and type-pattern clauses
+- normalization/lowering/Wasm still reject `Type t` programs in this milestone

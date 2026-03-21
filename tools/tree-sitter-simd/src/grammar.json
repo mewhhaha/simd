@@ -201,6 +201,10 @@
         },
         {
           "type": "SYMBOL",
+          "name": "prim_type"
+        },
+        {
+          "type": "SYMBOL",
           "name": "identifier"
         },
         {
@@ -279,6 +283,34 @@
           }
         },
         {
+          "type": "PREC_LEFT",
+          "value": 0,
+          "content": {
+            "type": "SEQ",
+            "members": [
+              {
+                "type": "FIELD",
+                "name": "constructor",
+                "content": {
+                  "type": "SYMBOL",
+                  "name": "type_constructor"
+                }
+              },
+              {
+                "type": "REPEAT1",
+                "content": {
+                  "type": "FIELD",
+                  "name": "argument",
+                  "content": {
+                    "type": "SYMBOL",
+                    "name": "type_atom"
+                  }
+                }
+              }
+            ]
+          }
+        },
+        {
           "type": "SYMBOL",
           "name": "type_base"
         }
@@ -290,6 +322,10 @@
         {
           "type": "SYMBOL",
           "name": "prim_type"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "identifier"
         },
         {
           "type": "SYMBOL",
@@ -334,6 +370,10 @@
           "value": "f64"
         }
       ]
+    },
+    "type_constructor": {
+      "type": "PATTERN",
+      "value": "[A-Z][a-zA-Z0-9_]*"
     },
     "record_type": {
       "type": "SEQ",
@@ -894,6 +934,10 @@
         },
         {
           "type": "SYMBOL",
+          "name": "prim_type"
+        },
+        {
+          "type": "SYMBOL",
           "name": "identifier"
         },
         {
@@ -951,8 +995,17 @@
                 "type": "FIELD",
                 "name": "segment",
                 "content": {
-                  "type": "SYMBOL",
-                  "name": "identifier"
+                  "type": "CHOICE",
+                  "members": [
+                    {
+                      "type": "SYMBOL",
+                      "name": "identifier"
+                    },
+                    {
+                      "type": "SYMBOL",
+                      "name": "prim_type"
+                    }
+                  ]
                 }
               }
             ]

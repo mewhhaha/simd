@@ -1,0 +1,5 @@
+wrap : Type t -> t -> t
+wrap i64 x = x
+
+main : i64 -> i64
+main x = scalar\axpy\i64 x

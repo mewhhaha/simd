@@ -4,7 +4,14 @@
 
 (clause
   name: (identifier) @function
-  pattern: (pattern (identifier) @variable.parameter))
+  [
+    pattern: (pattern (identifier)) @variable.parameter
+    pattern: (pattern (prim_type)) @type.builtin
+  ])
+
+(qualified_ref
+  head: (identifier) @function
+  segment: (identifier) @function)
 
 (let_expr
   "let" @keyword

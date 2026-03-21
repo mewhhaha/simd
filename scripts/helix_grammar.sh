@@ -3,6 +3,9 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 grammar_dir="$repo_root/tools/tree-sitter-simd"
+cache_home="${XDG_CACHE_HOME:-$repo_root/.tools/cache}"
+mkdir -p "$cache_home"
+export XDG_CACHE_HOME="$cache_home"
 
 resolve_tree_sitter_bin() {
   if [[ -n "${TREE_SITTER_BIN:-}" ]]; then

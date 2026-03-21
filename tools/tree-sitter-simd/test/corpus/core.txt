@@ -144,3 +144,106 @@ axpy a x y = a * x + y
                 (postfix_expr
                   (atom
                     (identifier)))))))))))
+
+==================
+type witness signature
+==================
+
+wrap : Type t -> t -> t
+
+---
+
+(source_file
+  (declaration
+    (signature
+      name: (identifier)
+      type: (type
+        arg: (type_atom
+          constructor: (type_constructor)
+          argument: (type_atom
+            (type_base
+              (identifier))))
+        result: (type
+          arg: (type_atom
+            (type_base
+              (identifier)))
+          result: (type
+            (type_atom
+              (type_base
+                (identifier)))))))))
+
+==================
+primitive witness pattern
+==================
+
+wrap i64 x = x
+
+---
+
+(source_file
+  (declaration
+    (clause
+      name: (identifier)
+      pattern: (pattern
+        (prim_type))
+      pattern: (pattern
+        (identifier))
+      body: (expr
+        (comparison_expr
+          (add_expr
+              (mul_expr
+                (application_expr
+                  (postfix_expr
+                    (atom
+                      (identifier)))))))))))
+
+==================
+specialization chain signature
+==================
+
+main : i64 -> i64
+
+---
+
+(source_file
+  (declaration
+    (signature
+      name: (identifier)
+      type: (type
+        arg: (type_atom
+          (type_base
+            (prim_type)))
+        result: (type
+          (type_atom
+            (type_base
+              (prim_type))))))))
+
+==================
+specialization chain with primitive segments
+==================
+
+main x = scalar\axpy\i64 x
+
+---
+
+(source_file
+  (declaration
+    (clause
+      name: (identifier)
+      pattern: (pattern
+        (identifier))
+      body: (expr
+        (comparison_expr
+          (add_expr
+            (mul_expr
+              (application_expr
+                function: (application_expr
+                  (postfix_expr
+                    (atom
+                      (qualified_ref
+                        head: (identifier)
+                        segment: (identifier)
+                        segment: (prim_type)))))
+                argument: (postfix_expr
+                  (atom
+                    (identifier)))))))))))

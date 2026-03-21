@@ -1,6 +1,26 @@
+id : t -> t
+id x = x
+
+const : t -> u -> t
+const x _ = x
+
+square_t : t -> t
+square_t x = x * x
+
+cube_t : t -> t
+cube_t x = x * x * x
+
+negate_t : t -> t
+negate_t x = 0 - x
+
+plus1_t : t -> t
+plus1_t x = x + 1
+
+axpy_t : t -> t -> t -> t
+axpy_t a x y = a * x + y
+
 square : f32 -> f32
 square x = x * x
-
 
 cube : f32 -> f32
 cube x = x * x * x

@@ -113,6 +113,7 @@ fn format_type_atom(ty: &Type) -> String {
     match ty {
         Type::Scalar(prim) => format_prim(*prim).to_string(),
         Type::Bulk(prim, shape) => format!("{}{}", format_prim(*prim), format_shape(shape)),
+        Type::TypeToken(inner) => format!("Type {}", format_type_atom(inner)),
         Type::Record(fields) => {
             let mut parts = Vec::with_capacity(fields.len());
             for (name, field_ty) in fields {
@@ -142,6 +143,7 @@ fn format_pattern(pattern: &Pattern) -> String {
     match pattern {
         Pattern::Int(value) => value.to_string(),
         Pattern::Float(value) => super::format_float(*value),
+        Pattern::Type(prim) => format_prim(*prim).to_string(),
         Pattern::Name(name) => name.clone(),
         Pattern::Wildcard => "_".to_string(),
     }
@@ -366,10 +368,12 @@ mod tests {
 
     #[test]
     fn formats_lambda_and_specialized_refs() {
-        let source = "id:t->t\nid x=x\nmain:(i64->i64)->i64->i64\nmain f x=f (id\\i64 x)\nhelper:i64->i64\nhelper x=(\\y->y+1) x\n";
+        let source = "my_func:Type t->t->t\nmy_func i64 x=x+1\nmain:i64->i64\nmain x=scalar\\axpy\\i64 x\nhelper:i64->i64\nhelper x=(\\y->y+1) x\n";
         let formatted = format_source_text(source).expect("format should succeed");
-        assert!(formatted.contains("id\\i64"));
-        assert!(formatted.contains("\\y -> y + 1"));
+        assert_eq!(
+            formatted,
+            "my_func : Type t -> t -> t\nmy_func i64 x = x + 1\n\nmain : i64 -> i64\nmain x = scalar\\axpy\\i64 x\n\nhelper : i64 -> i64\nhelper x = (\\y -> y + 1) x\n"
+        );
     }
 
     #[test]

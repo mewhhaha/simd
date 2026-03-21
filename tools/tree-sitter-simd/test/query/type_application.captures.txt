@@ -1,0 +1,15 @@
+/home/mewhhaha/src/simd/tools/tree-sitter-simd/test/query/type_application.simd
+    pattern:  0, capture: 0 - function, start: (0, 0), end: (0, 4), text: `wrap`
+    pattern:  0, capture: 1 - type, start: (0, 7), end: (0, 23), text: `Type t -> t -> t`
+    pattern:  1, capture: 0 - function, start: (1, 0), end: (1, 4), text: `wrap`
+    pattern:  1, capture: 0 - function, start: (1, 0), end: (1, 4), text: `wrap`
+    pattern:  1, capture: 3 - type.builtin, start: (1, 5), end: (1, 8), text: `i64`
+    pattern:  1, capture: 2 - variable.parameter, start: (1, 9), end: (1, 10), text: `x`
+    pattern:  0, capture: 0 - function, start: (3, 0), end: (3, 4), text: `main`
+    pattern:  0, capture: 1 - type, start: (3, 7), end: (3, 17), text: `i64 -> i64`
+    pattern:  1, capture: 0 - function, start: (4, 0), end: (4, 4), text: `main`
+    pattern:  1, capture: 2 - variable.parameter, start: (4, 5), end: (4, 6), text: `x`
+    pattern:  8, capture: 8 - function.call, start: (4, 9), end: (4, 24), text: `scalar\axpy\i64`
+    pattern:  2, capture: 0 - function, start: (4, 9), end: (4, 15), text: `scalar`
+    pattern:  2, capture: 0 - function, start: (4, 16), end: (4, 20), text: `axpy`
+    pattern:  8, capture: 6 - expression, start: (4, 25), end: (4, 26), text: `x`

@@ -48,7 +48,7 @@ module.exports = grammar({
         field("body", $.expr),
       ),
 
-    pattern: ($) => choice($.wildcard, $.identifier, $.int, $.float),
+    pattern: ($) => choice($.wildcard, $.prim_type, $.identifier, $.int, $.float),
 
     type: ($) =>
       choice(
@@ -59,12 +59,16 @@ module.exports = grammar({
     type_atom: ($) =>
       choice(
         prec.left(seq(field("base", $.type_base), repeat1($.shape_suffix))),
+        prec.left(seq(field("constructor", $.type_constructor), repeat1(field("argument", $.type_atom)))),
         $.type_base,
       ),
 
-    type_base: ($) => choice($.prim_type, $.record_type, seq("(", $.type, ")")),
+    type_base: ($) =>
+      choice($.prim_type, $.identifier, $.record_type, seq("(", $.type, ")")),
 
     prim_type: (_) => choice("i32", "i64", "f32", "f64"),
+
+    type_constructor: (_) => /[A-Z][a-zA-Z0-9_]*/,
 
     record_type: ($) =>
       seq("{", optional(seq($.type_field, repeat(seq(",", $.type_field)))), "}"),
@@ -167,6 +171,7 @@ module.exports = grammar({
     atom: ($) =>
       choice(
         $.qualified_ref,
+        $.prim_type,
         $.identifier,
         $.int,
         $.float,
@@ -177,7 +182,7 @@ module.exports = grammar({
     qualified_ref: ($) =>
       seq(
         field("head", $.identifier),
-        repeat1(seq("\\", field("segment", $.identifier))),
+        repeat1(seq("\\", field("segment", choice($.identifier, $.prim_type)))),
       ),
 
     record_expr: ($) =>

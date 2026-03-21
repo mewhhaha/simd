@@ -14,7 +14,7 @@ use tower_lsp::{Client, LanguageServer, LspService, Server};
 
 use crate::formatter::format_type_for_display;
 use crate::{
-    Pattern, Result, SimdError, Type, TypedExpr, TypedExprKind, compile_frontend,
+    Pattern, Prim, Result, SimdError, Type, TypedExpr, TypedExprKind, compile_frontend,
     format_source_text, parse_source,
 };
 
@@ -205,6 +205,9 @@ fn basic_error_diagnostic(message: String) -> Diagnostic {
 
 fn hover_for_position(source: &str, position: Position) -> Option<Hover> {
     let ident = identifier_at_position(source, position)?;
+    if let Some(hover) = hover_for_witness_token(source, &ident) {
+        return Some(hover);
+    }
     let (_surface, module, checked) = compile_frontend(source).ok()?;
 
     if let Some(function) = module
@@ -254,6 +257,43 @@ fn hover_for_position(source: &str, position: Position) -> Option<Hover> {
         }),
         range: Some(ident.range),
     })
+}
+
+fn hover_for_witness_token(source: &str, ident: &IdentifierAtPosition) -> Option<Hover> {
+    if ident.name == "Type" {
+        return Some(markup_hover(
+            ident.range.clone(),
+            "type witness keyword".to_string(),
+        ));
+    }
+    if Prim::parse(&ident.name).is_some() && witness_token_context(source, ident) {
+        return Some(markup_hover(
+            ident.range.clone(),
+            format!("primitive witness `{}`", ident.name),
+        ));
+    }
+    None
+}
+
+fn witness_token_context(source: &str, ident: &IdentifierAtPosition) -> bool {
+    let Some(line) = source.lines().nth(ident.line) else {
+        return false;
+    };
+    let Some(start) = utf16_col_to_byte_col(line, ident.range.start.character as usize) else {
+        return false;
+    };
+    let prefix = &line[..start];
+    prefix.contains(':') || prefix.contains('\\') || prefix.contains("Type")
+}
+
+fn markup_hover(range: Range, contents: String) -> Hover {
+    Hover {
+        contents: HoverContents::Markup(MarkupContent {
+            kind: MarkupKind::Markdown,
+            value: format!("```simd\n{}\n```", contents),
+        }),
+        range: Some(range),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -398,7 +438,8 @@ fn collect_expr_local_types(expr: &TypedExpr, map: &mut BTreeMap<String, Vec<Typ
         }
         TypedExprKind::FunctionRef { .. }
         | TypedExprKind::Int(_, _)
-        | TypedExprKind::Float(_, _) => {}
+        | TypedExprKind::Float(_, _)
+        | TypedExprKind::TypeToken(_) => {}
         TypedExprKind::Lambda { body, .. } => collect_expr_local_types(body, map),
         TypedExprKind::Let { bindings, body } => {
             for binding in bindings {
@@ -542,6 +583,27 @@ mod tests {
     }
 
     #[test]
+    fn hover_shows_type_witness_keyword() {
+        let source = "my_func : Type t -> t -> t\nmy_func i64 x = x + 1\n";
+        let hover = hover_for_position(source, Position::new(0, 10)).expect("hover");
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markdown hover content");
+        };
+        assert!(content.value.contains("type witness keyword"));
+    }
+
+    #[test]
+    fn hover_shows_primitive_witness_token() {
+        let source = "id : t -> t\nid x = x\nmain : i64 -> i64\nmain x = id\\i64 x\n";
+        let hover = hover_for_position(source, Position::new(3, 12)).expect("hover");
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markdown hover content");
+        };
+        assert!(content.value.contains("primitive witness"));
+        assert!(content.value.contains("i64"));
+    }
+
+    #[test]
     fn hover_shows_local_value_type() {
         let source = "inc : i64 -> i64\ninc x = let y = x + 1 in y\n";
         let hover = hover_for_position(source, Position::new(1, 12)).expect("hover");
@@ -561,6 +623,21 @@ mod tests {
     #[test]
     fn diagnostics_empty_for_valid_program() {
         let diagnostics = diagnostics_for_source("main : i64 -> i64\nmain x = x + 1\n");
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn diagnostics_empty_for_type_witness_program() {
+        let diagnostics =
+            diagnostics_for_source("my_func : Type t -> t -> t\nmy_func i64 x = x + 1\n");
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn diagnostics_empty_for_specialization_chain() {
+        let diagnostics = diagnostics_for_source(
+            "id : t -> t\nid x = x\nmain : i64 -> i64\nmain x = id\\i64 x\n",
+        );
         assert!(diagnostics.is_empty());
     }
 

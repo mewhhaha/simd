@@ -1,0 +1,7 @@
+my_func : Type t -> t -> t
+my_func i64 x = x + 1
+my_func i32 x = x + 2
+my_func _ x = x
+
+main : Type t -> t -> t
+main ty x = my_func ty x

@@ -10,3 +10,6 @@
 *.swo
 .idea/
 .vscode/
+
+# Local tool cache
+.tools/cache/

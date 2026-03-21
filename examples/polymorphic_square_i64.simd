@@ -1,0 +1,5 @@
+square : t -> t
+square x = x * x
+
+main : i64 -> i64
+main x = square x

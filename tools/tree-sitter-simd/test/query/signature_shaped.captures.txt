@@ -1,11 +1,11 @@
 /home/mewhhaha/src/simd/tools/tree-sitter-simd/test/query/signature_shaped.simd
     pattern:  0, capture: 0 - function, start: (0, 0), end: (0, 4), text: `main`
     pattern:  0, capture: 1 - type, start: (0, 7), end: (0, 23), text: `i64[n] -> i64[n]`
-    pattern: 18, capture: 9 - punctuation.bracket, start: (0, 10), end: (0, 11), text: `[`
-    pattern: 18, capture: 9 - punctuation.bracket, start: (0, 12), end: (0, 13), text: `]`
-    pattern: 18, capture: 9 - punctuation.bracket, start: (0, 20), end: (0, 21), text: `[`
-    pattern: 18, capture: 9 - punctuation.bracket, start: (0, 22), end: (0, 23), text: `]`
+    pattern: 19, capture: 10 - punctuation.bracket, start: (0, 10), end: (0, 11), text: `[`
+    pattern: 19, capture: 10 - punctuation.bracket, start: (0, 12), end: (0, 13), text: `]`
+    pattern: 19, capture: 10 - punctuation.bracket, start: (0, 20), end: (0, 21), text: `[`
+    pattern: 19, capture: 10 - punctuation.bracket, start: (0, 22), end: (0, 23), text: `]`
     pattern:  1, capture: 0 - function, start: (1, 0), end: (1, 4), text: `main`
     pattern:  1, capture: 2 - variable.parameter, start: (1, 5), end: (1, 7), text: `xs`
-    pattern:  7, capture: 7 - function.call, start: (1, 10), end: (1, 13), text: `inc`
-    pattern:  7, capture: 5 - expression, start: (1, 14), end: (1, 16), text: `xs`
+    pattern:  8, capture: 8 - function.call, start: (1, 10), end: (1, 13), text: `inc`
+    pattern:  8, capture: 6 - expression, start: (1, 14), end: (1, 16), text: `xs`

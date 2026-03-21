@@ -96,6 +96,7 @@ pub enum TypeArg {
 pub enum Pattern {
     Int(i64),
     Float(f64),
+    Type(Prim),
     Name(String),
     Wildcard,
 }
@@ -163,6 +164,7 @@ impl PrimOp {
 pub enum Type {
     Scalar(Prim),
     Bulk(Prim, Shape),
+    TypeToken(Box<Type>),
     Record(BTreeMap<String, Type>),
     Var(String),
     Infer(u32),
@@ -281,6 +283,7 @@ pub enum TypedExprKind {
     },
     Int(i64, Prim),
     Float(f64, Prim),
+    TypeToken(Prim),
     Lambda {
         param: String,
         body: Box<TypedExpr>,
@@ -489,6 +492,7 @@ pub struct CompiledProgram {
 pub enum Value {
     Scalar(ScalarValue),
     Bulk(BulkValue),
+    TypeToken(Prim),
     Record(BTreeMap<String, Value>),
 }
 
@@ -525,7 +529,11 @@ impl Type {
     fn prim(&self) -> Option<Prim> {
         match self {
             Self::Scalar(prim) | Self::Bulk(prim, _) => Some(*prim),
-            Self::Record(_) | Self::Var(_) | Self::Infer(_) | Self::Fun(_, _) => None,
+            Self::TypeToken(_)
+            | Self::Record(_)
+            | Self::Var(_)
+            | Self::Infer(_)
+            | Self::Fun(_, _) => None,
         }
     }
 }
@@ -561,6 +569,15 @@ impl Prim {
             Self::I32 | Self::F32 => 4,
             Self::I64 | Self::F64 => 8,
         }
+    }
+}
+
+fn format_prim(prim: Prim) -> &'static str {
+    match prim {
+        Prim::I32 => "i32",
+        Prim::I64 => "i64",
+        Prim::F32 => "f32",
+        Prim::F64 => "f64",
     }
 }
 
@@ -611,6 +628,7 @@ impl Value {
                 value.prim,
                 Shape(value.shape.iter().copied().map(Dim::Const).collect()),
             ),
+            Self::TypeToken(prim) => Type::TypeToken(Box::new(Type::Scalar(*prim))),
             Self::Record(fields) => Type::Record(
                 fields
                     .iter()
@@ -624,6 +642,7 @@ impl Value {
         match self {
             Self::Scalar(value) => value.to_json_string(),
             Self::Bulk(value) => render_bulk_json(&value.elements, &value.shape, 0),
+            Self::TypeToken(prim) => format!("\"{}\"", format_prim(*prim)),
             Self::Record(fields) => render_record_json(fields),
         }
     }
@@ -708,7 +727,7 @@ fn render_lifted_value_json(value: &Value, shape: &[usize], offset: usize) -> St
 
 fn value_lift_shape(value: &Value) -> Option<Vec<usize>> {
     match value {
-        Value::Scalar(_) => None,
+        Value::Scalar(_) | Value::TypeToken(_) => None,
         Value::Bulk(bulk) => Some(bulk.shape.clone()),
         Value::Record(fields) => {
             let mut shape = None::<Vec<usize>>;
@@ -731,6 +750,7 @@ fn value_leaf_prim(value: &Value) -> Option<Prim> {
     match value {
         Value::Scalar(value) => Some(value.prim()),
         Value::Bulk(value) => Some(value.prim),
+        Value::TypeToken(_) => None,
         Value::Record(fields) => fields.values().find_map(value_leaf_prim),
     }
 }
@@ -743,6 +763,9 @@ fn extract_lifted_lane(value: &Value, index: usize) -> Result<Value> {
                 .iter()
                 .map(|(name, value)| Ok((name.clone(), extract_lifted_lane(value, index)?)))
                 .collect::<Result<BTreeMap<_, _>>>()?,
+        )),
+        Value::TypeToken(_) => Err(SimdError::new(
+            "cannot extract a lifted lane from a type witness value",
         )),
         Value::Scalar(_) => Err(SimdError::new(
             "cannot extract a lifted lane from a scalar value",
@@ -790,6 +813,9 @@ fn collect_lifted_value(values: &[Value], scalar_ty: &Type, shape: &[usize]) -> 
         Type::Bulk(_, _) => Err(SimdError::new(
             "lifted result type unexpectedly contained bulk leaves already",
         )),
+        Type::TypeToken(_) => Err(SimdError::new(
+            "lifted result type unexpectedly contained type witnesses",
+        )),
         Type::Var(_) | Type::Infer(_) => Err(SimdError::new(
             "lifted result type unexpectedly contained an unresolved type variable",
         )),
@@ -811,6 +837,7 @@ fn collect_type_leaves(ty: &Type, prefix: &LeafPath, leaves: &mut Vec<TypeLeaf>)
             path: prefix.clone(),
             ty: ty.clone(),
         }),
+        Type::TypeToken(_) => {}
         Type::Record(fields) => {
             for (name, field_ty) in fields {
                 collect_type_leaves(field_ty, &prefix.child(name), leaves);
@@ -825,6 +852,7 @@ pub fn flatten_value_leaves(value: &Value, ty: &Type) -> Result<Vec<(LeafPath, V
         (Value::Scalar(_), Type::Scalar(_)) | (Value::Bulk(_), Type::Bulk(_, _)) => {
             Ok(vec![(LeafPath::root(), value.clone())])
         }
+        (Value::TypeToken(_), Type::TypeToken(_)) => Ok(Vec::new()),
         (Value::Record(fields), Type::Record(field_types)) => {
             let mut leaves = Vec::new();
             for (name, field_ty) in field_types {
@@ -853,6 +881,9 @@ pub fn rebuild_value_from_leaves(ty: &Type, leaves: &BTreeMap<LeafPath, Value>) 
             .get(&LeafPath::root())
             .cloned()
             .ok_or_else(|| SimdError::new(format!("missing root leaf for type {:?}", ty))),
+        Type::TypeToken(_) => Err(SimdError::new(
+            "cannot rebuild type witness values from flattened leaves",
+        )),
         Type::Record(fields) => {
             let mut record = BTreeMap::new();
             for (name, field_ty) in fields {
@@ -973,7 +1004,7 @@ fn lex(source: &str) -> Result<Vec<Token>> {
             index += 1;
             continue;
         }
-        if ch.is_ascii_lowercase() {
+        if ch.is_ascii_alphabetic() {
             let start = index;
             index += 1;
             while index < chars.len()
@@ -1193,6 +1224,8 @@ impl Parser {
                 self.pos += 1;
                 if token.text == "_" {
                     Ok(Pattern::Wildcard)
+                } else if let Some(prim) = Prim::parse(&token.text) {
+                    Ok(Pattern::Type(prim))
                 } else {
                     Ok(Pattern::Name(token.text))
                 }
@@ -1252,11 +1285,26 @@ impl Parser {
             Type::Record(fields)
         } else {
             let name = self.expect_ident()?;
-            match Prim::parse(&name) {
-                Some(prim) => Type::Scalar(prim),
-                None if is_implicit_type_var_name(&name) => Type::Var(name),
-                None => {
-                    return Err(SimdError::new(format!("unknown primitive type '{name}'")));
+            if name == "Type" {
+                let witness = self.expect_ident()?;
+                let witness_ty = match Prim::parse(&witness) {
+                    Some(prim) => Type::Scalar(prim),
+                    None if is_implicit_type_var_name(&witness) => Type::Var(witness),
+                    None => {
+                        return Err(SimdError::new(format!(
+                            "Type witness '{}' must be a primitive type or type variable",
+                            witness
+                        )));
+                    }
+                };
+                Type::TypeToken(Box::new(witness_ty))
+            } else {
+                match Prim::parse(&name) {
+                    Some(prim) => Type::Scalar(prim),
+                    None if is_implicit_type_var_name(&name) => Type::Var(name),
+                    None => {
+                        return Err(SimdError::new(format!("unknown primitive type '{name}'")));
+                    }
                 }
             }
         };
@@ -1753,8 +1801,25 @@ fn group_program(surface: &SurfaceProgram) -> Result<Module> {
 }
 
 fn validate_signature_shape_contract(signature: &Signature) -> Result<()> {
-    let _ = signature;
+    let (_params, ret) = signature.ty.fun_parts();
+    if type_contains_type_witness(&ret) {
+        return Err(SimdError::new(format!(
+            "function '{}' cannot return a Type witness value in v0",
+            signature.name
+        )));
+    }
     Ok(())
+}
+
+fn type_contains_type_witness(ty: &Type) -> bool {
+    match ty {
+        Type::TypeToken(_) => true,
+        Type::Scalar(_) | Type::Bulk(_, _) | Type::Var(_) | Type::Infer(_) => false,
+        Type::Record(fields) => fields.values().any(type_contains_type_witness),
+        Type::Fun(args, ret) => {
+            args.iter().any(type_contains_type_witness) || type_contains_type_witness(ret)
+        }
+    }
 }
 
 fn analyze_pointwise(module: &Module) -> Result<BTreeMap<String, bool>> {
@@ -1886,6 +1951,11 @@ fn check_pattern(pattern: &Pattern, ty: &Type, locals: &mut BTreeMap<String, Typ
     match pattern {
         Pattern::Wildcard => Ok(()),
         Pattern::Name(name) => {
+            if matches!(ty, Type::TypeToken(_)) {
+                return Err(SimdError::new(
+                    "type witness parameters cannot bind local names; use a primitive witness pattern or '_'",
+                ));
+            }
             if name == "_" {
                 return Err(SimdError::new("wildcard '_' cannot bind a name"));
             }
@@ -1911,6 +1981,22 @@ fn check_pattern(pattern: &Pattern, ty: &Type, locals: &mut BTreeMap<String, Typ
                 ty
             ))),
         },
+        Pattern::Type(prim) => match ty {
+            Type::TypeToken(inner) => match inner.as_ref() {
+                Type::Scalar(actual) if actual == prim => Ok(()),
+                Type::Var(_) | Type::Infer(_) => Ok(()),
+                other => Err(SimdError::new(format!(
+                    "type witness pattern '{}' is incompatible with {:?}",
+                    format_prim(*prim),
+                    other
+                ))),
+            },
+            _ => Err(SimdError::new(format!(
+                "type witness pattern '{}' is only valid against Type parameters, found {:?}",
+                format_prim(*prim),
+                ty
+            ))),
+        },
     }
 }
 
@@ -1929,22 +2015,34 @@ fn infer_expr(
     match expr {
         Expr::Ref(reference) => infer_ref_expr(reference, context, expected),
         Expr::Int(value) => {
+            if let Some(expected_ty @ (Type::Var(_) | Type::Infer(_))) = expected {
+                return Ok(TypedExpr {
+                    ty: expected_ty.clone(),
+                    kind: TypedExprKind::Int(*value, Prim::I64),
+                });
+            }
             let prim = match expected.and_then(Type::prim) {
                 Some(prim) if prim.is_int() => prim,
-                Some(prim) if prim.is_float() => {
-                    return Err(SimdError::new(format!(
-                        "integer literal '{}' used where {:?} was expected",
-                        value, prim
-                    )));
-                }
+                Some(prim) if prim.is_float() => prim,
                 _ => Prim::I64,
+            };
+            let kind = if prim.is_int() {
+                TypedExprKind::Int(*value, prim)
+            } else {
+                TypedExprKind::Float(*value as f64, prim)
             };
             Ok(TypedExpr {
                 ty: Type::Scalar(prim),
-                kind: TypedExprKind::Int(*value, prim),
+                kind,
             })
         }
         Expr::Float(value) => {
+            if let Some(expected_ty @ (Type::Var(_) | Type::Infer(_))) = expected {
+                return Ok(TypedExpr {
+                    ty: expected_ty.clone(),
+                    kind: TypedExprKind::Float(*value, Prim::F64),
+                });
+            }
             let prim = match expected.and_then(Type::prim) {
                 Some(prim) if prim.is_float() => prim,
                 Some(prim) if prim.is_int() => {
@@ -1982,6 +2080,33 @@ fn infer_ref_expr(
                 kind: TypedExprKind::Local(reference.name.clone()),
             });
         }
+    }
+    if reference.alias.is_none()
+        && reference.type_args.is_empty()
+        && let Some(prim) = Prim::parse(&reference.name)
+        && !context.signatures.contains_key(&reference.name)
+    {
+        let ty = Type::TypeToken(Box::new(Type::Scalar(prim)));
+        if let Some(expected_ty) = expected {
+            let matches_expected = match expected_ty {
+                Type::TypeToken(inner) => match inner.as_ref() {
+                    Type::Scalar(expected_prim) => *expected_prim == prim,
+                    Type::Var(_) | Type::Infer(_) => true,
+                    _ => false,
+                },
+                _ => false,
+            };
+            if !matches_expected {
+                return Err(SimdError::new(format!(
+                    "type witness '{}' has type {:?}, expected {:?}",
+                    reference.name, ty, expected_ty
+                )));
+            }
+        }
+        return Ok(TypedExpr {
+            ty,
+            kind: TypedExprKind::TypeToken(prim),
+        });
     }
     let resolved_name = resolve_ref_name(reference, context).ok_or_else(|| {
         SimdError::new(format!(
@@ -2188,7 +2313,10 @@ fn collect_expr_local_names(expr: &Expr) -> BTreeSet<String> {
 fn collect_expr_local_names_into(expr: &Expr, names: &mut BTreeSet<String>) {
     match expr {
         Expr::Ref(reference) => {
-            if reference.alias.is_none() && reference.type_args.is_empty() {
+            if reference.alias.is_none()
+                && reference.type_args.is_empty()
+                && Prim::parse(&reference.name).is_none()
+            {
                 names.insert(reference.name.clone());
             }
         }
@@ -2240,6 +2368,7 @@ fn type_contains_var(ty: &Type) -> bool {
     match ty {
         Type::Var(_) | Type::Infer(_) => true,
         Type::Scalar(_) | Type::Bulk(_, _) => false,
+        Type::TypeToken(inner) => type_contains_var(inner),
         Type::Record(fields) => fields.values().any(type_contains_var),
         Type::Fun(args, ret) => args.iter().any(type_contains_var) || type_contains_var(ret),
     }
@@ -2260,6 +2389,7 @@ fn collect_type_vars_in_order_into(ty: &Type, seen: &mut BTreeSet<String>, vars:
             }
         }
         Type::Scalar(_) | Type::Bulk(_, _) | Type::Infer(_) => {}
+        Type::TypeToken(inner) => collect_type_vars_in_order_into(inner, seen, vars),
         Type::Record(fields) => {
             for field_ty in fields.values() {
                 collect_type_vars_in_order_into(field_ty, seen, vars);
@@ -2278,6 +2408,7 @@ fn apply_type_subst(ty: &Type, subst: &BTreeMap<String, Type>) -> Type {
     match ty {
         Type::Var(name) => subst.get(name).cloned().unwrap_or_else(|| ty.clone()),
         Type::Scalar(_) | Type::Bulk(_, _) | Type::Infer(_) => ty.clone(),
+        Type::TypeToken(inner) => Type::TypeToken(Box::new(apply_type_subst(inner, subst))),
         Type::Record(fields) => Type::Record(
             fields
                 .iter()
@@ -2299,17 +2430,36 @@ fn unify_type_template(
     subst: &mut BTreeMap<String, Type>,
 ) -> Result<()> {
     match template {
-        Type::Var(name) => match subst.get(name) {
-            Some(existing) if existing == actual => Ok(()),
-            Some(existing) => Err(SimdError::new(format!(
-                "type variable '{}' was inferred as {:?}, not {:?}",
-                name, existing, actual
-            ))),
-            None => {
-                subst.insert(name.clone(), actual.clone());
-                Ok(())
+        Type::Var(name) => {
+            if matches!(actual, Type::Var(other) if other == name) {
+                return Ok(());
             }
-        },
+            match subst.get(name) {
+                Some(existing) if existing == actual => Ok(()),
+                Some(Type::Var(existing_name)) if existing_name == name => {
+                    subst.insert(name.clone(), actual.clone());
+                    Ok(())
+                }
+                Some(existing) if matches!(actual, Type::Var(other) if other == name) => {
+                    if existing == template {
+                        Ok(())
+                    } else {
+                        Err(SimdError::new(format!(
+                            "type variable '{}' was inferred as {:?}, not {:?}",
+                            name, existing, actual
+                        )))
+                    }
+                }
+                Some(existing) => Err(SimdError::new(format!(
+                    "type variable '{}' was inferred as {:?}, not {:?}",
+                    name, existing, actual
+                ))),
+                None => {
+                    subst.insert(name.clone(), actual.clone());
+                    Ok(())
+                }
+            }
+        }
         Type::Scalar(left) => match actual {
             Type::Scalar(right) if left == right => Ok(()),
             _ => Err(SimdError::new(format!(
@@ -2325,6 +2475,13 @@ fn unify_type_template(
             }
             _ => Err(SimdError::new(format!(
                 "expected bulk {:?}, found {:?}",
+                template, actual
+            ))),
+        },
+        Type::TypeToken(left_inner) => match actual {
+            Type::TypeToken(right_inner) => unify_type_template(left_inner, right_inner, subst),
+            _ => Err(SimdError::new(format!(
+                "expected type witness {:?}, found {:?}",
                 template, actual
             ))),
         },
@@ -2749,7 +2906,7 @@ fn instantiate_call_signature(
     }
     let mut subst = BTreeMap::<String, Type>::new();
     for (expr_arg, param_ty) in args_exprs.iter().zip(params.iter()) {
-        let typed_arg = infer_expr(expr_arg, context, None)?;
+        let typed_arg = infer_expr(expr_arg, context, Some(param_ty))?;
         unify_type_template(param_ty, &typed_arg.ty, &mut subst)?;
     }
     if let Some(expected_ty) = expected {
@@ -2774,6 +2931,16 @@ fn infer_primitive_call(
     let mut right =
         infer_expr(rhs, context, Some(&left.ty)).or_else(|_| infer_expr(rhs, context, None))?;
 
+    if !primitive_operands_compatible(op, &left.ty, &right.ty) {
+        if let Some(retargeted) = retarget_literal_to_var(&left, &right.ty) {
+            left = retargeted;
+        }
+    }
+    if !primitive_operands_compatible(op, &left.ty, &right.ty) {
+        if let Some(retargeted) = retarget_literal_to_var(&right, &left.ty) {
+            right = retargeted;
+        }
+    }
     if !primitive_operands_compatible(op, &left.ty, &right.ty) {
         if let Some(prim) = right.ty.prim() {
             if let Some(retargeted) = retarget_literal(&left, prim) {
@@ -2906,9 +3073,30 @@ fn retarget_literal(expr: &TypedExpr, prim: Prim) -> Option<TypedExpr> {
             ty: Type::Scalar(prim),
             kind: TypedExprKind::Int(*value, prim),
         }),
+        TypedExprKind::Int(value, _) if prim.is_float() => Some(TypedExpr {
+            ty: Type::Scalar(prim),
+            kind: TypedExprKind::Float(*value as f64, prim),
+        }),
         TypedExprKind::Float(value, _) if prim.is_float() => Some(TypedExpr {
             ty: Type::Scalar(prim),
             kind: TypedExprKind::Float(*value, prim),
+        }),
+        _ => None,
+    }
+}
+
+fn retarget_literal_to_var(expr: &TypedExpr, target_ty: &Type) -> Option<TypedExpr> {
+    if !matches!(target_ty, Type::Var(_) | Type::Infer(_)) {
+        return None;
+    }
+    match &expr.kind {
+        TypedExprKind::Int(value, prim) => Some(TypedExpr {
+            ty: target_ty.clone(),
+            kind: TypedExprKind::Int(*value, *prim),
+        }),
+        TypedExprKind::Float(value, prim) => Some(TypedExpr {
+            ty: target_ty.clone(),
+            kind: TypedExprKind::Float(*value, *prim),
         }),
         _ => None,
     }
@@ -2933,6 +3121,9 @@ fn lift_type_over_shape(ty: &Type, shape: &Shape) -> Result<Type> {
         Type::Scalar(prim) => Ok(Type::Bulk(*prim, shape.clone())),
         Type::Var(name) => Ok(Type::Var(name.clone())),
         Type::Infer(index) => Ok(Type::Infer(*index)),
+        Type::TypeToken(_) => Err(SimdError::new(
+            "bulk postfix cannot be applied to type witness parameters",
+        )),
         Type::Record(fields) => Ok(Type::Record(
             fields
                 .iter()
@@ -2951,6 +3142,9 @@ fn lift_type_over_shape(ty: &Type, shape: &Shape) -> Result<Type> {
 fn unify_lifted_type(slot: &mut Option<Shape>, param: &Type, actual: &Type) -> Result<()> {
     match (param, actual) {
         (Type::Var(_), _) | (Type::Infer(_), _) => Ok(()),
+        (Type::TypeToken(_), _) => Err(SimdError::new(
+            "type witness parameters cannot be lifted over bulk values",
+        )),
         (Type::Scalar(left), Type::Bulk(right, shape)) if left == right => {
             unify_lifted_shape(slot, shape)
         }
@@ -2981,6 +3175,7 @@ fn unify_param_type(
     match (param, actual) {
         (Type::Var(_), _) => Ok(()),
         (Type::Infer(_), _) => Ok(()),
+        (Type::TypeToken(left), Type::TypeToken(right)) => unify_param_type(left, right, dim_subst),
         (Type::Scalar(left), Type::Scalar(right)) if left == right => Ok(()),
         (Type::Bulk(left_prim, left_shape), Type::Bulk(right_prim, right_shape))
             if left_prim == right_prim && left_shape.0.len() == right_shape.0.len() =>
@@ -3038,6 +3233,7 @@ fn unify_param_type(
 fn apply_dim_subst(ty: &Type, subst: &BTreeMap<String, Dim>) -> Type {
     match ty {
         Type::Scalar(_) | Type::Var(_) | Type::Infer(_) => ty.clone(),
+        Type::TypeToken(inner) => Type::TypeToken(Box::new(apply_dim_subst(inner, subst))),
         Type::Bulk(prim, shape) => Type::Bulk(
             *prim,
             Shape(
@@ -3101,7 +3297,8 @@ fn visit_tail_calls(
         TypedExprKind::Local(_)
         | TypedExprKind::FunctionRef { .. }
         | TypedExprKind::Int(_, _)
-        | TypedExprKind::Float(_, _) => {}
+        | TypedExprKind::Float(_, _)
+        | TypedExprKind::TypeToken(_) => {}
         TypedExprKind::Lambda { body, .. } => {
             visit_tail_calls(body, self_name, false, recursive, valid);
         }
@@ -3152,6 +3349,11 @@ struct LocalLeafBinding {
 }
 
 fn normalize_records(checked: &CheckedProgram) -> Result<NormalizedProgram> {
+    if checked_uses_type_witness(checked) {
+        return Err(SimdError::new(
+            "Type witness parameters are currently evaluator-only and are not yet supported by normalization/lowering",
+        ));
+    }
     let mut entries = Vec::new();
     for function in &checked.functions {
         let (params, ret) = function.signature.ty.fun_parts();
@@ -3200,6 +3402,47 @@ fn normalize_records(checked: &CheckedProgram) -> Result<NormalizedProgram> {
     }
 
     Ok(NormalizedProgram { functions, entries })
+}
+
+fn checked_uses_type_witness(checked: &CheckedProgram) -> bool {
+    checked.functions.iter().any(|function| {
+        type_contains_type_witness(&function.signature.ty)
+            || function.clauses.iter().any(|clause| {
+                clause
+                    .patterns
+                    .iter()
+                    .any(|pattern| matches!(pattern.pattern, Pattern::Type(_)))
+                    || typed_expr_uses_type_witness(&clause.body)
+            })
+    })
+}
+
+fn typed_expr_uses_type_witness(expr: &TypedExpr) -> bool {
+    match &expr.kind {
+        TypedExprKind::TypeToken(_) => true,
+        TypedExprKind::Local(_)
+        | TypedExprKind::FunctionRef { .. }
+        | TypedExprKind::Int(_, _)
+        | TypedExprKind::Float(_, _) => false,
+        TypedExprKind::Lambda { body, .. } => typed_expr_uses_type_witness(body),
+        TypedExprKind::Let { bindings, body } => {
+            bindings
+                .iter()
+                .any(|binding| typed_expr_uses_type_witness(&binding.expr))
+                || typed_expr_uses_type_witness(body)
+        }
+        TypedExprKind::Record(fields) => fields.values().any(typed_expr_uses_type_witness),
+        TypedExprKind::Project { base, .. } => typed_expr_uses_type_witness(base),
+        TypedExprKind::RecordUpdate { base, fields } => {
+            typed_expr_uses_type_witness(base) || fields.values().any(typed_expr_uses_type_witness)
+        }
+        TypedExprKind::Call { args, .. } => args
+            .iter()
+            .any(|arg| typed_expr_uses_type_witness(&arg.expr)),
+        TypedExprKind::Apply { callee, arg } => {
+            typed_expr_uses_type_witness(callee) || typed_expr_uses_type_witness(arg)
+        }
+    }
 }
 
 fn normalize_function_leaf(
@@ -3269,6 +3512,15 @@ fn normalize_function_leaf(
                         pattern: Pattern::Float(*value),
                         ty: leaves[0].ty.clone(),
                     });
+                }
+                Pattern::Type(prim) => {
+                    if !leaves.is_empty() {
+                        return Err(SimdError::new(format!(
+                            "type witness pattern '{}' in '{}' must target a Type parameter",
+                            format_prim(*prim),
+                            function.name
+                        )));
+                    }
                 }
             }
         }
@@ -3351,6 +3603,9 @@ fn normalize_expr_to_leaf(
                 kind: TypedExprKind::Float(*value, *prim),
             })
         }
+        TypedExprKind::TypeToken(_) => Err(SimdError::new(
+            "type witness expressions are compile-time only and cannot appear in normalized leaves",
+        )),
         TypedExprKind::FunctionRef { .. }
         | TypedExprKind::Lambda { .. }
         | TypedExprKind::Apply { .. } => {
@@ -3503,6 +3758,9 @@ fn lookup_leaf_type(ty: &Type, path: &LeafPath) -> Result<Type> {
     if path.is_root() {
         return match ty {
             Type::Scalar(_) | Type::Bulk(_, _) => Ok(ty.clone()),
+            Type::TypeToken(_) => Err(SimdError::new(
+                "type witness values cannot appear as normalized leaf results",
+            )),
             Type::Record(_) => Err(SimdError::new(format!(
                 "record type {:?} requires a concrete leaf path",
                 ty
@@ -3548,7 +3806,8 @@ fn collect_typed_local_names(expr: &TypedExpr, names: &mut BTreeSet<String>) {
         }
         TypedExprKind::FunctionRef { .. }
         | TypedExprKind::Int(_, _)
-        | TypedExprKind::Float(_, _) => {}
+        | TypedExprKind::Float(_, _)
+        | TypedExprKind::TypeToken(_) => {}
         TypedExprKind::Lambda { body, .. } => collect_typed_local_names(body, names),
         TypedExprKind::Let { bindings, body } => {
             for binding in bindings {
@@ -4124,6 +4383,7 @@ fn lower_function(function: &NormalizedFunction) -> Result<LoweredFunction> {
         .map(|ty| match ty {
             Type::Scalar(_) => AccessKind::Same,
             Type::Bulk(_, _) => AccessKind::Lane,
+            Type::TypeToken(_) => AccessKind::Same,
             Type::Record(_) => AccessKind::Same,
             Type::Var(_) | Type::Infer(_) => AccessKind::Same,
             Type::Fun(_, _) => AccessKind::Same,
@@ -4155,6 +4415,11 @@ fn lower_function(function: &NormalizedFunction) -> Result<LoweredFunction> {
         Type::Record(_) => {
             return Err(SimdError::new(
                 "normalized lowering encountered an unexpected record result",
+            ));
+        }
+        Type::TypeToken(_) => {
+            return Err(SimdError::new(
+                "normalized lowering encountered an unexpected type witness result",
             ));
         }
         Type::Var(_) | Type::Infer(_) => {
@@ -4302,6 +4567,9 @@ fn lower_expr_to_ir(
             ty: Type::Scalar(*prim),
             kind: IrExprKind::Float(*value, *prim),
         }),
+        TypedExprKind::TypeToken(_) => Err(SimdError::new(
+            "type witness expressions are not supported by loop lowering",
+        )),
         TypedExprKind::FunctionRef { .. }
         | TypedExprKind::Lambda { .. }
         | TypedExprKind::Apply { .. } => Err(SimdError::new(
@@ -4425,11 +4693,36 @@ fn parse_host_args(args_json: &str, checked: &CheckedProgram, main: &str) -> Res
         )));
     }
     let mut shape_env = BTreeMap::<String, usize>::new();
-    let mut values = Vec::new();
+    let mut type_subst = BTreeMap::<String, Type>::new();
     for (item, ty) in items.iter().zip(&params) {
+        if let Type::TypeToken(inner) = ty {
+            let prim = parse_json_type_witness_prim(item)?;
+            unify_type_template(inner, &Type::Scalar(prim), &mut type_subst)?;
+        }
+    }
+    let mut values = Vec::new();
+    let concrete_params = params
+        .iter()
+        .map(|ty| apply_type_subst(ty, &type_subst))
+        .collect::<Vec<_>>();
+    for (item, ty) in items.iter().zip(&concrete_params) {
         values.push(value_from_json(item, ty, &mut shape_env)?);
     }
     Ok(values)
+}
+
+fn parse_json_type_witness_prim(json: &JsonValue) -> Result<Prim> {
+    let JsonValue::String(text) = json else {
+        return Err(SimdError::new(
+            "type witness runtime argument must be a JSON string like \"i64\"",
+        ));
+    };
+    Prim::parse(text).ok_or_else(|| {
+        SimdError::new(format!(
+            "unknown type witness '{}'; expected one of i32/i64/f32/f64",
+            text
+        ))
+    })
 }
 
 struct Evaluator<'a> {
@@ -4510,6 +4803,16 @@ impl<'a> Evaluator<'a> {
                 env.insert(name.clone(), binding.clone());
                 Ok(true)
             }
+            Pattern::Type(expected) => {
+                let Value::TypeToken(actual) =
+                    self.expect_host_value(self.force_binding(binding)?)?
+                else {
+                    return Err(SimdError::new(
+                        "type witness pattern can only match type witness inputs",
+                    ));
+                };
+                Ok(*expected == actual)
+            }
             Pattern::Int(expected) => {
                 let Value::Scalar(value) = self.expect_host_value(self.force_binding(binding)?)?
                 else {
@@ -4561,6 +4864,7 @@ impl<'a> Evaluator<'a> {
             TypedExprKind::Float(value, prim) => Ok(EvalValue::Host(Value::Scalar(
                 make_float_value(*value, *prim),
             ))),
+            TypedExprKind::TypeToken(prim) => Ok(EvalValue::Host(Value::TypeToken(*prim))),
             TypedExprKind::Lambda { param, body } => Ok(EvalValue::Closure(Closure::Lambda {
                 param: param.clone(),
                 body,
@@ -4694,6 +4998,7 @@ impl<'a> Evaluator<'a> {
                     };
                     values.push(value);
                 }
+                coerce_runtime_poly_literals(args, &mut values)?;
                 Ok(EvalValue::Host(Value::Scalar(apply_primitive(
                     *op, &values[0], &values[1],
                 )?)))
@@ -4796,13 +5101,14 @@ impl<'a> Evaluator<'a> {
             }
             let value = match callee {
                 Callee::Prim(op) => {
-                    let scalars = scalar_args
+                    let mut scalars = scalar_args
                         .into_iter()
                         .map(|binding| match binding {
                             Binding::Ready(EvalValue::Host(Value::Scalar(value))) => value,
                             _ => unreachable!(),
                         })
                         .collect::<Vec<_>>();
+                    coerce_runtime_poly_literals(args, &mut scalars)?;
                     Value::Scalar(apply_primitive(*op, &scalars[0], &scalars[1])?)
                 }
                 Callee::Function(name) => {
@@ -4855,6 +5161,54 @@ fn make_float_value(value: f64, prim: Prim) -> ScalarValue {
         Prim::F32 => ScalarValue::F32(value as f32),
         Prim::F64 => ScalarValue::F64(value),
         Prim::I32 | Prim::I64 => unreachable!(),
+    }
+}
+
+fn coerce_runtime_poly_literals(args: &[TypedArg], values: &mut [ScalarValue]) -> Result<()> {
+    if args.len() != 2 || values.len() != 2 {
+        return Ok(());
+    }
+    if let Some(coerced) = coerce_poly_literal_to_runtime_target(&args[0].expr, &values[1])? {
+        values[0] = coerced;
+    }
+    if let Some(coerced) = coerce_poly_literal_to_runtime_target(&args[1].expr, &values[0])? {
+        values[1] = coerced;
+    }
+    Ok(())
+}
+
+fn coerce_poly_literal_to_runtime_target(
+    expr: &TypedExpr,
+    target: &ScalarValue,
+) -> Result<Option<ScalarValue>> {
+    if !matches!(expr.ty, Type::Var(_) | Type::Infer(_)) {
+        return Ok(None);
+    }
+    let target_prim = match target {
+        ScalarValue::I32(_) => Prim::I32,
+        ScalarValue::I64(_) => Prim::I64,
+        ScalarValue::F32(_) => Prim::F32,
+        ScalarValue::F64(_) => Prim::F64,
+    };
+    match &expr.kind {
+        TypedExprKind::Int(value, _) => {
+            if target_prim.is_int() {
+                Ok(Some(make_int_value(*value, target_prim)?))
+            } else {
+                Ok(Some(make_float_value(*value as f64, target_prim)))
+            }
+        }
+        TypedExprKind::Float(value, _) => {
+            if target_prim.is_float() {
+                Ok(Some(make_float_value(*value, target_prim)))
+            } else {
+                Err(SimdError::new(format!(
+                    "float literal '{}' cannot be inferred as integer operand",
+                    value
+                )))
+            }
+        }
+        _ => Ok(None),
     }
 }
 
@@ -5024,6 +5378,10 @@ impl<'a> LoweredEvaluator<'a> {
                             "scalar lowered function '{}' received bulk input",
                             name
                         ))),
+                        Value::TypeToken(_) => Err(SimdError::new(format!(
+                            "scalar lowered function '{}' received type witness input",
+                            name
+                        ))),
                         Value::Record(_) => Err(SimdError::new(format!(
                             "scalar lowered function '{}' received record input",
                             name
@@ -5113,6 +5471,11 @@ impl<'a> LoweredEvaluator<'a> {
                 match (value, access) {
                     (Value::Scalar(value), AccessKind::Same) => lane_args.push(value.clone()),
                     (Value::Bulk(bulk), AccessKind::Lane) => lane_args.push(bulk.scalar_at(index)),
+                    (Value::TypeToken(_), _) => {
+                        return Err(SimdError::new(
+                            "kernel lowering does not support type witness runtime values",
+                        ));
+                    }
                     (Value::Scalar(_), AccessKind::Lane) => {
                         return Err(SimdError::new(
                             "kernel lane parameter received scalar input",
@@ -5151,6 +5514,11 @@ impl<'a> LoweredEvaluator<'a> {
                 Pattern::Wildcard => {}
                 Pattern::Name(name) => {
                     env.insert(name.clone(), value.clone());
+                }
+                Pattern::Type(_) => {
+                    return Err(SimdError::new(
+                        "lowered clauses cannot contain type witness patterns",
+                    ));
                 }
                 Pattern::Int(expected) if matches_int_pattern(*expected, value) => {}
                 Pattern::Float(expected) if matches_float_pattern(*expected, value) => {}
@@ -5208,6 +5576,7 @@ impl ValueExt for Value {
         match self {
             Value::Scalar(value) => Ok(value),
             Value::Bulk(_) => Err(SimdError::new("expected scalar value, found bulk")),
+            Value::TypeToken(_) => Err(SimdError::new("expected scalar value, found type witness")),
             Value::Record(_) => Err(SimdError::new("expected scalar value, found record")),
         }
     }
@@ -5438,6 +5807,39 @@ fn value_from_json(
                 elements,
             }))
         }
+        Type::TypeToken(inner) => {
+            let expected_prim = match inner.as_ref() {
+                Type::Scalar(prim) => Some(*prim),
+                Type::Var(_) | Type::Infer(_) => None,
+                other => {
+                    return Err(SimdError::new(format!(
+                        "host JSON type witnesses must target scalar primitives, found {:?}",
+                        other
+                    )));
+                }
+            };
+            let JsonValue::String(text) = json else {
+                return Err(SimdError::new(
+                    "type witness runtime argument must be a JSON string like \"i64\"",
+                ));
+            };
+            let Some(actual) = Prim::parse(text) else {
+                return Err(SimdError::new(format!(
+                    "unknown type witness '{}'; expected one of i32/i64/f32/f64",
+                    text
+                )));
+            };
+            if let Some(expected) = expected_prim
+                && actual != expected
+            {
+                return Err(SimdError::new(format!(
+                    "type witness '{}' does not match expected '{}'",
+                    text,
+                    format_prim(expected)
+                )));
+            }
+            Ok(Value::TypeToken(actual))
+        }
         Type::Record(fields) => {
             let values = match json {
                 JsonValue::Object(values) => values.clone(),
@@ -5650,6 +6052,20 @@ fn bundled_examples_inspector_html() -> Result<String> {
             "examples/mouse_rings_f32.simd",
             "main",
             include_str!("../examples/mouse_rings_f32.simd"),
+        ),
+        (
+            "poly-square-i64",
+            "poly-square-i64",
+            "examples/polymorphic_square_i64.simd",
+            "main",
+            include_str!("../examples/polymorphic_square_i64.simd"),
+        ),
+        (
+            "lambda-capture-i64",
+            "lambda-capture-i64",
+            "examples/lambda_capture_i64.simd",
+            "main",
+            include_str!("../examples/lambda_capture_i64.simd"),
         ),
     ];
 
@@ -5931,6 +6347,21 @@ mod tests {
     }
 
     #[test]
+    fn parses_type_witness_signature_and_patterns() {
+        let program =
+            parse_source("pick : Type t -> t -> t\npick i64 x = x\npick _ x = x\n").unwrap();
+        assert_eq!(program.decls.len(), 3);
+    }
+
+    #[test]
+    fn parses_type_witness_literal_pattern_clause() {
+        let program =
+            parse_source("my_func : Type t -> t -> t\nmy_func i64 x = x + 1\nmy_func _ x = x\n")
+                .unwrap();
+        assert_eq!(program.decls.len(), 3);
+    }
+
+    #[test]
     fn rejects_import_after_function_declaration() {
         let error = parse_source("main : i64 -> i64\nmain x = x\nimport math/scalar as scalar\n")
             .unwrap_err();
@@ -5985,6 +6416,24 @@ mod tests {
     fn evaluates_qualified_alias_call() {
         let src = "import math/scalar as scalar\naxpy : i64 -> i64 -> i64 -> i64\naxpy a x y = a * x + y\nmain : i64 -> i64[n] -> i64[n] -> i64[n]\nmain a xs ys = scalar\\axpy a xs ys\n";
         assert_eq!(run(src, "main", "[2,[1,2,3],[10,20,30]]"), "[12,24,36]");
+    }
+
+    #[test]
+    fn int_literal_adapts_to_float_context() {
+        let src = "main : f32 -> f32\nmain x = x + 1\n";
+        assert_eq!(run(src, "main", "[1.5]"), "2.5");
+    }
+
+    #[test]
+    fn generic_int_literal_adapts_at_call_site() {
+        let src = "inc : t -> t\ninc x = x + 1\nmain : f32 -> f32\nmain x = inc x\n";
+        assert_eq!(run(src, "main", "[2.5]"), "3.5");
+    }
+
+    #[test]
+    fn generic_float_literal_adapts_at_call_site() {
+        let src = "bump : t -> t\nbump x = x + 1.0\nmain : f32 -> f32\nmain x = bump x\n";
+        assert_eq!(run(src, "main", "[2.5]"), "3.5");
     }
 
     #[test]
@@ -6063,6 +6512,36 @@ mod tests {
     fn evaluates_explicit_specialization_in_value_position() {
         let src = "id : t -> t\nid x = x\nmain : i64 -> i64\nmain x = let f = id\\i64 in f x\n";
         assert_eq!(run(src, "main", "[7]"), "7");
+    }
+
+    #[test]
+    fn evaluates_type_witness_clause_matching() {
+        let src = "my_func : Type t -> t -> t\nmy_func i64 x = x + 1\nmy_func i32 x = x + 2\nmy_func _ x = x\nmain : i64 -> i64\nmain x = my_func i64 x\n";
+        assert_eq!(run(src, "main", "[7]"), "8");
+    }
+
+    #[test]
+    fn evaluates_type_witness_wildcard_fallback() {
+        let src = "my_func : Type t -> t -> t\nmy_func i64 x = x + 1\nmy_func _ x = x\nmain : f32 -> f32\nmain x = my_func f32 x\n";
+        assert_eq!(run(src, "main", "[2.5]"), "2.5");
+    }
+
+    #[test]
+    fn accepts_json_type_witness_argument_for_direct_entry() {
+        let src = "main : Type t -> t -> t\nmain i64 x = x + 1\nmain _ x = x\n";
+        assert_eq!(run(src, "main", "[\"i64\",7]"), "8");
+    }
+
+    #[test]
+    fn lowering_rejects_type_witness_programs_for_now() {
+        let error =
+            compile_source("my_func : Type t -> t -> t\nmy_func i64 x = x + 1\nmy_func _ x = x\n")
+                .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Type witness parameters are currently evaluator-only")
+        );
     }
 
     #[test]
@@ -6241,6 +6720,8 @@ mod tests {
         assert!(html.contains("axpy2-record-i64"));
         assert!(html.contains("mouse-glow-f32"));
         assert!(html.contains("mouse-rings-f32"));
+        assert!(html.contains("poly-square-i64"));
+        assert!(html.contains("lambda-capture-i64"));
         assert!(html.contains("(module"));
         assert!(html.contains("color-scheme: dark"));
         assert!(html.contains("--bg: #0b1020"));
@@ -6275,6 +6756,47 @@ mod tests {
                 .expect("step should run")
                 .to_json_string(),
             "1"
+        );
+    }
+
+    #[test]
+    fn prelude_polymorphic_helpers_run() {
+        let prelude = include_str!("../examples/prelude.simd");
+        let source = format!("{prelude}\nmain : i64 -> i64\nmain x = square_t x\n");
+        assert_eq!(
+            run_main(&source, "main", "[9]")
+                .expect("square_t should run")
+                .to_json_string(),
+            "81"
+        );
+        let source = format!("{prelude}\nmain : f32 -> f32\nmain x = plus1_t x\n");
+        assert_eq!(
+            run_main(&source, "main", "[2.5]")
+                .expect("plus1_t should run")
+                .to_json_string(),
+            "3.5"
+        );
+    }
+
+    #[test]
+    fn lambda_capture_example_runs() {
+        let source = include_str!("../examples/lambda_capture_i64.simd");
+        assert_eq!(
+            run_main(source, "main", "[5,9]")
+                .expect("lambda capture example should run")
+                .to_json_string(),
+            "14"
+        );
+    }
+
+    #[test]
+    fn polymorphic_square_example_runs() {
+        let source = include_str!("../examples/polymorphic_square_i64.simd");
+        assert_eq!(
+            run_main(source, "main", "[9]")
+                .expect("polymorphic square example should run")
+                .to_json_string(),
+            "81"
         );
     }
 }

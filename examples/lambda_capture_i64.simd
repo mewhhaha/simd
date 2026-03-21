@@ -1,0 +1,5 @@
+apply : (i64 -> i64) -> i64 -> i64
+apply f x = f x
+
+main : i64 -> i64 -> i64
+main a x = apply (\y -> y + a) x

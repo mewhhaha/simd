@@ -4,6 +4,15 @@
 ] @constant.numeric
 
 (prim_type) @type.builtin
+(type_constructor) @type
+
+(type_atom
+  constructor: (type_constructor) @keyword
+  (#eq? @keyword "Type"))
+
+(qualified_ref
+  head: (identifier) @function
+  segment: (identifier) @function)
 
 (signature
   name: (identifier) @function

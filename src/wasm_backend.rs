@@ -1104,6 +1104,11 @@ fn load_prepared_args(bound: &mut BoundPreparedRun, args: &[Value]) -> Result<()
                     "prepared flattened input should not contain record values",
                 ));
             }
+            Value::TypeToken(_) => {
+                return Err(SimdError::new(
+                    "prepared execution does not support type witness runtime values",
+                ));
+            }
         }
     }
     Ok(())
@@ -1520,6 +1525,7 @@ struct PendingSpecialization {
     output_name: String,
     type_subst: BTreeMap<String, Type>,
     known_fun_args: BTreeMap<usize, KnownFunctionArgSpec>,
+    known_type_witness_args: BTreeMap<usize, Prim>,
     origin: String,
 }
 
@@ -1588,6 +1594,16 @@ fn specialize_checked_program_for_main(
             main
         )));
     }
+    let (entry_params, _) = entry.signature.ty.fun_parts();
+    if entry_params
+        .iter()
+        .any(|param| matches!(param, Type::TypeToken(_)))
+    {
+        return Err(SimdError::new(format!(
+            "entry function '{}' cannot expose Type witness parameters to Wasm runtime; specialize them at compile-time before main",
+            main
+        )));
+    }
 
     let mut queue = VecDeque::<PendingSpecialization>::new();
     let mut scheduled_names = BTreeSet::<String>::new();
@@ -1609,6 +1625,7 @@ fn specialize_checked_program_for_main(
             output_name: main.to_string(),
             type_subst: BTreeMap::new(),
             known_fun_args: BTreeMap::new(),
+            known_type_witness_args: BTreeMap::new(),
             origin: format!("entry:{main}"),
         },
     );
@@ -1695,10 +1712,31 @@ fn specialize_function_instance(
             )));
         }
     }
+    for (index, witness_prim) in &pending.known_type_witness_args {
+        let Some(param_ty) = applied_param_types.get(*index) else {
+            return Err(SimdError::new(format!(
+                "specialization for '{}' referenced missing type-witness arg index {}",
+                pending.output_name, index
+            )));
+        };
+        let Type::TypeToken(inner) = param_ty else {
+            return Err(SimdError::new(format!(
+                "specialization for '{}' tried to bind non-Type parameter {} to witness '{}'",
+                pending.output_name,
+                index,
+                format_prim(*witness_prim)
+            )));
+        };
+        let mut check_subst = BTreeMap::<String, Type>::new();
+        collect_type_var_bindings(inner, &Type::Scalar(*witness_prim), &mut check_subst)?;
+    }
     let mut kept_param_types = Vec::<Type>::new();
     for (index, ty) in applied_param_types.iter().enumerate() {
         if let Some(binding) = pending.known_fun_args.get(&index) {
             kept_param_types.extend(binding.capture_types.clone());
+        } else if pending.known_type_witness_args.contains_key(&index) {
+            // Type witnesses are compile-time dispatch values and are erased
+            // from specialized runtime signatures.
         } else {
             kept_param_types.push(ty.clone());
         }
@@ -1720,6 +1758,7 @@ fn specialize_function_instance(
             let mut fun_subst = BTreeMap::<String, KnownFunctionBinding>::new();
             let mut scope_types = BTreeMap::<String, Type>::new();
             let mut patterns = Vec::<TypedPattern>::new();
+            let mut clause_matches_witnesses = true;
             for (index, pattern) in clause.patterns.iter().enumerate() {
                 let typed_pattern = TypedPattern {
                     pattern: pattern.pattern.clone(),
@@ -1754,13 +1793,30 @@ fn specialize_function_instance(
                             );
                         }
                         Pattern::Wildcard => {}
-                        Pattern::Int(_) | Pattern::Float(_) => {
+                        Pattern::Int(_) | Pattern::Float(_) | Pattern::Type(_) => {
                             return Err(SimdError::new(format!(
                                 "function-typed parameter {} in '{}' used a literal pattern",
                                 index, pending.base_name
                             )));
                         }
                     }
+                } else if let Some(witness_prim) = pending.known_type_witness_args.get(&index) {
+                    match &typed_pattern.pattern {
+                        Pattern::Type(pattern_prim) => {
+                            if pattern_prim != witness_prim {
+                                clause_matches_witnesses = false;
+                                break;
+                            }
+                        }
+                        Pattern::Wildcard | Pattern::Name(_) => {}
+                        Pattern::Int(_) | Pattern::Float(_) => {
+                            return Err(SimdError::new(format!(
+                                "type witness parameter {} in '{}' used a non-Type literal pattern",
+                                index, pending.base_name
+                            )));
+                        }
+                    }
+                    // Do not push this witness pattern: it was consumed at compile-time.
                 } else {
                     if let Pattern::Name(name) = &typed_pattern.pattern {
                         scope_types.insert(name.clone(), typed_pattern.ty.clone());
@@ -1768,7 +1824,10 @@ fn specialize_function_instance(
                     patterns.push(typed_pattern);
                 }
             }
-            Ok(TypedClause {
+            if !clause_matches_witnesses {
+                return Ok(None);
+            }
+            Ok(Some(TypedClause {
                 patterns,
                 body: specialize_expr(
                     &clause.body,
@@ -1782,9 +1841,18 @@ fn specialize_function_instance(
                     scheduled_names,
                     generic_instances,
                 )?,
-            })
+            }))
         })
-        .collect::<Result<Vec<_>>>()?;
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    if clauses.is_empty() {
+        return Err(SimdError::new(format!(
+            "specialization removed all clauses for '{}' with the selected type witness arguments",
+            pending.output_name
+        )));
+    }
 
     Ok(CheckedFunction {
         name: pending.output_name.clone(),
@@ -1828,8 +1896,22 @@ fn specialize_expr(
                 &format!("fnref:{current_function}"),
             )?,
         },
-        TypedExprKind::Int(value, prim) => TypedExprKind::Int(*value, *prim),
-        TypedExprKind::Float(value, prim) => TypedExprKind::Float(*value, *prim),
+        TypedExprKind::Int(value, prim) => match &ty {
+            Type::Scalar(target_prim) if target_prim.is_int() => {
+                TypedExprKind::Int(*value, *target_prim)
+            }
+            Type::Scalar(target_prim) if target_prim.is_float() => {
+                TypedExprKind::Float(*value as f64, *target_prim)
+            }
+            _ => TypedExprKind::Int(*value, *prim),
+        },
+        TypedExprKind::Float(value, prim) => match &ty {
+            Type::Scalar(target_prim) if target_prim.is_float() => {
+                TypedExprKind::Float(*value, *target_prim)
+            }
+            _ => TypedExprKind::Float(*value, *prim),
+        },
+        TypedExprKind::TypeToken(prim) => TypedExprKind::TypeToken(*prim),
         TypedExprKind::Lambda { param, body } => TypedExprKind::Lambda {
             param: param.clone(),
             body: {
@@ -2093,7 +2175,8 @@ fn extract_known_function_binding(expr: &TypedExpr) -> Option<KnownFunctionBindi
         | TypedExprKind::RecordUpdate { .. }
         | TypedExprKind::Call { .. }
         | TypedExprKind::Int(_, _)
-        | TypedExprKind::Float(_, _) => None,
+        | TypedExprKind::Float(_, _)
+        | TypedExprKind::TypeToken(_) => None,
     }
 }
 
@@ -2246,7 +2329,7 @@ fn try_inline_lambda_result_call(
                     });
                 }
             }
-            Pattern::Int(_) | Pattern::Float(_) => return Ok(None),
+            Pattern::Int(_) | Pattern::Float(_) | Pattern::Type(_) => return Ok(None),
         }
     }
     let rewritten_body = specialize_expr(
@@ -2310,6 +2393,7 @@ fn resolve_specialized_callee_call(
         .map(|ty| apply_type_subst(ty, &callee_subst))
         .collect::<Vec<_>>();
     let mut known_fun_args = BTreeMap::<usize, KnownFunctionArgSpec>::new();
+    let mut known_type_witness_args = BTreeMap::<usize, Prim>::new();
     let mut retained_args = Vec::<TypedArg>::new();
     let mut closure_info = Vec::<ClosureBindingSummary>::new();
     for (index, (param_ty, arg)) in instantiated_params.iter().zip(args.iter()).enumerate() {
@@ -2344,12 +2428,26 @@ fn resolve_specialized_callee_call(
             closure_info.push(summary);
             continue;
         }
+        if matches!(param_ty, Type::TypeToken(_)) {
+            let witness_prim = match &arg.expr.kind {
+                TypedExprKind::TypeToken(prim) => *prim,
+                _ => {
+                    return Err(SimdError::new(format!(
+                        "Wasm specialization requires type witness argument {} in call to '{}' to be a literal primitive token",
+                        index, callee_name
+                    )));
+                }
+            };
+            known_type_witness_args.insert(index, witness_prim);
+            continue;
+        }
         retained_args.push(arg.clone());
     }
     let output_name = resolve_specialized_function_name(
         callee_name,
         &callee_subst,
         &known_fun_args,
+        &known_type_witness_args,
         originals,
         queue,
         scheduled_names,
@@ -2533,6 +2631,9 @@ fn estimate_closure_env_bytes(ty: &Type) -> Result<usize> {
     match ty {
         Type::Scalar(prim) => Ok(byte_width(*prim) as usize),
         Type::Bulk(_, _) => Ok(8),
+        Type::TypeToken(_) => Err(SimdError::new(
+            "closure env does not support type witness captures",
+        )),
         Type::Record(fields) => fields
             .values()
             .map(estimate_closure_env_bytes)
@@ -2566,6 +2667,7 @@ fn resolve_function_ref_name_for_type(
         function_name,
         &subst,
         &BTreeMap::new(),
+        &BTreeMap::new(),
         originals,
         queue,
         scheduled_names,
@@ -2578,6 +2680,7 @@ fn resolve_specialized_function_name(
     base_name: &str,
     type_subst: &BTreeMap<String, Type>,
     known_fun_args: &BTreeMap<usize, KnownFunctionArgSpec>,
+    known_type_witness_args: &BTreeMap<usize, Prim>,
     originals: &BTreeMap<String, &CheckedFunction>,
     queue: &mut VecDeque<PendingSpecialization>,
     scheduled_names: &mut BTreeSet<String>,
@@ -2607,10 +2710,30 @@ fn resolve_specialized_function_name(
             )));
         }
     }
+    for (index, prim) in known_type_witness_args {
+        let Some(param_ty) = instantiated_params.get(*index) else {
+            return Err(SimdError::new(format!(
+                "type-witness specialization for '{}' referenced missing arg index {}",
+                base_name, index
+            )));
+        };
+        let Type::TypeToken(inner) = param_ty else {
+            return Err(SimdError::new(format!(
+                "type-witness specialization for '{}' tried to bind non-Type arg {} to '{}'",
+                base_name,
+                index,
+                format_prim(*prim)
+            )));
+        };
+        let mut check_subst = BTreeMap::<String, Type>::new();
+        collect_type_var_bindings(inner, &Type::Scalar(*prim), &mut check_subst)?;
+    }
     let mut kept_params = Vec::<Type>::new();
     for (index, ty) in instantiated_params.iter().enumerate() {
         if let Some(binding) = known_fun_args.get(&index) {
             kept_params.extend(binding.capture_types.clone());
+        } else if known_type_witness_args.contains_key(&index) {
+            // Type witness arg consumed by monomorphized dispatch.
         } else {
             kept_params.push(ty.clone());
         }
@@ -2624,6 +2747,7 @@ fn resolve_specialized_function_name(
         )));
     }
     let needs_specialized_clone = !known_fun_args.is_empty()
+        || !known_type_witness_args.is_empty()
         || !type_subst.is_empty()
         || type_contains_unresolved_vars(&original.signature.ty);
     if !needs_specialized_clone {
@@ -2635,6 +2759,7 @@ fn resolve_specialized_function_name(
                 output_name: base_name.to_string(),
                 type_subst: BTreeMap::new(),
                 known_fun_args: BTreeMap::new(),
+                known_type_witness_args: BTreeMap::new(),
                 origin: origin.to_string(),
             },
         );
@@ -2645,6 +2770,7 @@ fn resolve_specialized_function_name(
         &instantiated_params,
         &instantiated_result,
         known_fun_args,
+        known_type_witness_args,
     );
     let output_name = if let Some(existing) = generic_instances.get(&instance_key) {
         existing.clone()
@@ -2672,15 +2798,28 @@ fn resolve_specialized_function_name(
                     .join("_")
             )
         };
+        let witness_suffix = if known_type_witness_args.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "$tw${}",
+                known_type_witness_args
+                    .iter()
+                    .map(|(index, prim)| format!("{index}_{}", format_prim(*prim)))
+                    .collect::<Vec<_>>()
+                    .join("_")
+            )
+        };
         let generated = format!(
-            "{}$mono${}{}",
+            "{}$mono${}{}{}",
             sanitize_specialized_name(base_name),
             instantiated_params
                 .iter()
                 .map(mangle_type)
                 .collect::<Vec<_>>()
                 .join("_"),
-            known_suffix
+            known_suffix,
+            witness_suffix
         );
         generic_instances.insert(instance_key, generated.clone());
         enqueue_specialization(
@@ -2691,6 +2830,7 @@ fn resolve_specialized_function_name(
                 output_name: generated.clone(),
                 type_subst: type_subst.clone(),
                 known_fun_args: known_fun_args.clone(),
+                known_type_witness_args: known_type_witness_args.clone(),
                 origin: origin.to_string(),
             },
         );
@@ -2714,6 +2854,7 @@ fn specialization_key(
     params: &[Type],
     result: &Type,
     known_fun_args: &BTreeMap<usize, KnownFunctionArgSpec>,
+    known_type_witness_args: &BTreeMap<usize, Prim>,
 ) -> String {
     let known = if known_fun_args.is_empty() {
         "none".to_string()
@@ -2735,12 +2876,22 @@ fn specialization_key(
             .collect::<Vec<_>>()
             .join("|")
     };
+    let type_witness = if known_type_witness_args.is_empty() {
+        "none".to_string()
+    } else {
+        known_type_witness_args
+            .iter()
+            .map(|(index, prim)| format!("{index}:{}", format_prim(*prim)))
+            .collect::<Vec<_>>()
+            .join("|")
+    };
     format!(
-        "{}::{}::ret={}::fn={}",
+        "{}::{}::ret={}::fn={}::tw={}",
         base_name,
         params.iter().map(mangle_type).collect::<Vec<_>>().join("|"),
         mangle_type(result),
-        known
+        known,
+        type_witness
     )
 }
 
@@ -2769,6 +2920,7 @@ fn mangle_type(ty: &Type) -> String {
             mangle_type(&Type::Scalar(*prim)),
             shape.0.iter().map(mangle_dim).collect::<Vec<_>>().join("")
         ),
+        Type::TypeToken(inner) => format!("t{}", mangle_type(inner)),
         Type::Record(fields) => format!(
             "r{}",
             fields
@@ -2798,6 +2950,7 @@ fn type_contains_unresolved_vars(ty: &Type) -> bool {
     match ty {
         Type::Var(_) | Type::Infer(_) => true,
         Type::Scalar(_) | Type::Bulk(_, _) => false,
+        Type::TypeToken(inner) => type_contains_unresolved_vars(inner),
         Type::Record(fields) => fields.values().any(type_contains_unresolved_vars),
         Type::Fun(args, ret) => {
             args.iter().any(type_contains_unresolved_vars) || type_contains_unresolved_vars(ret)
@@ -2853,6 +3006,7 @@ fn eliminate_non_escaping_lambdas_expr(
         TypedExprKind::FunctionRef { name } => TypedExprKind::FunctionRef { name: name.clone() },
         TypedExprKind::Int(value, prim) => TypedExprKind::Int(*value, *prim),
         TypedExprKind::Float(value, prim) => TypedExprKind::Float(*value, *prim),
+        TypedExprKind::TypeToken(prim) => TypedExprKind::TypeToken(*prim),
         TypedExprKind::Lambda { param, body } => TypedExprKind::Lambda {
             param: param.clone(),
             body: Box::new(eliminate_non_escaping_lambdas_expr(
@@ -3064,7 +3218,8 @@ fn collect_free_locals(
         }
         TypedExprKind::FunctionRef { .. }
         | TypedExprKind::Int(_, _)
-        | TypedExprKind::Float(_, _) => {}
+        | TypedExprKind::Float(_, _)
+        | TypedExprKind::TypeToken(_) => {}
         TypedExprKind::Lambda { param, body } => {
             let mut nested = bound.clone();
             nested.insert(param.clone());
@@ -3125,6 +3280,7 @@ fn rename_free_locals(
         TypedExprKind::FunctionRef { name } => TypedExprKind::FunctionRef { name: name.clone() },
         TypedExprKind::Int(value, prim) => TypedExprKind::Int(*value, *prim),
         TypedExprKind::Float(value, prim) => TypedExprKind::Float(*value, *prim),
+        TypedExprKind::TypeToken(prim) => TypedExprKind::TypeToken(*prim),
         TypedExprKind::Lambda { param, body } => {
             let mut nested = bound.clone();
             nested.insert(param.clone());
@@ -3216,7 +3372,8 @@ fn collect_used_locals(expr: &TypedExpr, names: &mut BTreeSet<String>) {
         }
         TypedExprKind::FunctionRef { .. }
         | TypedExprKind::Int(_, _)
-        | TypedExprKind::Float(_, _) => {}
+        | TypedExprKind::Float(_, _)
+        | TypedExprKind::TypeToken(_) => {}
         TypedExprKind::Lambda { body, .. } => collect_used_locals(body, names),
         TypedExprKind::Let { bindings, body } => {
             for binding in bindings {
@@ -3299,6 +3456,7 @@ fn canonicalize_backend_higher_order_expr(
         TypedExprKind::FunctionRef { name } => TypedExprKind::FunctionRef { name: name.clone() },
         TypedExprKind::Int(value, prim) => TypedExprKind::Int(*value, *prim),
         TypedExprKind::Float(value, prim) => TypedExprKind::Float(*value, *prim),
+        TypedExprKind::TypeToken(prim) => TypedExprKind::TypeToken(*prim),
         TypedExprKind::Lambda { param, body } => TypedExprKind::Lambda {
             param: param.clone(),
             body: Box::new(canonicalize_backend_higher_order_expr(
@@ -3443,6 +3601,7 @@ fn classify_function_value_expr_for_backend(expr: &TypedExpr) -> FunctionValueCl
         | TypedExprKind::Call { .. } => FunctionValueClass::EscapingUnknown,
         TypedExprKind::Int(_, _)
         | TypedExprKind::Float(_, _)
+        | TypedExprKind::TypeToken(_)
         | TypedExprKind::Record(_)
         | TypedExprKind::Project { .. }
         | TypedExprKind::RecordUpdate { .. } => FunctionValueClass::EscapingUnknown,
@@ -3559,6 +3718,7 @@ fn apply_type_subst(ty: &Type, subst: &BTreeMap<String, Type>) -> Type {
     match ty {
         Type::Var(name) => subst.get(name).cloned().unwrap_or_else(|| ty.clone()),
         Type::Scalar(_) | Type::Bulk(_, _) | Type::Infer(_) => ty.clone(),
+        Type::TypeToken(inner) => Type::TypeToken(Box::new(apply_type_subst(inner, subst))),
         Type::Record(fields) => Type::Record(
             fields
                 .iter()
@@ -3606,6 +3766,13 @@ fn collect_type_var_bindings(
             }
             _ => Err(SimdError::new(format!(
                 "specialization expected bulk {:?}, found {:?}",
+                template, actual
+            ))),
+        },
+        Type::TypeToken(left) => match actual {
+            Type::TypeToken(right) => collect_type_var_bindings(left, right, subst),
+            _ => Err(SimdError::new(format!(
+                "specialization expected type witness {:?}, found {:?}",
                 template, actual
             ))),
         },
@@ -3658,6 +3825,9 @@ fn lane_scalar_type(ty: &Type) -> Result<Type> {
                 .iter()
                 .map(|(name, field_ty)| Ok((name.clone(), lane_scalar_type(field_ty)?)))
                 .collect::<Result<BTreeMap<_, _>>>()?,
+        )),
+        Type::TypeToken(_) => Err(SimdError::new(
+            "lane argument expected bulk-compatible type, found type witness",
         )),
         Type::Scalar(_) | Type::Var(_) | Type::Infer(_) | Type::Fun(_, _) => {
             Err(SimdError::new(format!(
@@ -3841,7 +4011,10 @@ fn collect_higher_order_expr_counts(
                 );
             }
         }
-        TypedExprKind::Local(_) | TypedExprKind::Int(_, _) | TypedExprKind::Float(_, _) => {}
+        TypedExprKind::Local(_)
+        | TypedExprKind::Int(_, _)
+        | TypedExprKind::Float(_, _)
+        | TypedExprKind::TypeToken(_) => {}
     }
 }
 
@@ -3866,7 +4039,8 @@ fn typed_expr_contains_lambda_or_apply(expr: &TypedExpr) -> bool {
         TypedExprKind::Local(_)
         | TypedExprKind::FunctionRef { .. }
         | TypedExprKind::Int(_, _)
-        | TypedExprKind::Float(_, _) => false,
+        | TypedExprKind::Float(_, _)
+        | TypedExprKind::TypeToken(_) => false,
     }
 }
 
@@ -3895,7 +4069,8 @@ fn typed_expr_contains_fun_local(expr: &TypedExpr) -> bool {
         TypedExprKind::Local(_)
         | TypedExprKind::FunctionRef { .. }
         | TypedExprKind::Int(_, _)
-        | TypedExprKind::Float(_, _) => false,
+        | TypedExprKind::Float(_, _)
+        | TypedExprKind::TypeToken(_) => false,
     }
 }
 
@@ -5393,6 +5568,11 @@ fn entry_signature(function: &CheckedFunction) -> Result<(Vec<ValType>, Option<V
                 lowered.push(ValType::I32);
                 lowered.push(ValType::I32);
             }
+            Type::TypeToken(_) => {
+                return Err(SimdError::new(
+                    "Wasm backend does not support Type witness entry parameters",
+                ));
+            }
             Type::Record(_) => {
                 return Err(SimdError::new(
                     "Wasm backend does not yet support record entry parameters",
@@ -5421,6 +5601,11 @@ fn entry_signature(function: &CheckedFunction) -> Result<(Vec<ValType>, Option<V
             lowered.push(ValType::I32);
             lowered.push(ValType::I32);
             None
+        }
+        Type::TypeToken(_) => {
+            return Err(SimdError::new(
+                "Wasm backend does not support Type witness entry results",
+            ));
         }
         Type::Record(_) => {
             return Err(SimdError::new(
@@ -5652,6 +5837,11 @@ fn compile_kernel_entry(
                     len_local: wasm_param_index + 1,
                 });
                 wasm_param_index += 2;
+            }
+            Type::TypeToken(_) => {
+                return Err(SimdError::new(
+                    "Wasm backend does not support Type witness kernel parameters",
+                ));
             }
             Type::Record(_) => {
                 return Err(SimdError::new(
@@ -6460,7 +6650,7 @@ fn pattern_local_map(patterns: &[TypedPattern]) -> BTreeMap<String, u32> {
         .enumerate()
         .filter_map(|(index, pattern)| match &pattern.pattern {
             Pattern::Name(name) => Some((name.clone(), index as u32)),
-            Pattern::Wildcard | Pattern::Int(_) | Pattern::Float(_) => None,
+            Pattern::Wildcard | Pattern::Int(_) | Pattern::Float(_) | Pattern::Type(_) => None,
         })
         .collect()
 }
@@ -6506,6 +6696,11 @@ fn emit_clause_condition(
                     function.instruction(&Instruction::I32And);
                 }
             }
+            Pattern::Type(_) => {
+                return Err(SimdError::new(
+                    "Wasm backend does not support type witness clause patterns",
+                ));
+            }
         }
     }
     if !emitted {
@@ -6530,6 +6725,11 @@ fn emit_pattern_value(
         }
         Pattern::Wildcard | Pattern::Int(_) | Pattern::Float(_) => {
             function.instruction(&Instruction::LocalGet(fallback_local));
+        }
+        Pattern::Type(_) => {
+            return Err(SimdError::new(
+                "Wasm backend does not support type witness clause patterns",
+            ));
         }
     }
     Ok(())
@@ -7061,6 +7261,7 @@ fn patterns_are_vectorizable(
                     return false;
                 }
             }
+            Pattern::Type(_) => return false,
             Pattern::Name(_) | Pattern::Wildcard => {}
         }
     }
@@ -7138,6 +7339,11 @@ fn emit_vector_clause_mask(
                     function.instruction(&Instruction::V128And);
                 }
                 terms += 1;
+            }
+            Pattern::Type(_) => {
+                return Err(SimdError::new(
+                    "Wasm backend does not support type witness clause patterns",
+                ));
             }
         }
     }
@@ -7871,12 +8077,17 @@ fn flatten_clause_patterns(
                 pattern: pattern.pattern.clone(),
                 ty: ty.clone(),
             }),
+            Type::TypeToken(_) => {
+                return Err(SimdError::new(
+                    "Wasm backend does not support type witness parameters in flattened clauses",
+                ));
+            }
             Type::Record(_) => {
                 for leaf in flatten_type_leaves(ty) {
                     let leaf_pattern = match &pattern.pattern {
                         Pattern::Name(name) => Pattern::Name(leaf_symbol_name(name, &leaf.path)),
                         Pattern::Wildcard => Pattern::Wildcard,
-                        Pattern::Int(_) | Pattern::Float(_) => {
+                        Pattern::Int(_) | Pattern::Float(_) | Pattern::Type(_) => {
                             return Err(SimdError::new(
                                 "record parameters cannot use literal patterns",
                             ));
@@ -7950,6 +8161,9 @@ fn normalize_expr_for_leaf(
                 kind: TypedExprKind::Float(*value, *prim),
             })
         }
+        TypedExprKind::TypeToken(_) => Err(SimdError::new(
+            "Wasm record normalization does not support type witness expressions",
+        )),
         TypedExprKind::FunctionRef { .. }
         | TypedExprKind::Lambda { .. }
         | TypedExprKind::Apply { .. } => Err(SimdError::new(
@@ -8146,6 +8360,9 @@ fn wasm_param_abi_from_single_type(ty: &Type) -> Result<WasmParamAbi> {
     match ty {
         Type::Scalar(prim) => Ok(WasmParamAbi::Scalar { prim: *prim }),
         Type::Bulk(prim, _) => Ok(WasmParamAbi::Bulk { prim: *prim }),
+        Type::TypeToken(_) => Err(SimdError::new(
+            "Wasm backend does not support Type witness entry parameters",
+        )),
         Type::Record(fields) => Ok(WasmParamAbi::Record {
             fields: fields
                 .iter()
@@ -8177,6 +8394,9 @@ fn wasm_result_abi_from_type(ty: &Type, param_types: &[Type]) -> Result<WasmResu
                     )
                 })?,
         }),
+        Type::TypeToken(_) => Err(SimdError::new(
+            "Wasm backend does not support Type witness entry results",
+        )),
         Type::Record(fields) => Ok(WasmResultAbi::Record {
             fields: fields
                 .iter()
@@ -8203,6 +8423,7 @@ fn type_contains_bulk_leaf(ty: &Type) -> bool {
         Type::Record(fields) => fields
             .iter()
             .any(|(_, field_ty)| type_contains_bulk_leaf(field_ty)),
+        Type::TypeToken(_) => false,
         Type::Scalar(_) | Type::Var(_) | Type::Infer(_) | Type::Fun(_, _) => false,
     }
 }
@@ -8211,6 +8432,9 @@ fn wasm_leaf_result_abi_from_type(ty: &Type) -> Result<WasmLeafResultAbi> {
     match ty {
         Type::Scalar(prim) => Ok(WasmLeafResultAbi::Scalar { prim: *prim }),
         Type::Bulk(prim, _) => Ok(WasmLeafResultAbi::Bulk { prim: *prim }),
+        Type::TypeToken(_) => Err(SimdError::new(
+            "leaf result ABI cannot contain Type witness values",
+        )),
         Type::Record(_) => Err(SimdError::new("leaf result ABI cannot contain records")),
         Type::Fun(_, _) => Err(SimdError::new("leaf result ABI cannot contain functions")),
         Type::Var(_) | Type::Infer(_) => Err(SimdError::new(
@@ -8245,6 +8469,9 @@ fn type_at_leaf_path(ty: &Type, leaf_path: &LeafPath) -> Result<Type> {
     if leaf_path.is_root() {
         return match ty {
             Type::Scalar(_) | Type::Bulk(_, _) => Ok(ty.clone()),
+            Type::TypeToken(_) => Err(SimdError::new(
+                "Type witness values cannot be used as leaf values",
+            )),
             Type::Record(_) => Err(SimdError::new("record type requires a non-empty leaf path")),
             Type::Fun(_, _) => Err(SimdError::new(
                 "function types cannot be used as leaf values",
@@ -8976,6 +9203,12 @@ fn flatten_wasm_value(
                 prim
             )));
         }
+        (Value::TypeToken(_), WasmParamAbi::Scalar { .. })
+        | (Value::TypeToken(_), WasmParamAbi::Bulk { .. }) => {
+            return Err(SimdError::new(
+                "Wasm backend does not support runtime type witness arguments",
+            ));
+        }
         (value, WasmParamAbi::Record { .. }) => {
             return Err(SimdError::new(format!(
                 "record Wasm ABI expected a record value, found {:?}",
@@ -9395,7 +9628,8 @@ mod tests {
             TypedExprKind::Local(_)
             | TypedExprKind::FunctionRef { .. }
             | TypedExprKind::Int(_, _)
-            | TypedExprKind::Float(_, _) => false,
+            | TypedExprKind::Float(_, _)
+            | TypedExprKind::TypeToken(_) => false,
         }
     }
 
@@ -9848,6 +10082,45 @@ mod tests {
     fn wasm_monomorphizes_transitive_generic_calls() {
         let src = "id : t -> t\nid x = x\nsquare : t -> t\nsquare x = let y = id x in y * y\nmain : i64 -> i64\nmain x = square x\n";
         assert_eq!(wasm_run(src, "main", "[7]"), "49");
+    }
+
+    #[test]
+    fn wasm_monomorphizes_generic_literal_for_float_call() {
+        let src = "inc : t -> t\ninc x = x + 1\nmain : f32 -> f32\nmain x = inc x\n";
+        assert_eq!(wasm_run(src, "main", "[1.5]"), "2.5");
+    }
+
+    #[test]
+    fn wasm_monomorphizes_type_witness_dispatch_when_main_is_concrete() {
+        let src = "my_func : Type t -> t -> t\nmy_func i64 x = x + 1\nmy_func _ x = x\nmain : i64 -> i64\nmain x = my_func i64 x\n";
+        let eval = run_main(src, "main", "[41]")
+            .expect("evaluator should run")
+            .to_json_string();
+        let wasm = run_wasm_main(src, "main", "[41]")
+            .expect("wasm should run")
+            .to_json_string();
+        assert_eq!(eval, wasm);
+        assert_eq!(wasm, "42");
+    }
+
+    #[test]
+    fn wasm_rejects_runtime_type_witness_entry_params() {
+        let src = "main : Type i64 -> i64 -> i64\nmain i64 x = x + 1\nmain _ x = x\n";
+        let error = compile_wasm_main(src, "main").expect_err("Wasm compile should reject");
+        assert!(
+            error
+                .to_string()
+                .contains("cannot expose Type witness parameters")
+        );
+    }
+
+    #[test]
+    fn wasm_rejects_nonliteral_type_witness_call_args() {
+        let src = "my_func : Type t -> t -> t\nmy_func i64 x = x + 1\nmy_func _ x = x\nmain : i64 -> i64\nmain x = let ty = i64 in my_func ty x\n";
+        let error = compile_wasm_main(src, "main").expect_err("Wasm compile should reject");
+        assert!(error.to_string().contains(
+            "type witness argument 0 in call to 'my_func' to be a literal primitive token"
+        ));
     }
 
     #[test]

@@ -1,0 +1,34 @@
+    pattern:  5, capture: 4 - function, start: (0, 0), end: (0, 7), text: `my_func`
+    pattern: 14, capture: 10 - punctuation.delimiter, start: (0, 8), end: (0, 9), text: `:`
+    pattern:  5, capture: 2 - type, start: (0, 10), end: (0, 26), text: `Type t -> t -> t`
+    pattern:  2, capture: 2 - type, start: (0, 10), end: (0, 14), text: `Type`
+    pattern:  3, capture: 3 - keyword, start: (0, 10), end: (0, 14), text: `Type`
+    pattern: 14, capture: 10 - punctuation.delimiter, start: (0, 17), end: (0, 19), text: `->`
+    pattern: 14, capture: 10 - punctuation.delimiter, start: (0, 22), end: (0, 24), text: `->`
+    pattern:  6, capture: 4 - function, start: (1, 0), end: (1, 7), text: `my_func`
+    pattern:  1, capture: 1 - type.builtin, start: (1, 8), end: (1, 11), text: `i64`
+    pattern:  6, capture: 5 - variable.parameter, start: (1, 12), end: (1, 13), text: `x`
+    pattern: 14, capture: 10 - punctuation.delimiter, start: (1, 14), end: (1, 15), text: `=`
+    pattern: 12, capture: 8 - operator, start: (1, 18), end: (1, 19), text: `+`
+    pattern:  0, capture: 0 - constant.numeric, start: (1, 20), end: (1, 21), text: `1`
+    pattern:  6, capture: 4 - function, start: (2, 0), end: (2, 7), text: `my_func`
+    pattern:  1, capture: 1 - type.builtin, start: (2, 8), end: (2, 11), text: `i32`
+    pattern:  6, capture: 5 - variable.parameter, start: (2, 12), end: (2, 13), text: `x`
+    pattern: 14, capture: 10 - punctuation.delimiter, start: (2, 14), end: (2, 15), text: `=`
+    pattern: 12, capture: 8 - operator, start: (2, 18), end: (2, 19), text: `+`
+    pattern:  0, capture: 0 - constant.numeric, start: (2, 20), end: (2, 21), text: `2`
+    pattern:  6, capture: 4 - function, start: (3, 0), end: (3, 7), text: `my_func`
+    pattern:  6, capture: 5 - variable.parameter, start: (3, 10), end: (3, 11), text: `x`
+    pattern: 14, capture: 10 - punctuation.delimiter, start: (3, 12), end: (3, 13), text: `=`
+    pattern:  5, capture: 4 - function, start: (5, 0), end: (5, 4), text: `main`
+    pattern: 14, capture: 10 - punctuation.delimiter, start: (5, 5), end: (5, 6), text: `:`
+    pattern:  5, capture: 2 - type, start: (5, 7), end: (5, 23), text: `Type t -> t -> t`
+    pattern:  2, capture: 2 - type, start: (5, 7), end: (5, 11), text: `Type`
+    pattern:  3, capture: 3 - keyword, start: (5, 7), end: (5, 11), text: `Type`
+    pattern: 14, capture: 10 - punctuation.delimiter, start: (5, 14), end: (5, 16), text: `->`
+    pattern: 14, capture: 10 - punctuation.delimiter, start: (5, 19), end: (5, 21), text: `->`
+    pattern:  6, capture: 4 - function, start: (6, 0), end: (6, 4), text: `main`
+    pattern:  6, capture: 4 - function, start: (6, 0), end: (6, 4), text: `main`
+    pattern:  6, capture: 5 - variable.parameter, start: (6, 5), end: (6, 7), text: `ty`
+    pattern:  6, capture: 5 - variable.parameter, start: (6, 8), end: (6, 9), text: `x`
+    pattern: 14, capture: 10 - punctuation.delimiter, start: (6, 10), end: (6, 11), text: `=`
