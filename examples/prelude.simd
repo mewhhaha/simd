@@ -4,11 +4,17 @@ id x = x
 const : t -> u -> t
 const x _ = x
 
-square_t : t -> t
-square_t x = x * x
+add_t : t -> t -> t
+add_t a b = a + b
 
-cube_t : t -> t
-cube_t x = x * x * x
+sub_t : t -> t -> t
+sub_t a b = a - b
+
+mul_t : t -> t -> t
+mul_t a b = a * b
+
+div_t : t -> t -> t
+div_t a b = a / b
 
 negate_t : t -> t
 negate_t x = 0 - x
@@ -16,8 +22,113 @@ negate_t x = 0 - x
 plus1_t : t -> t
 plus1_t x = x + 1
 
+minus1_t : t -> t
+minus1_t x = x - 1
+
+double_t : t -> t
+double_t x = x + x
+
+half_t : t -> t
+half_t x = x / 2
+
+square_t : t -> t
+square_t x = x * x
+
+cube_t : t -> t
+cube_t x = x * x * x
+
 axpy_t : t -> t -> t -> t
 axpy_t a x y = a * x + y
+
+mean2_t : t -> t -> t
+mean2_t a b = (a + b) / 2
+
+eq_i64 : i64 -> i64 -> i64
+eq_i64 a b = a == b
+
+lt_i64 : i64 -> i64 -> i64
+lt_i64 a b = a < b
+
+le_i64 : i64 -> i64 -> i64
+le_i64 a b = a <= b
+
+gt_i64 : i64 -> i64 -> i64
+gt_i64 a b = a > b
+
+ge_i64 : i64 -> i64 -> i64
+ge_i64 a b = a >= b
+
+between_closed_i64 : i64 -> i64 -> i64 -> i64
+between_closed_i64 lo hi x = (x >= lo) * (x <= hi)
+
+eq_f32 : f32 -> f32 -> i64
+eq_f32 a b = a == b
+
+lt_f32 : f32 -> f32 -> i64
+lt_f32 a b = a < b
+
+le_f32 : f32 -> f32 -> i64
+le_f32 a b = a <= b
+
+gt_f32 : f32 -> f32 -> i64
+gt_f32 a b = a > b
+
+ge_f32 : f32 -> f32 -> i64
+ge_f32 a b = a >= b
+
+between_closed_f32 : f32 -> f32 -> f32 -> i64
+between_closed_f32 lo hi x = (x >= lo) * (x <= hi)
+
+bool_and : i64 -> i64 -> i64
+bool_and a b = a * b
+
+bool_or : i64 -> i64 -> i64
+bool_or a b = 1 - (1 - a) * (1 - b)
+
+bool_not : i64 -> i64
+bool_not a = 1 - a
+
+select_i64 : i64 -> i64 -> i64 -> i64
+select_i64 cond when_true when_false = cond * when_true + (1 - cond) * when_false
+
+ge_nat : i64 -> i64 -> i64
+ge_nat x 0 = 1
+ge_nat 0 y = 0
+ge_nat x y = ge_nat (x - 1) (y - 1)
+
+step : i64 -> i64 -> i64
+step edge x = ge_nat x edge
+
+gt_nat : i64 -> i64 -> i64
+gt_nat x y = step (y + 1) x
+
+eq_nat : i64 -> i64 -> i64
+eq_nat x y = bool_and (step x y) (step y x)
+
+min_nat : i64 -> i64 -> i64
+min_nat x y = select_i64 (step x y) x y
+
+max_nat : i64 -> i64 -> i64
+max_nat x y = select_i64 (step x y) y x
+
+clamp_nat : i64 -> i64 -> i64 -> i64
+clamp_nat lo hi x = min_nat hi (max_nat lo x)
+
+saturate_nat : i64 -> i64 -> i64
+saturate_nat hi x = clamp_nat 0 hi x
+
+pow_nat : i64 -> i64 -> i64
+pow_nat base 0 = 1
+pow_nat base n = base * pow_nat base (n - 1)
+
+triangular_nat : i64 -> i64
+triangular_nat 0 = 0
+triangular_nat n = n + triangular_nat (n - 1)
+
+fib_nat : i64 -> i64
+fib_nat 0 = 0
+fib_nat 1 = 1
+fib_nat n = fib_nat (n - 1) + fib_nat (n - 2)
 
 square : f32 -> f32
 square x = x * x
@@ -28,14 +139,17 @@ cube x = x * x * x
 negate : f32 -> f32
 negate x = 0.0 - x
 
+inv1 : f32 -> f32
+inv1 x = 1.0 / (1.0 + x)
+
+affine : f32 -> f32 -> f32 -> f32
+affine scale bias x = scale * x + bias
+
 dist2 : f32 -> f32 -> f32 -> f32 -> f32
 dist2 x y cx cy = let
   dx = x - cx
   dy = y - cy
   in square dx + square dy
-
-inv1 : f32 -> f32
-inv1 x = 1.0 / (1.0 + x)
 
 glow : f32 -> f32 -> f32 -> f32
 glow amp falloff d2 = amp * inv1 (falloff * d2)
@@ -73,10 +187,83 @@ vignette strength d2 = inv1 (strength * d2)
 scanline : f32 -> f32 -> f32 -> f32
 scanline amount line01 color = color * (1.0 - amount * line01)
 
-ge_nat : i64 -> i64 -> i64
-ge_nat x 0 = 1
-ge_nat 0 y = 0
-ge_nat x y = ge_nat (x - 1) (y - 1)
+vec2 : f32 -> f32 -> {x:f32,y:f32}
+vec2 x y = { x = x, y = y }
 
-step : i64 -> i64 -> i64
-step edge x = ge_nat x edge
+vec2_add : {x:f32,y:f32} -> {x:f32,y:f32} -> {x:f32,y:f32}
+vec2_add a b = { x = a.x + b.x, y = a.y + b.y }
+
+vec2_sub : {x:f32,y:f32} -> {x:f32,y:f32} -> {x:f32,y:f32}
+vec2_sub a b = { x = a.x - b.x, y = a.y - b.y }
+
+vec2_scale : f32 -> {x:f32,y:f32} -> {x:f32,y:f32}
+vec2_scale s v = { x = s * v.x, y = s * v.y }
+
+vec2_dot : {x:f32,y:f32} -> {x:f32,y:f32} -> f32
+vec2_dot a b = a.x * b.x + a.y * b.y
+
+vec2_len2 : {x:f32,y:f32} -> f32
+vec2_len2 v = vec2_dot v v
+
+vec2_dist2 : {x:f32,y:f32} -> {x:f32,y:f32} -> f32
+vec2_dist2 a b = vec2_len2 (vec2_sub a b)
+
+vec2_mix : f32 -> {x:f32,y:f32} -> {x:f32,y:f32} -> {x:f32,y:f32}
+vec2_mix t a b = { x = mix (a.x) (b.x) t, y = mix (a.y) (b.y) t }
+
+vec2_perp : {x:f32,y:f32} -> {x:f32,y:f32}
+vec2_perp v = { x = 0.0 - v.y, y = v.x }
+
+vec3 : f32 -> f32 -> f32 -> {x:f32,y:f32,z:f32}
+vec3 x y z = { x = x, y = y, z = z }
+
+vec3_add : {x:f32,y:f32,z:f32} -> {x:f32,y:f32,z:f32} -> {x:f32,y:f32,z:f32}
+vec3_add a b = { x = a.x + b.x, y = a.y + b.y, z = a.z + b.z }
+
+vec3_sub : {x:f32,y:f32,z:f32} -> {x:f32,y:f32,z:f32} -> {x:f32,y:f32,z:f32}
+vec3_sub a b = { x = a.x - b.x, y = a.y - b.y, z = a.z - b.z }
+
+vec3_mul : {x:f32,y:f32,z:f32} -> {x:f32,y:f32,z:f32} -> {x:f32,y:f32,z:f32}
+vec3_mul a b = { x = a.x * b.x, y = a.y * b.y, z = a.z * b.z }
+
+vec3_scale : f32 -> {x:f32,y:f32,z:f32} -> {x:f32,y:f32,z:f32}
+vec3_scale s v = { x = s * v.x, y = s * v.y, z = s * v.z }
+
+vec3_dot : {x:f32,y:f32,z:f32} -> {x:f32,y:f32,z:f32} -> f32
+vec3_dot a b = a.x * b.x + a.y * b.y + a.z * b.z
+
+vec3_len2 : {x:f32,y:f32,z:f32} -> f32
+vec3_len2 v = vec3_dot v v
+
+vec3_mix : f32 -> {x:f32,y:f32,z:f32} -> {x:f32,y:f32,z:f32} -> {x:f32,y:f32,z:f32}
+vec3_mix t a b = { x = mix (a.x) (b.x) t, y = mix (a.y) (b.y) t, z = mix (a.z) (b.z) t }
+
+rgb : f32 -> f32 -> f32 -> {r:f32,g:f32,b:f32}
+rgb r g b = { r = r, g = g, b = b }
+
+rgb_add : {r:f32,g:f32,b:f32} -> {r:f32,g:f32,b:f32} -> {r:f32,g:f32,b:f32}
+rgb_add a b = { r = a.r + b.r, g = a.g + b.g, b = a.b + b.b }
+
+rgb_mul : {r:f32,g:f32,b:f32} -> {r:f32,g:f32,b:f32} -> {r:f32,g:f32,b:f32}
+rgb_mul a b = { r = a.r * b.r, g = a.g * b.g, b = a.b * b.b }
+
+rgb_scale : f32 -> {r:f32,g:f32,b:f32} -> {r:f32,g:f32,b:f32}
+rgb_scale s c = { r = s * c.r, g = s * c.g, b = s * c.b }
+
+rgb_mix : f32 -> {r:f32,g:f32,b:f32} -> {r:f32,g:f32,b:f32} -> {r:f32,g:f32,b:f32}
+rgb_mix t a b = { r = mix (a.r) (b.r) t, g = mix (a.g) (b.g) t, b = mix (a.b) (b.b) t }
+
+rgb_luma : {r:f32,g:f32,b:f32} -> f32
+rgb_luma c = 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b
+
+rgb_tone_reinhard : {r:f32,g:f32,b:f32} -> {r:f32,g:f32,b:f32}
+rgb_tone_reinhard c = { r = tone_reinhard (c.r), g = tone_reinhard (c.g), b = tone_reinhard (c.b) }
+
+rgb_exposure : f32 -> {r:f32,g:f32,b:f32} -> {r:f32,g:f32,b:f32}
+rgb_exposure exposure c = { r = tone_exposure exposure (c.r), g = tone_exposure exposure (c.g), b = tone_exposure exposure (c.b) }
+
+rgb_scanline : f32 -> f32 -> {r:f32,g:f32,b:f32} -> {r:f32,g:f32,b:f32}
+rgb_scanline amount line01 c = { r = scanline amount line01 (c.r), g = scanline amount line01 (c.g), b = scanline amount line01 (c.b) }
+
+rgb_vignette : f32 -> f32 -> {r:f32,g:f32,b:f32} -> {r:f32,g:f32,b:f32}
+rgb_vignette strength d2 c = rgb_scale (vignette strength d2) c
