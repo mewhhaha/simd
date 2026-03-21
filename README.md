@@ -7,9 +7,16 @@ All numbers are machine-dependent and should be compared on the same host.
 
 ## Web Demos
 
+- [Demo Explorer](./docs/demo_explorer.html)
 - [WAT Inspector](./docs/inspector.html)
 - [Mouse Shader Demo](./docs/canvas_mouse_demo.html)
 - [Image Upload Shader Lab](./docs/image_upload_shader_demo.html)
+
+Run all demos locally with:
+
+```sh
+just demo
+```
 
 ### Latest Snapshot (2026-03-20)
 

@@ -1,0 +1,146 @@
+==================
+signature
+==================
+
+f : i64 -> i64
+
+---
+
+(source_file
+  (declaration
+    (signature
+      name: (identifier)
+      type: (type
+        arg: (type_atom
+          (type_base
+            (prim_type)))
+        result: (type
+          (type_atom
+            (type_base
+              (prim_type))))))))
+
+==================
+clause
+==================
+
+f x = x + 1
+
+---
+
+(source_file
+  (declaration
+    (clause
+      name: (identifier)
+      pattern: (pattern
+        (identifier))
+      body: (expr
+        (comparison_expr
+          (add_expr
+            left: (add_expr
+              (mul_expr
+                (application_expr
+                  (postfix_expr
+                    (atom
+                      (identifier))))))
+            right: (mul_expr
+              (application_expr
+                (postfix_expr
+                  (atom
+                    (int)))))))))))
+
+==================
+let, record, projection, and update
+==================
+
+main p = let q = p { x = 3 }; r = q.x in r
+
+---
+
+(source_file
+  (declaration
+    (clause
+      name: (identifier)
+      pattern: (pattern
+        (identifier))
+      body: (expr
+        (let_expr
+          (let_binding
+            name: (identifier)
+            value: (expr
+              (comparison_expr
+                (add_expr
+                  (mul_expr
+                    (application_expr
+                      (postfix_expr
+                        base: (postfix_expr
+                          (atom
+                            (identifier)))
+                        update: (record_update
+                          (record_field
+                            name: (identifier)
+                            value: (expr
+                              (comparison_expr
+                                (add_expr
+                                  (mul_expr
+                                    (application_expr
+                                      (postfix_expr
+                                        (atom
+                                          (int)))))))))))))))))
+          (let_binding
+            name: (identifier)
+            value: (expr
+              (comparison_expr
+                (add_expr
+                  (mul_expr
+                    (application_expr
+                      (postfix_expr
+                        base: (postfix_expr
+                          (atom
+                            (identifier)))
+                        field: (identifier))))))))
+          (expr
+            (comparison_expr
+              (add_expr
+                (mul_expr
+                  (application_expr
+                    (postfix_expr
+                      (atom
+                        (identifier)))))))))))))
+
+==================
+application and infix precedence
+==================
+
+axpy a x y = a * x + y
+
+---
+
+(source_file
+  (declaration
+    (clause
+      name: (identifier)
+      pattern: (pattern
+        (identifier))
+      pattern: (pattern
+        (identifier))
+      pattern: (pattern
+        (identifier))
+      body: (expr
+        (comparison_expr
+          (add_expr
+            left: (add_expr
+              (mul_expr
+                left: (mul_expr
+                  (application_expr
+                    (postfix_expr
+                      (atom
+                        (identifier)))))
+                right: (application_expr
+                  (postfix_expr
+                    (atom
+                      (identifier))))))
+            right: (mul_expr
+              (application_expr
+                (postfix_expr
+                  (atom
+                    (identifier)))))))))))

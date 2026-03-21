@@ -1,0 +1,28 @@
+{
+  "grammars": [
+    {
+      "name": "simd",
+      "camelcase": "Simd",
+      "scope": "source.simd",
+      "path": ".",
+      "highlights": "queries/highlights.scm",
+      "tree-sitter-highlights": "queries/highlights.scm",
+      "file-types": [
+        "simd"
+      ]
+    }
+  ],
+  "metadata": {
+    "version": "0.1.0",
+    "license": "MIT",
+    "description": "Tree-sitter grammar for the simd language"
+  },
+  "bindings": {
+    "c": true,
+    "go": true,
+    "node": true,
+    "python": true,
+    "rust": true,
+    "swift": true
+  }
+}

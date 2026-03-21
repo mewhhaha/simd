@@ -1,0 +1,13 @@
+shade : f32 -> f32 -> f32 -> f32 -> f32 -> f32
+shade t mx my x y = let
+  dx = x - mx
+  dy = y - my
+  d2 = dx * dx + dy * dy
+  swirl = dx * dx - dy * dy + 0.25 * t
+  glow = 0.66 / (1.0 + 28.0 * d2)
+  rings = 0.34 / (1.0 + 7.0 * swirl * swirl)
+  in glow + rings
+
+main : f32 -> f32 -> f32 -> f32[n] -> f32[n] -> f32[n]
+main t mx my xs ys = shade t mx my xs ys
+

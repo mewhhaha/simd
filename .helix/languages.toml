@@ -1,0 +1,13 @@
+[language-server.simd-lsp]
+command = "simd"
+args = ["lsp"]
+
+[[language]]
+name = "simd"
+scope = "source.simd"
+injection-regex = "simd"
+file-types = ["simd"]
+roots = []
+grammar = "simd"
+rainbow-brackets = true
+language-servers = ["simd-lsp"]

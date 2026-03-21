@@ -1,0 +1,223 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>simd demo explorer</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #070b14;
+        --panel: #111a2a;
+        --panel-2: #0b1321;
+        --border: #25324a;
+        --text: #e8eef9;
+        --muted: #9caacc;
+        --accent: #78d7ff;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+        background: radial-gradient(1100px 520px at 8% -12%, #203259 0%, var(--bg) 60%);
+        color: var(--text);
+      }
+
+      .app {
+        min-height: 100vh;
+        display: grid;
+        grid-template-columns: 320px minmax(0, 1fr);
+      }
+
+      .sidebar {
+        border-right: 1px solid var(--border);
+        background: var(--panel-2);
+        padding: 14px;
+        display: grid;
+        gap: 12px;
+        align-content: start;
+      }
+
+      h1 {
+        margin: 0;
+        font-size: 17px;
+      }
+
+      .sub {
+        color: var(--muted);
+        font-size: 12px;
+        line-height: 1.35;
+      }
+
+      .list {
+        display: grid;
+        gap: 8px;
+      }
+
+      .item {
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        background: var(--panel);
+        color: var(--text);
+        width: 100%;
+        text-align: left;
+        padding: 10px;
+        cursor: pointer;
+      }
+
+      .item:hover {
+        border-color: var(--accent);
+      }
+
+      .item.active {
+        border-color: var(--accent);
+        box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 38%, transparent);
+      }
+
+      .item strong {
+        display: block;
+        font-size: 13px;
+      }
+
+      .item span {
+        display: block;
+        margin-top: 4px;
+        font-size: 12px;
+        color: var(--muted);
+      }
+
+      .main {
+        padding: 14px;
+        display: grid;
+        gap: 10px;
+      }
+
+      .toolbar {
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        background: var(--panel);
+        padding: 10px;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px 14px;
+        align-items: center;
+      }
+
+      .toolbar code {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 12px;
+        color: #bfd4ff;
+      }
+
+      .toolbar a {
+        color: var(--accent);
+        text-decoration: none;
+        font-size: 12px;
+      }
+
+      .toolbar a:hover {
+        text-decoration: underline;
+      }
+
+      iframe {
+        width: 100%;
+        min-height: 72vh;
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        background: #05080f;
+      }
+
+      @media (max-width: 980px) {
+        .app {
+          grid-template-columns: 1fr;
+        }
+        .sidebar {
+          border-right: 0;
+          border-bottom: 1px solid var(--border);
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main class="app">
+      <aside class="sidebar">
+        <header>
+          <h1>simd demo explorer</h1>
+          <div class="sub">
+            One place to inspect current examples.
+            Start local server with <code>just demo</code>.
+          </div>
+        </header>
+        <section id="list" class="list"></section>
+      </aside>
+      <section class="main">
+        <div class="toolbar">
+          <strong id="title"></strong>
+          <code id="path"></code>
+          <a id="openTab" href="#" target="_blank" rel="noreferrer">open in new tab</a>
+        </div>
+        <iframe id="preview" title="demo preview"></iframe>
+      </section>
+    </main>
+    <script>
+      const DEMOS = [
+        {
+          id: "inspector",
+          title: "WAT Inspector",
+          note: "Preset source examples with generated WAT output.",
+          path: "/docs/inspector.html",
+        },
+        {
+          id: "mouse",
+          title: "Mouse Shader Demo",
+          note: "Realtime mouse-reactive canvas shader from compiled Wasm.",
+          path: "/docs/canvas_mouse_demo.html",
+        },
+        {
+          id: "image",
+          title: "Image Upload Shader Lab",
+          note: "Upload an image and apply interactive shader-like transforms.",
+          path: "/docs/image_upload_shader_demo.html",
+        },
+      ];
+
+      const list = document.getElementById("list");
+      const title = document.getElementById("title");
+      const pathNode = document.getElementById("path");
+      const openTab = document.getElementById("openTab");
+      const preview = document.getElementById("preview");
+      const buttons = new Map();
+
+      function renderList() {
+        for (const demo of DEMOS) {
+          const button = document.createElement("button");
+          button.type = "button";
+          button.className = "item";
+          button.innerHTML = `<strong>${demo.title}</strong><span>${demo.note}</span>`;
+          button.addEventListener("click", () => selectDemo(demo.id));
+          buttons.set(demo.id, button);
+          list.appendChild(button);
+        }
+      }
+
+      function selectDemo(id) {
+        const demo = DEMOS.find((entry) => entry.id === id) ?? DEMOS[0];
+        for (const [buttonId, button] of buttons) {
+          button.classList.toggle("active", buttonId === demo.id);
+        }
+        title.textContent = demo.title;
+        pathNode.textContent = demo.path;
+        openTab.href = demo.path;
+        preview.src = demo.path;
+      }
+
+      renderList();
+      selectDemo(DEMOS[0].id);
+    </script>
+  </body>
+</html>

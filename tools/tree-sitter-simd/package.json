@@ -1,0 +1,15 @@
+{
+  "name": "tree-sitter-simd",
+  "version": "0.1.0",
+  "description": "Tree-sitter grammar for the simd language",
+  "tree-sitter": [
+    {
+      "scope": "source.simd",
+      "file-types": [
+        "simd"
+      ],
+      "highlights": "queries/highlights.scm",
+      "tree-sitter-highlights": "queries/highlights.scm"
+    }
+  ]
+}

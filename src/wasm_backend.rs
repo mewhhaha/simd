@@ -1,6 +1,6 @@
 use super::*;
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::rc::Rc;
 
@@ -21,6 +21,7 @@ pub struct WasmArtifact {
     pub grouped_export: Option<WasmGroupedExport>,
     pub leaf_exports: Vec<WasmLeafExport>,
     pub optimizer_reports: Vec<WasmOptimizationReport>,
+    pub higher_order_reports: Vec<WasmHigherOrderReport>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,6 +31,26 @@ pub struct WasmOptimizationReport {
     pub vectorizable: bool,
     pub vector_unroll: usize,
     pub fallback_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WasmHigherOrderReport {
+    pub function: String,
+    pub specialization_origin: String,
+    pub lambda_mode: LambdaLoweringMode,
+    pub capture_count: usize,
+    pub env_bytes: usize,
+    pub known_fn_values: usize,
+    pub known_lambda_values: usize,
+    pub escaping_unknown_values: usize,
+    pub rejection_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LambdaLoweringMode {
+    DirectFirstOrder,
+    ClosureConverted,
+    Rejected,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -234,13 +255,19 @@ pub enum WasmLeafResultAbi {
 
 pub fn compile_wasm_main(source: &str, main: &str) -> Result<WasmArtifact> {
     let (_surface, _module, checked) = compile_frontend(source)?;
-    compile_wasm_artifact_checked(&checked, main)
+    let specialized = specialize_checked_program_for_main(&checked, main)?;
+    let lowered_ready = eliminate_non_escaping_lambdas_program(&specialized.checked)?;
+    let canonical = canonicalize_backend_higher_order_program(&lowered_ready)?;
+    compile_wasm_artifact_checked(&canonical, main, &specialized.origins)
 }
 
 pub fn prepare_wasm_main(source: &str, main: &str) -> Result<PreparedWasmMain> {
     let (_surface, _module, checked) = compile_frontend(source)?;
-    let plan = build_wasm_plan(&checked, main)?;
-    let artifact = compile_wasm_artifact_checked(&checked, main)?;
+    let specialized = specialize_checked_program_for_main(&checked, main)?;
+    let lowered_ready = eliminate_non_escaping_lambdas_program(&specialized.checked)?;
+    let canonical = canonicalize_backend_higher_order_program(&lowered_ready)?;
+    let plan = build_wasm_plan(&canonical, main)?;
+    let artifact = compile_wasm_artifact_checked(&canonical, main, &specialized.origins)?;
     let flat_param_abis = flatten_wasm_param_abis(&plan.params)?;
     let input_templates = prepared_input_templates(&plan.params)?;
     let output_templates = prepared_output_templates(&plan.result, &artifact, &input_templates)?;
@@ -275,8 +302,11 @@ pub fn run_wasm_artifact(artifact: &WasmArtifact, args: &[Value]) -> Result<Valu
 
 pub fn run_wasm_main(source: &str, main: &str, args_json: &str) -> Result<Value> {
     let (_surface, _module, checked) = compile_frontend(source)?;
-    let args = parse_host_args(args_json, &checked, main)?;
-    let artifact = compile_wasm_artifact_checked(&checked, main)?;
+    let specialized = specialize_checked_program_for_main(&checked, main)?;
+    let lowered_ready = eliminate_non_escaping_lambdas_program(&specialized.checked)?;
+    let canonical = canonicalize_backend_higher_order_program(&lowered_ready)?;
+    let args = parse_host_args(args_json, &canonical, main)?;
+    let artifact = compile_wasm_artifact_checked(&canonical, main, &specialized.origins)?;
     prepare_wasm_artifact(artifact)?.run(&args)
 }
 
@@ -295,8 +325,9 @@ pub fn wat_main(source: &str, main: &str) -> Result<String> {
     let wat = wasmprinter::print_bytes(&artifact.bytes)
         .map_err(|error| SimdError::new(format!("failed to print WAT: {error}")))?;
     Ok(format!(
-        "{}\n{}",
+        "{}\n{}\n{}",
         render_optimizer_report_comments(&artifact.optimizer_reports),
+        render_higher_order_report_comments(&artifact.higher_order_reports),
         wat
     ))
 }
@@ -333,6 +364,33 @@ fn render_optimizer_report_comments(reports: &[WasmOptimizationReport]) -> Strin
         lines.push(format!(
             ";; - fn={} intent={:?} plan={}{}",
             report.function, report.intent, plan, fallback
+        ));
+    }
+    lines.join("\n")
+}
+
+fn render_higher_order_report_comments(reports: &[WasmHigherOrderReport]) -> String {
+    if reports.is_empty() {
+        return ";; higher-order reports: none".to_string();
+    }
+    let mut lines = vec![";; higher-order reports:".to_string()];
+    for report in reports {
+        let rejection = report
+            .rejection_reason
+            .as_ref()
+            .map(|reason| format!(" reject={reason}"))
+            .unwrap_or_default();
+        lines.push(format!(
+            ";; - fn={} origin={} mode={:?} captures={} env_bytes={} known_fn={} known_lambda={} escaping_unknown={}{}",
+            report.function,
+            report.specialization_origin,
+            report.lambda_mode,
+            report.capture_count,
+            report.env_bytes,
+            report.known_fn_values,
+            report.known_lambda_values,
+            report.escaping_unknown_values,
+            rejection
         ));
     }
     lines.join("\n")
@@ -1456,10 +1514,2415 @@ impl WasmRuntime {
     }
 }
 
+#[derive(Debug, Clone)]
+struct PendingSpecialization {
+    base_name: String,
+    output_name: String,
+    type_subst: BTreeMap<String, Type>,
+    known_fun_args: BTreeMap<usize, KnownFunctionArgSpec>,
+    origin: String,
+}
+
+#[derive(Debug, Clone)]
+struct SpecializedProgram {
+    checked: CheckedProgram,
+    origins: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct KnownFunctionArgSpec {
+    target_name: String,
+    capture_types: Vec<Type>,
+}
+
+#[derive(Debug, Clone)]
+struct KnownFunctionBinding {
+    target_name: String,
+    bound_args: Vec<TypedExpr>,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedSpecializedCall {
+    callee_name: String,
+    args: Vec<TypedArg>,
+    closure_info: Vec<ClosureBindingSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ClosureBindingSummary {
+    capture_count: usize,
+    env_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FunctionValueClass {
+    KnownFn,
+    KnownLambda,
+    EscapingUnknown,
+}
+
+#[derive(Debug, Clone)]
+struct LambdaLiftState {
+    next_id: usize,
+    generated: BTreeMap<String, CheckedFunction>,
+    origins: BTreeMap<String, String>,
+    closure_info: BTreeMap<String, Vec<ClosureBindingSummary>>,
+}
+
+fn specialize_checked_program_for_main(
+    checked: &CheckedProgram,
+    main: &str,
+) -> Result<SpecializedProgram> {
+    let originals = checked
+        .functions
+        .iter()
+        .map(|function| (function.name.clone(), function))
+        .collect::<BTreeMap<_, _>>();
+    let entry = originals
+        .get(main)
+        .copied()
+        .ok_or_else(|| SimdError::new(format!("unknown entry function '{}'", main)))?;
+    if type_contains_unresolved_vars(&entry.signature.ty) {
+        return Err(SimdError::new(format!(
+            "entry function '{}' must be monomorphic for Wasm lowering",
+            main
+        )));
+    }
+
+    let mut queue = VecDeque::<PendingSpecialization>::new();
+    let mut scheduled_names = BTreeSet::<String>::new();
+    let mut built = BTreeMap::<String, CheckedFunction>::new();
+    let mut generic_instances = BTreeMap::<String, String>::new();
+    let mut origins = BTreeMap::<String, String>::new();
+    let mut lambda_lifts = LambdaLiftState {
+        next_id: 0,
+        generated: BTreeMap::new(),
+        origins: BTreeMap::new(),
+        closure_info: BTreeMap::new(),
+    };
+
+    enqueue_specialization(
+        &mut queue,
+        &mut scheduled_names,
+        PendingSpecialization {
+            base_name: main.to_string(),
+            output_name: main.to_string(),
+            type_subst: BTreeMap::new(),
+            known_fun_args: BTreeMap::new(),
+            origin: format!("entry:{main}"),
+        },
+    );
+
+    while let Some(pending) = queue.pop_front() {
+        if built.contains_key(&pending.output_name) {
+            continue;
+        }
+        origins
+            .entry(pending.output_name.clone())
+            .or_insert_with(|| pending.origin.clone());
+        let specialized = specialize_function_instance(
+            &pending,
+            &originals,
+            &mut lambda_lifts,
+            &mut queue,
+            &mut scheduled_names,
+            &mut generic_instances,
+        )?;
+        built.insert(specialized.name.clone(), specialized);
+    }
+
+    for (name, function) in lambda_lifts.generated {
+        built.insert(name, function);
+    }
+    for (name, origin) in lambda_lifts.origins {
+        origins.entry(name).or_insert(origin);
+    }
+    for (name, summaries) in lambda_lifts.closure_info {
+        let capture_count = summaries
+            .iter()
+            .map(|item| item.capture_count)
+            .sum::<usize>();
+        let env_bytes = summaries.iter().map(|item| item.env_bytes).sum::<usize>();
+        let detail = format!("closure-converted captures={capture_count} env-bytes={env_bytes}");
+        origins
+            .entry(name)
+            .and_modify(|existing| {
+                existing.push_str(" | ");
+                existing.push_str(&detail);
+            })
+            .or_insert(detail);
+    }
+
+    Ok(SpecializedProgram {
+        checked: CheckedProgram {
+            functions: built.into_values().collect(),
+        },
+        origins,
+    })
+}
+
+fn specialize_function_instance(
+    pending: &PendingSpecialization,
+    originals: &BTreeMap<String, &CheckedFunction>,
+    lambda_lifts: &mut LambdaLiftState,
+    queue: &mut VecDeque<PendingSpecialization>,
+    scheduled_names: &mut BTreeSet<String>,
+    generic_instances: &mut BTreeMap<String, String>,
+) -> Result<CheckedFunction> {
+    let original = originals.get(&pending.base_name).copied().ok_or_else(|| {
+        SimdError::new(format!(
+            "missing function '{}' during Wasm specialization",
+            pending.base_name
+        ))
+    })?;
+    let (base_param_types, base_result_ty) = original.signature.ty.fun_parts();
+    let applied_param_types = base_param_types
+        .iter()
+        .map(|ty| apply_type_subst(ty, &pending.type_subst))
+        .collect::<Vec<_>>();
+    let applied_result_ty = apply_type_subst(&base_result_ty, &pending.type_subst);
+    for (index, binding) in &pending.known_fun_args {
+        let Some(param_ty) = applied_param_types.get(*index) else {
+            return Err(SimdError::new(format!(
+                "specialization for '{}' referenced missing function-arg index {}",
+                pending.output_name, index
+            )));
+        };
+        if !matches!(param_ty, Type::Fun(_, _)) {
+            return Err(SimdError::new(format!(
+                "specialization for '{}' tried to bind non-function param {} to '{}'",
+                pending.output_name, index, binding.target_name
+            )));
+        }
+    }
+    let mut kept_param_types = Vec::<Type>::new();
+    for (index, ty) in applied_param_types.iter().enumerate() {
+        if let Some(binding) = pending.known_fun_args.get(&index) {
+            kept_param_types.extend(binding.capture_types.clone());
+        } else {
+            kept_param_types.push(ty.clone());
+        }
+    }
+    let specialized_signature = Signature {
+        name: pending.output_name.clone(),
+        ty: Type::Fun(kept_param_types, Box::new(applied_result_ty)),
+    };
+    if type_contains_unresolved_vars(&specialized_signature.ty) {
+        return Err(SimdError::new(format!(
+            "specialized function '{}' still has unresolved polymorphic types",
+            pending.output_name
+        )));
+    }
+    let clauses = original
+        .clauses
+        .iter()
+        .map(|clause| {
+            let mut fun_subst = BTreeMap::<String, KnownFunctionBinding>::new();
+            let mut scope_types = BTreeMap::<String, Type>::new();
+            let mut patterns = Vec::<TypedPattern>::new();
+            for (index, pattern) in clause.patterns.iter().enumerate() {
+                let typed_pattern = TypedPattern {
+                    pattern: pattern.pattern.clone(),
+                    ty: apply_type_subst(&pattern.ty, &pending.type_subst),
+                };
+                if let Some(binding) = pending.known_fun_args.get(&index) {
+                    let capture_locals = binding
+                        .capture_types
+                        .iter()
+                        .enumerate()
+                        .map(|(capture_index, capture_ty)| {
+                            let local = format!("__fn{}_cap{}", index, capture_index);
+                            patterns.push(TypedPattern {
+                                pattern: Pattern::Name(local.clone()),
+                                ty: capture_ty.clone(),
+                            });
+                            scope_types.insert(local.clone(), capture_ty.clone());
+                            TypedExpr {
+                                ty: capture_ty.clone(),
+                                kind: TypedExprKind::Local(local),
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    match &typed_pattern.pattern {
+                        Pattern::Name(name) => {
+                            fun_subst.insert(
+                                name.clone(),
+                                KnownFunctionBinding {
+                                    target_name: binding.target_name.clone(),
+                                    bound_args: capture_locals,
+                                },
+                            );
+                        }
+                        Pattern::Wildcard => {}
+                        Pattern::Int(_) | Pattern::Float(_) => {
+                            return Err(SimdError::new(format!(
+                                "function-typed parameter {} in '{}' used a literal pattern",
+                                index, pending.base_name
+                            )));
+                        }
+                    }
+                } else {
+                    if let Pattern::Name(name) = &typed_pattern.pattern {
+                        scope_types.insert(name.clone(), typed_pattern.ty.clone());
+                    }
+                    patterns.push(typed_pattern);
+                }
+            }
+            Ok(TypedClause {
+                patterns,
+                body: specialize_expr(
+                    &clause.body,
+                    &pending.type_subst,
+                    &fun_subst,
+                    &scope_types,
+                    &pending.output_name,
+                    originals,
+                    lambda_lifts,
+                    queue,
+                    scheduled_names,
+                    generic_instances,
+                )?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(CheckedFunction {
+        name: pending.output_name.clone(),
+        signature: specialized_signature,
+        clauses,
+        pointwise: original.pointwise,
+        tailrec: original.tailrec.clone(),
+    })
+}
+
+fn specialize_expr(
+    expr: &TypedExpr,
+    type_subst: &BTreeMap<String, Type>,
+    fun_subst: &BTreeMap<String, KnownFunctionBinding>,
+    scope_types: &BTreeMap<String, Type>,
+    current_function: &str,
+    originals: &BTreeMap<String, &CheckedFunction>,
+    lambda_lifts: &mut LambdaLiftState,
+    queue: &mut VecDeque<PendingSpecialization>,
+    scheduled_names: &mut BTreeSet<String>,
+    generic_instances: &mut BTreeMap<String, String>,
+) -> Result<TypedExpr> {
+    let ty = apply_type_subst(&expr.ty, type_subst);
+    let kind = match &expr.kind {
+        TypedExprKind::Local(name) => {
+            if let Some(binding) = fun_subst.get(name) {
+                build_known_binding_expr(binding, &ty)?.kind
+            } else {
+                TypedExprKind::Local(name.clone())
+            }
+        }
+        TypedExprKind::FunctionRef { name } => TypedExprKind::FunctionRef {
+            name: resolve_function_ref_name_for_type(
+                name,
+                &ty,
+                originals,
+                lambda_lifts,
+                queue,
+                scheduled_names,
+                generic_instances,
+                &format!("fnref:{current_function}"),
+            )?,
+        },
+        TypedExprKind::Int(value, prim) => TypedExprKind::Int(*value, *prim),
+        TypedExprKind::Float(value, prim) => TypedExprKind::Float(*value, *prim),
+        TypedExprKind::Lambda { param, body } => TypedExprKind::Lambda {
+            param: param.clone(),
+            body: {
+                let mut nested_fun_subst = fun_subst.clone();
+                nested_fun_subst.remove(param);
+                Box::new(specialize_expr(
+                    body,
+                    type_subst,
+                    &nested_fun_subst,
+                    scope_types,
+                    current_function,
+                    originals,
+                    lambda_lifts,
+                    queue,
+                    scheduled_names,
+                    generic_instances,
+                )?)
+            },
+        },
+        TypedExprKind::Let { bindings, body } => {
+            let mut next_fun_subst = fun_subst.clone();
+            let mut next_scope_types = scope_types.clone();
+            let rewritten = bindings
+                .iter()
+                .map(|binding| {
+                    let rewritten_expr = specialize_expr(
+                        &binding.expr,
+                        type_subst,
+                        &next_fun_subst,
+                        &next_scope_types,
+                        current_function,
+                        originals,
+                        lambda_lifts,
+                        queue,
+                        scheduled_names,
+                        generic_instances,
+                    )?;
+                    if binding.name != "_" {
+                        if let Some(template) = extract_known_function_binding(&rewritten_expr) {
+                            next_fun_subst.insert(binding.name.clone(), template);
+                        } else {
+                            next_fun_subst.remove(&binding.name);
+                        }
+                        next_scope_types.insert(binding.name.clone(), rewritten_expr.ty.clone());
+                    }
+                    Ok(TypedLetBinding {
+                        name: binding.name.clone(),
+                        expr: rewritten_expr,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            TypedExprKind::Let {
+                bindings: rewritten,
+                body: Box::new(specialize_expr(
+                    body,
+                    type_subst,
+                    &next_fun_subst,
+                    &next_scope_types,
+                    current_function,
+                    originals,
+                    lambda_lifts,
+                    queue,
+                    scheduled_names,
+                    generic_instances,
+                )?),
+            }
+        }
+        TypedExprKind::Record(fields) => TypedExprKind::Record(
+            fields
+                .iter()
+                .map(|(name, value)| {
+                    Ok((
+                        name.clone(),
+                        specialize_expr(
+                            value,
+                            type_subst,
+                            fun_subst,
+                            scope_types,
+                            current_function,
+                            originals,
+                            lambda_lifts,
+                            queue,
+                            scheduled_names,
+                            generic_instances,
+                        )?,
+                    ))
+                })
+                .collect::<Result<BTreeMap<_, _>>>()?,
+        ),
+        TypedExprKind::Project { base, field } => TypedExprKind::Project {
+            base: Box::new(specialize_expr(
+                base,
+                type_subst,
+                fun_subst,
+                scope_types,
+                current_function,
+                originals,
+                lambda_lifts,
+                queue,
+                scheduled_names,
+                generic_instances,
+            )?),
+            field: field.clone(),
+        },
+        TypedExprKind::RecordUpdate { base, fields } => TypedExprKind::RecordUpdate {
+            base: Box::new(specialize_expr(
+                base,
+                type_subst,
+                fun_subst,
+                scope_types,
+                current_function,
+                originals,
+                lambda_lifts,
+                queue,
+                scheduled_names,
+                generic_instances,
+            )?),
+            fields: fields
+                .iter()
+                .map(|(name, value)| {
+                    Ok((
+                        name.clone(),
+                        specialize_expr(
+                            value,
+                            type_subst,
+                            fun_subst,
+                            scope_types,
+                            current_function,
+                            originals,
+                            lambda_lifts,
+                            queue,
+                            scheduled_names,
+                            generic_instances,
+                        )?,
+                    ))
+                })
+                .collect::<Result<BTreeMap<_, _>>>()?,
+        },
+        TypedExprKind::Call {
+            callee,
+            args,
+            lifted_shape,
+        } => {
+            let args = args
+                .iter()
+                .map(|arg| {
+                    Ok(TypedArg {
+                        mode: arg.mode,
+                        expr: Box::new(specialize_expr(
+                            &arg.expr,
+                            type_subst,
+                            fun_subst,
+                            scope_types,
+                            current_function,
+                            originals,
+                            lambda_lifts,
+                            queue,
+                            scheduled_names,
+                            generic_instances,
+                        )?),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let callee = match callee {
+                Callee::Prim(op) => Callee::Prim(*op),
+                Callee::Function(name) => {
+                    if let Some(inlined) = try_inline_lambda_result_call(
+                        name,
+                        &args,
+                        &ty,
+                        originals,
+                        current_function,
+                        scope_types,
+                        lambda_lifts,
+                        queue,
+                        scheduled_names,
+                        generic_instances,
+                    )? {
+                        return Ok(inlined);
+                    }
+                    let resolved = resolve_specialized_callee_call(
+                        name,
+                        &args,
+                        originals,
+                        lambda_lifts,
+                        scope_types,
+                        queue,
+                        scheduled_names,
+                        generic_instances,
+                        &format!("call:{current_function}->{name}"),
+                    )?;
+                    if !resolved.closure_info.is_empty() {
+                        lambda_lifts
+                            .closure_info
+                            .entry(current_function.to_string())
+                            .or_default()
+                            .extend(resolved.closure_info.clone());
+                    }
+                    return Ok(TypedExpr {
+                        ty,
+                        kind: TypedExprKind::Call {
+                            callee: Callee::Function(resolved.callee_name),
+                            args: resolved.args,
+                            lifted_shape: lifted_shape.clone(),
+                        },
+                    });
+                }
+            };
+            TypedExprKind::Call {
+                callee,
+                args,
+                lifted_shape: lifted_shape.clone(),
+            }
+        }
+        TypedExprKind::Apply { callee, arg } => TypedExprKind::Apply {
+            callee: Box::new(specialize_expr(
+                callee,
+                type_subst,
+                fun_subst,
+                scope_types,
+                current_function,
+                originals,
+                lambda_lifts,
+                queue,
+                scheduled_names,
+                generic_instances,
+            )?),
+            arg: Box::new(specialize_expr(
+                arg,
+                type_subst,
+                fun_subst,
+                scope_types,
+                current_function,
+                originals,
+                lambda_lifts,
+                queue,
+                scheduled_names,
+                generic_instances,
+            )?),
+        },
+    };
+    Ok(TypedExpr { ty, kind })
+}
+
+fn extract_known_function_binding(expr: &TypedExpr) -> Option<KnownFunctionBinding> {
+    match &expr.kind {
+        TypedExprKind::FunctionRef { name } => Some(KnownFunctionBinding {
+            target_name: name.clone(),
+            bound_args: Vec::new(),
+        }),
+        TypedExprKind::Apply { callee, arg } => {
+            let mut binding = extract_known_function_binding(callee)?;
+            binding.bound_args.push((**arg).clone());
+            Some(binding)
+        }
+        TypedExprKind::Local(_)
+        | TypedExprKind::Lambda { .. }
+        | TypedExprKind::Let { .. }
+        | TypedExprKind::Record(_)
+        | TypedExprKind::Project { .. }
+        | TypedExprKind::RecordUpdate { .. }
+        | TypedExprKind::Call { .. }
+        | TypedExprKind::Int(_, _)
+        | TypedExprKind::Float(_, _) => None,
+    }
+}
+
+fn build_known_binding_expr(
+    binding: &KnownFunctionBinding,
+    expected_ty: &Type,
+) -> Result<TypedExpr> {
+    let (remaining_args, remaining_ret) = match expected_ty {
+        Type::Fun(args, ret) => (args.clone(), ret.clone()),
+        other => {
+            return Err(SimdError::new(format!(
+                "known function binding for '{}' requires function type, found {:?}",
+                binding.target_name, other
+            )));
+        }
+    };
+    let mut base_args = binding
+        .bound_args
+        .iter()
+        .map(|arg| arg.ty.clone())
+        .collect::<Vec<_>>();
+    base_args.extend(remaining_args.clone());
+    let mut expr = TypedExpr {
+        ty: Type::Fun(base_args, remaining_ret.clone()),
+        kind: TypedExprKind::FunctionRef {
+            name: binding.target_name.clone(),
+        },
+    };
+    for arg in &binding.bound_args {
+        let next_ty = match &expr.ty {
+            Type::Fun(args, ret) if !args.is_empty() => {
+                if arg.ty != args[0] {
+                    return Err(SimdError::new(format!(
+                        "known function binding argument type mismatch for '{}': {:?} vs {:?}",
+                        binding.target_name, arg.ty, args[0]
+                    )));
+                }
+                if args.len() == 1 {
+                    ret.as_ref().clone()
+                } else {
+                    Type::Fun(args[1..].to_vec(), ret.clone())
+                }
+            }
+            other => {
+                return Err(SimdError::new(format!(
+                    "known function binding for '{}' over-applied non-function {:?}",
+                    binding.target_name, other
+                )));
+            }
+        };
+        expr = TypedExpr {
+            ty: next_ty.clone(),
+            kind: TypedExprKind::Apply {
+                callee: Box::new(expr),
+                arg: Box::new(arg.clone()),
+            },
+        };
+    }
+    if expr.ty != *expected_ty {
+        return Err(SimdError::new(format!(
+            "known function binding for '{}' produced {:?}, expected {:?}",
+            binding.target_name, expr.ty, expected_ty
+        )));
+    }
+    Ok(expr)
+}
+
+fn try_inline_lambda_result_call(
+    callee_name: &str,
+    args: &[TypedArg],
+    call_ty: &Type,
+    originals: &BTreeMap<String, &CheckedFunction>,
+    current_function: &str,
+    caller_scope_types: &BTreeMap<String, Type>,
+    lambda_lifts: &mut LambdaLiftState,
+    queue: &mut VecDeque<PendingSpecialization>,
+    scheduled_names: &mut BTreeSet<String>,
+    generic_instances: &mut BTreeMap<String, String>,
+) -> Result<Option<TypedExpr>> {
+    if !matches!(call_ty, Type::Fun(_, _)) {
+        return Ok(None);
+    }
+    if callee_name == current_function {
+        return Ok(None);
+    }
+    if args.iter().any(|arg| arg.mode != AccessKind::Same) {
+        return Ok(None);
+    }
+    let Some(callee) = originals.get(callee_name).copied() else {
+        return Ok(None);
+    };
+    if callee.clauses.len() != 1 {
+        return Ok(None);
+    }
+    let clause = &callee.clauses[0];
+    if clause.patterns.len() != args.len() {
+        return Ok(None);
+    }
+    if clause
+        .patterns
+        .iter()
+        .any(|pattern| matches!(pattern.pattern, Pattern::Int(_) | Pattern::Float(_)))
+    {
+        return Ok(None);
+    }
+    let (param_types, _) = callee.signature.ty.fun_parts();
+    if param_types.len() != args.len() {
+        return Ok(None);
+    }
+    let mut callee_subst = BTreeMap::<String, Type>::new();
+    for (param_ty, arg) in param_types.iter().zip(args.iter()) {
+        let actual_ty = specialization_arg_type(arg)?;
+        collect_type_var_bindings(param_ty, &actual_ty, &mut callee_subst)?;
+    }
+    let instantiated_param_types = param_types
+        .iter()
+        .map(|ty| apply_type_subst(ty, &callee_subst))
+        .collect::<Vec<_>>();
+    let mut callee_fun_subst = BTreeMap::<String, KnownFunctionBinding>::new();
+    let mut callee_scope_types = BTreeMap::<String, Type>::new();
+    let mut let_bindings = Vec::<TypedLetBinding>::new();
+    for (index, pattern) in clause.patterns.iter().enumerate() {
+        let pattern_ty = apply_type_subst(&pattern.ty, &callee_subst);
+        let arg_expr = args[index].expr.as_ref().clone();
+        match &pattern.pattern {
+            Pattern::Wildcard => {}
+            Pattern::Name(name) => {
+                callee_scope_types.insert(name.clone(), pattern_ty.clone());
+                if matches!(instantiated_param_types[index], Type::Fun(_, _)) {
+                    let (binding, summary) = extract_specializable_function_value(
+                        &arg_expr,
+                        originals,
+                        lambda_lifts,
+                        caller_scope_types,
+                        queue,
+                        scheduled_names,
+                        generic_instances,
+                        &format!("inline:{current_function}->{callee_name}:arg{index}"),
+                    )?;
+                    callee_fun_subst.insert(name.clone(), binding);
+                    lambda_lifts
+                        .closure_info
+                        .entry(current_function.to_string())
+                        .or_default()
+                        .push(summary);
+                } else {
+                    let_bindings.push(TypedLetBinding {
+                        name: name.clone(),
+                        expr: arg_expr,
+                    });
+                }
+            }
+            Pattern::Int(_) | Pattern::Float(_) => return Ok(None),
+        }
+    }
+    let rewritten_body = specialize_expr(
+        &clause.body,
+        &callee_subst,
+        &callee_fun_subst,
+        &callee_scope_types,
+        current_function,
+        originals,
+        lambda_lifts,
+        queue,
+        scheduled_names,
+        generic_instances,
+    )?;
+    if let_bindings.is_empty() {
+        return Ok(Some(rewritten_body));
+    }
+    Ok(Some(TypedExpr {
+        ty: call_ty.clone(),
+        kind: TypedExprKind::Let {
+            bindings: let_bindings,
+            body: Box::new(rewritten_body),
+        },
+    }))
+}
+
+fn resolve_specialized_callee_call(
+    callee_name: &str,
+    args: &[TypedArg],
+    originals: &BTreeMap<String, &CheckedFunction>,
+    lambda_lifts: &mut LambdaLiftState,
+    scope_types: &BTreeMap<String, Type>,
+    queue: &mut VecDeque<PendingSpecialization>,
+    scheduled_names: &mut BTreeSet<String>,
+    generic_instances: &mut BTreeMap<String, String>,
+    origin: &str,
+) -> Result<ResolvedSpecializedCall> {
+    let Some(callee) = originals.get(callee_name).copied() else {
+        return Ok(ResolvedSpecializedCall {
+            callee_name: callee_name.to_string(),
+            args: args.to_vec(),
+            closure_info: Vec::new(),
+        });
+    };
+    let (param_types, _) = callee.signature.ty.fun_parts();
+    if args.len() != param_types.len() {
+        return Err(SimdError::new(format!(
+            "specialization expected {} arguments for '{}', found {}",
+            param_types.len(),
+            callee_name,
+            args.len()
+        )));
+    }
+    let mut callee_subst = BTreeMap::<String, Type>::new();
+    for (param, arg) in param_types.iter().zip(args) {
+        let actual_ty = specialization_arg_type(arg)?;
+        collect_type_var_bindings(param, &actual_ty, &mut callee_subst)?;
+    }
+    let instantiated_params = param_types
+        .iter()
+        .map(|ty| apply_type_subst(ty, &callee_subst))
+        .collect::<Vec<_>>();
+    let mut known_fun_args = BTreeMap::<usize, KnownFunctionArgSpec>::new();
+    let mut retained_args = Vec::<TypedArg>::new();
+    let mut closure_info = Vec::<ClosureBindingSummary>::new();
+    for (index, (param_ty, arg)) in instantiated_params.iter().zip(args.iter()).enumerate() {
+        if matches!(param_ty, Type::Fun(_, _)) {
+            let (binding, summary) = extract_specializable_function_value(
+                &arg.expr,
+                originals,
+                lambda_lifts,
+                scope_types,
+                queue,
+                scheduled_names,
+                generic_instances,
+                &format!("{origin}:arg{index}"),
+            )?;
+            known_fun_args.insert(
+                index,
+                KnownFunctionArgSpec {
+                    target_name: binding.target_name.clone(),
+                    capture_types: binding
+                        .bound_args
+                        .iter()
+                        .map(|expr| expr.ty.clone())
+                        .collect(),
+                },
+            );
+            for bound_arg in binding.bound_args {
+                retained_args.push(TypedArg {
+                    mode: AccessKind::Same,
+                    expr: Box::new(bound_arg),
+                });
+            }
+            closure_info.push(summary);
+            continue;
+        }
+        retained_args.push(arg.clone());
+    }
+    let output_name = resolve_specialized_function_name(
+        callee_name,
+        &callee_subst,
+        &known_fun_args,
+        originals,
+        queue,
+        scheduled_names,
+        generic_instances,
+        origin,
+    )?;
+    Ok(ResolvedSpecializedCall {
+        callee_name: output_name,
+        args: retained_args,
+        closure_info,
+    })
+}
+
+fn extract_specializable_function_value(
+    expr: &TypedExpr,
+    originals: &BTreeMap<String, &CheckedFunction>,
+    lambda_lifts: &mut LambdaLiftState,
+    scope_types: &BTreeMap<String, Type>,
+    queue: &mut VecDeque<PendingSpecialization>,
+    scheduled_names: &mut BTreeSet<String>,
+    generic_instances: &mut BTreeMap<String, String>,
+    origin: &str,
+) -> Result<(KnownFunctionBinding, ClosureBindingSummary)> {
+    if let Some(binding) = extract_known_function_binding(expr) {
+        let target_name = resolve_function_ref_name_for_type(
+            &binding.target_name,
+            &expr.ty,
+            originals,
+            lambda_lifts,
+            queue,
+            scheduled_names,
+            generic_instances,
+            origin,
+        )?;
+        let summary = ClosureBindingSummary {
+            capture_count: binding.bound_args.len(),
+            env_bytes: binding
+                .bound_args
+                .iter()
+                .map(|arg| estimate_closure_env_bytes(&arg.ty))
+                .sum::<Result<usize>>()?,
+        };
+        return Ok((
+            KnownFunctionBinding {
+                target_name,
+                bound_args: binding.bound_args,
+            },
+            summary,
+        ));
+    }
+    if let TypedExprKind::Lambda { param, body } = &expr.kind {
+        let (target_name, bound_args, summary) = lift_lambda_for_specialization(
+            param,
+            body,
+            &expr.ty,
+            scope_types,
+            lambda_lifts,
+            origin,
+        )?;
+        return Ok((
+            KnownFunctionBinding {
+                target_name,
+                bound_args,
+            },
+            summary,
+        ));
+    }
+    let class = classify_function_value_expr_for_backend(expr);
+    Err(SimdError::new(format!(
+        "cannot specialize higher-order value at '{}'; expected known function or liftable lambda, found {:?}",
+        origin, class
+    )))
+}
+
+fn lift_lambda_for_specialization(
+    param: &str,
+    body: &TypedExpr,
+    lambda_ty: &Type,
+    scope_types: &BTreeMap<String, Type>,
+    lambda_lifts: &mut LambdaLiftState,
+    origin: &str,
+) -> Result<(String, Vec<TypedExpr>, ClosureBindingSummary)> {
+    let Type::Fun(args, ret) = lambda_ty else {
+        return Err(SimdError::new("lambda lift expected a function type"));
+    };
+    if args.len() != 1 {
+        return Err(SimdError::new(
+            "lambda lift currently supports unary lambdas only",
+        ));
+    }
+    let param_ty = args[0].clone();
+    if matches!(param_ty, Type::Fun(_, _)) {
+        return Err(SimdError::new(
+            "lambda lift does not support function-typed lambda parameters yet",
+        ));
+    }
+    let in_scope = scope_types.keys().cloned().collect::<BTreeSet<_>>();
+    let captures = free_lambda_capture_names(body, param, &in_scope);
+    let mut capture_map = BTreeMap::<String, String>::new();
+    let mut bound_args = Vec::<TypedExpr>::new();
+    let mut capture_types = Vec::<Type>::new();
+    for (index, capture) in captures.iter().enumerate() {
+        let capture_ty = scope_types.get(capture).cloned().ok_or_else(|| {
+            SimdError::new(format!(
+                "lambda lift capture '{}' is missing from scope",
+                capture
+            ))
+        })?;
+        if matches!(capture_ty, Type::Fun(_, _)) {
+            return Err(SimdError::new(format!(
+                "lambda lift does not support function capture '{}' yet",
+                capture
+            )));
+        }
+        let alias = format!("__cap{index}");
+        capture_map.insert(capture.clone(), alias.clone());
+        capture_types.push(capture_ty.clone());
+        bound_args.push(TypedExpr {
+            ty: capture_ty,
+            kind: TypedExprKind::Local(capture.clone()),
+        });
+    }
+    let renamed_body = rename_free_locals(body, &capture_map, &BTreeSet::new())?;
+    let lift_id = lambda_lifts.next_id;
+    lambda_lifts.next_id += 1;
+    let lift_name = format!("__lambda_lift${lift_id}");
+    let mut patterns = Vec::<TypedPattern>::new();
+    for (index, capture_ty) in capture_types.iter().enumerate() {
+        patterns.push(TypedPattern {
+            pattern: Pattern::Name(format!("__cap{index}")),
+            ty: capture_ty.clone(),
+        });
+    }
+    patterns.push(TypedPattern {
+        pattern: Pattern::Name(param.to_string()),
+        ty: param_ty.clone(),
+    });
+    let mut signature_params = capture_types.clone();
+    signature_params.push(param_ty);
+    let env_bytes = capture_types
+        .iter()
+        .map(estimate_closure_env_bytes)
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .sum::<usize>();
+    lambda_lifts.generated.insert(
+        lift_name.clone(),
+        CheckedFunction {
+            name: lift_name.clone(),
+            signature: Signature {
+                name: lift_name.clone(),
+                ty: Type::Fun(signature_params, ret.clone()),
+            },
+            clauses: vec![TypedClause {
+                patterns,
+                body: renamed_body,
+            }],
+            pointwise: true,
+            tailrec: TailRecInfo {
+                recursive: false,
+                loop_lowerable: false,
+            },
+        },
+    );
+    lambda_lifts
+        .origins
+        .insert(lift_name.clone(), format!("lambda-lift:{origin}"));
+    let summary = ClosureBindingSummary {
+        capture_count: capture_types.len(),
+        env_bytes,
+    };
+    lambda_lifts
+        .closure_info
+        .entry(lift_name.clone())
+        .or_default()
+        .push(summary.clone());
+    Ok((lift_name, bound_args, summary))
+}
+
+fn estimate_closure_env_bytes(ty: &Type) -> Result<usize> {
+    match ty {
+        Type::Scalar(prim) => Ok(byte_width(*prim) as usize),
+        Type::Bulk(_, _) => Ok(8),
+        Type::Record(fields) => fields
+            .values()
+            .map(estimate_closure_env_bytes)
+            .collect::<Result<Vec<_>>>()
+            .map(|items| items.into_iter().sum()),
+        Type::Var(_) | Type::Infer(_) => Err(SimdError::new(
+            "closure env size cannot be computed for unresolved polymorphic capture",
+        )),
+        Type::Fun(_, _) => Err(SimdError::new(
+            "closure env does not support function-typed captures",
+        )),
+    }
+}
+
+fn resolve_function_ref_name_for_type(
+    function_name: &str,
+    concrete_ty: &Type,
+    originals: &BTreeMap<String, &CheckedFunction>,
+    _lambda_lifts: &mut LambdaLiftState,
+    queue: &mut VecDeque<PendingSpecialization>,
+    scheduled_names: &mut BTreeSet<String>,
+    generic_instances: &mut BTreeMap<String, String>,
+    origin: &str,
+) -> Result<String> {
+    let Some(function) = originals.get(function_name).copied() else {
+        return Ok(function_name.to_string());
+    };
+    let mut subst = BTreeMap::<String, Type>::new();
+    collect_type_var_bindings(&function.signature.ty, concrete_ty, &mut subst)?;
+    resolve_specialized_function_name(
+        function_name,
+        &subst,
+        &BTreeMap::new(),
+        originals,
+        queue,
+        scheduled_names,
+        generic_instances,
+        origin,
+    )
+}
+
+fn resolve_specialized_function_name(
+    base_name: &str,
+    type_subst: &BTreeMap<String, Type>,
+    known_fun_args: &BTreeMap<usize, KnownFunctionArgSpec>,
+    originals: &BTreeMap<String, &CheckedFunction>,
+    queue: &mut VecDeque<PendingSpecialization>,
+    scheduled_names: &mut BTreeSet<String>,
+    generic_instances: &mut BTreeMap<String, String>,
+    origin: &str,
+) -> Result<String> {
+    let Some(original) = originals.get(base_name).copied() else {
+        return Ok(base_name.to_string());
+    };
+    let (base_params, base_result) = original.signature.ty.fun_parts();
+    let instantiated_params = base_params
+        .iter()
+        .map(|ty| apply_type_subst(ty, type_subst))
+        .collect::<Vec<_>>();
+    let instantiated_result = apply_type_subst(&base_result, type_subst);
+    for (index, _) in known_fun_args {
+        let Some(param_ty) = instantiated_params.get(*index) else {
+            return Err(SimdError::new(format!(
+                "higher-order specialization for '{}' referenced missing arg index {}",
+                base_name, index
+            )));
+        };
+        if !matches!(param_ty, Type::Fun(_, _)) {
+            return Err(SimdError::new(format!(
+                "higher-order specialization for '{}' tried to bind non-function arg {}",
+                base_name, index
+            )));
+        }
+    }
+    let mut kept_params = Vec::<Type>::new();
+    for (index, ty) in instantiated_params.iter().enumerate() {
+        if let Some(binding) = known_fun_args.get(&index) {
+            kept_params.extend(binding.capture_types.clone());
+        } else {
+            kept_params.push(ty.clone());
+        }
+    }
+    if kept_params.iter().any(type_contains_unresolved_vars)
+        || type_contains_unresolved_vars(&instantiated_result)
+    {
+        return Err(SimdError::new(format!(
+            "cannot fully specialize '{}' at Wasm lowering time",
+            base_name
+        )));
+    }
+    let needs_specialized_clone = !known_fun_args.is_empty()
+        || !type_subst.is_empty()
+        || type_contains_unresolved_vars(&original.signature.ty);
+    if !needs_specialized_clone {
+        enqueue_specialization(
+            queue,
+            scheduled_names,
+            PendingSpecialization {
+                base_name: base_name.to_string(),
+                output_name: base_name.to_string(),
+                type_subst: BTreeMap::new(),
+                known_fun_args: BTreeMap::new(),
+                origin: origin.to_string(),
+            },
+        );
+        return Ok(base_name.to_string());
+    }
+    let instance_key = specialization_key(
+        base_name,
+        &instantiated_params,
+        &instantiated_result,
+        known_fun_args,
+    );
+    let output_name = if let Some(existing) = generic_instances.get(&instance_key) {
+        existing.clone()
+    } else {
+        let known_suffix = if known_fun_args.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "$fn${}",
+                known_fun_args
+                    .iter()
+                    .map(|(index, binding)| {
+                        format!(
+                            "{index}_{}_{}",
+                            sanitize_specialized_name(&binding.target_name),
+                            binding
+                                .capture_types
+                                .iter()
+                                .map(mangle_type)
+                                .collect::<Vec<_>>()
+                                .join("_")
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("_")
+            )
+        };
+        let generated = format!(
+            "{}$mono${}{}",
+            sanitize_specialized_name(base_name),
+            instantiated_params
+                .iter()
+                .map(mangle_type)
+                .collect::<Vec<_>>()
+                .join("_"),
+            known_suffix
+        );
+        generic_instances.insert(instance_key, generated.clone());
+        enqueue_specialization(
+            queue,
+            scheduled_names,
+            PendingSpecialization {
+                base_name: base_name.to_string(),
+                output_name: generated.clone(),
+                type_subst: type_subst.clone(),
+                known_fun_args: known_fun_args.clone(),
+                origin: origin.to_string(),
+            },
+        );
+        generated
+    };
+    Ok(output_name)
+}
+
+fn enqueue_specialization(
+    queue: &mut VecDeque<PendingSpecialization>,
+    scheduled_names: &mut BTreeSet<String>,
+    pending: PendingSpecialization,
+) {
+    if scheduled_names.insert(pending.output_name.clone()) {
+        queue.push_back(pending);
+    }
+}
+
+fn specialization_key(
+    base_name: &str,
+    params: &[Type],
+    result: &Type,
+    known_fun_args: &BTreeMap<usize, KnownFunctionArgSpec>,
+) -> String {
+    let known = if known_fun_args.is_empty() {
+        "none".to_string()
+    } else {
+        known_fun_args
+            .iter()
+            .map(|(index, value)| {
+                format!(
+                    "{index}:{}:{}",
+                    sanitize_specialized_name(&value.target_name),
+                    value
+                        .capture_types
+                        .iter()
+                        .map(mangle_type)
+                        .collect::<Vec<_>>()
+                        .join("_")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("|")
+    };
+    format!(
+        "{}::{}::ret={}::fn={}",
+        base_name,
+        params.iter().map(mangle_type).collect::<Vec<_>>().join("|"),
+        mangle_type(result),
+        known
+    )
+}
+
+fn sanitize_specialized_name(name: &str) -> String {
+    name.chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '_' {
+                ch
+            } else {
+                '$'
+            }
+        })
+        .collect()
+}
+
+fn mangle_type(ty: &Type) -> String {
+    match ty {
+        Type::Scalar(prim) => match prim {
+            Prim::I32 => "i32".to_string(),
+            Prim::I64 => "i64".to_string(),
+            Prim::F32 => "f32".to_string(),
+            Prim::F64 => "f64".to_string(),
+        },
+        Type::Bulk(prim, shape) => format!(
+            "b{}{}",
+            mangle_type(&Type::Scalar(*prim)),
+            shape.0.iter().map(mangle_dim).collect::<Vec<_>>().join("")
+        ),
+        Type::Record(fields) => format!(
+            "r{}",
+            fields
+                .iter()
+                .map(|(name, ty)| format!("{}{}", name, mangle_type(ty)))
+                .collect::<Vec<_>>()
+                .join("")
+        ),
+        Type::Var(name) => format!("v{}", name),
+        Type::Infer(index) => format!("u{}", index),
+        Type::Fun(args, ret) => format!(
+            "f{}r{}",
+            args.iter().map(mangle_type).collect::<Vec<_>>().join("_"),
+            mangle_type(ret)
+        ),
+    }
+}
+
+fn mangle_dim(dim: &Dim) -> String {
+    match dim {
+        Dim::Const(value) => format!("c{}", value),
+        Dim::Var(name) => format!("s{}", name),
+    }
+}
+
+fn type_contains_unresolved_vars(ty: &Type) -> bool {
+    match ty {
+        Type::Var(_) | Type::Infer(_) => true,
+        Type::Scalar(_) | Type::Bulk(_, _) => false,
+        Type::Record(fields) => fields.values().any(type_contains_unresolved_vars),
+        Type::Fun(args, ret) => {
+            args.iter().any(type_contains_unresolved_vars) || type_contains_unresolved_vars(ret)
+        }
+    }
+}
+
+#[derive(Clone)]
+struct LambdaTemplate {
+    param: String,
+    body: TypedExpr,
+}
+
+fn eliminate_non_escaping_lambdas_program(checked: &CheckedProgram) -> Result<CheckedProgram> {
+    let mut functions = Vec::with_capacity(checked.functions.len());
+    for function in &checked.functions {
+        let mut clauses = Vec::with_capacity(function.clauses.len());
+        for clause in &function.clauses {
+            let mut scope_types = BTreeMap::<String, Type>::new();
+            for pattern in &clause.patterns {
+                if let Pattern::Name(name) = &pattern.pattern {
+                    scope_types.insert(name.clone(), pattern.ty.clone());
+                }
+            }
+            clauses.push(TypedClause {
+                patterns: clause.patterns.clone(),
+                body: eliminate_non_escaping_lambdas_expr(
+                    &clause.body,
+                    &BTreeMap::new(),
+                    &scope_types,
+                )?,
+            });
+        }
+        functions.push(CheckedFunction {
+            name: function.name.clone(),
+            signature: function.signature.clone(),
+            clauses,
+            pointwise: function.pointwise,
+            tailrec: function.tailrec.clone(),
+        });
+    }
+    Ok(CheckedProgram { functions })
+}
+
+fn eliminate_non_escaping_lambdas_expr(
+    expr: &TypedExpr,
+    lambda_env: &BTreeMap<String, LambdaTemplate>,
+    scope_types: &BTreeMap<String, Type>,
+) -> Result<TypedExpr> {
+    let ty = expr.ty.clone();
+    let kind = match &expr.kind {
+        TypedExprKind::Local(name) => TypedExprKind::Local(name.clone()),
+        TypedExprKind::FunctionRef { name } => TypedExprKind::FunctionRef { name: name.clone() },
+        TypedExprKind::Int(value, prim) => TypedExprKind::Int(*value, *prim),
+        TypedExprKind::Float(value, prim) => TypedExprKind::Float(*value, *prim),
+        TypedExprKind::Lambda { param, body } => TypedExprKind::Lambda {
+            param: param.clone(),
+            body: Box::new(eliminate_non_escaping_lambdas_expr(
+                body,
+                lambda_env,
+                scope_types,
+            )?),
+        },
+        TypedExprKind::Let { bindings, body } => {
+            let mut next_scope = scope_types.clone();
+            let mut next_env = lambda_env.clone();
+            let mut rebuilt = Vec::<TypedLetBinding>::new();
+            for binding in bindings {
+                let mut rewritten_expr =
+                    eliminate_non_escaping_lambdas_expr(&binding.expr, &next_env, &next_scope)?;
+                let lambda_shape = match &rewritten_expr.kind {
+                    TypedExprKind::Lambda { param, body } if binding.name != "_" => {
+                        Some((param.clone(), (**body).clone()))
+                    }
+                    _ => None,
+                };
+                if let Some((param_name, body_expr)) = lambda_shape {
+                    let captures = free_lambda_capture_names(
+                        &body_expr,
+                        &param_name,
+                        &next_scope.keys().cloned().collect(),
+                    );
+                    if !captures.is_empty() {
+                        let mut capture_map = BTreeMap::<String, String>::new();
+                        for (index, capture) in captures.iter().enumerate() {
+                            if let Some(capture_ty) = next_scope.get(capture) {
+                                let alias = format!("{}$cap${}", binding.name, index);
+                                rebuilt.push(TypedLetBinding {
+                                    name: alias.clone(),
+                                    expr: TypedExpr {
+                                        ty: capture_ty.clone(),
+                                        kind: TypedExprKind::Local(capture.clone()),
+                                    },
+                                });
+                                next_scope.insert(alias.clone(), capture_ty.clone());
+                                capture_map.insert(capture.clone(), alias);
+                            }
+                        }
+                        let renamed_body =
+                            rename_free_locals(&body_expr, &capture_map, &BTreeSet::new())?;
+                        rewritten_expr = TypedExpr {
+                            ty: rewritten_expr.ty.clone(),
+                            kind: TypedExprKind::Lambda {
+                                param: param_name.clone(),
+                                body: Box::new(renamed_body.clone()),
+                            },
+                        };
+                        next_env.insert(
+                            binding.name.clone(),
+                            LambdaTemplate {
+                                param: param_name,
+                                body: renamed_body,
+                            },
+                        );
+                    } else {
+                        next_env.insert(
+                            binding.name.clone(),
+                            LambdaTemplate {
+                                param: param_name,
+                                body: body_expr,
+                            },
+                        );
+                    }
+                }
+                rebuilt.push(TypedLetBinding {
+                    name: binding.name.clone(),
+                    expr: rewritten_expr.clone(),
+                });
+                if binding.name != "_" {
+                    next_scope.insert(binding.name.clone(), rewritten_expr.ty);
+                }
+            }
+            let rewritten_body = eliminate_non_escaping_lambdas_expr(body, &next_env, &next_scope)?;
+            let pruned = prune_typed_let_bindings_for_backend(rebuilt, &rewritten_body);
+            if pruned.is_empty() {
+                return Ok(rewritten_body);
+            }
+            TypedExprKind::Let {
+                bindings: pruned,
+                body: Box::new(rewritten_body),
+            }
+        }
+        TypedExprKind::Record(fields) => TypedExprKind::Record(
+            fields
+                .iter()
+                .map(|(name, value)| {
+                    Ok((
+                        name.clone(),
+                        eliminate_non_escaping_lambdas_expr(value, lambda_env, scope_types)?,
+                    ))
+                })
+                .collect::<Result<BTreeMap<_, _>>>()?,
+        ),
+        TypedExprKind::Project { base, field } => TypedExprKind::Project {
+            base: Box::new(eliminate_non_escaping_lambdas_expr(
+                base,
+                lambda_env,
+                scope_types,
+            )?),
+            field: field.clone(),
+        },
+        TypedExprKind::RecordUpdate { base, fields } => TypedExprKind::RecordUpdate {
+            base: Box::new(eliminate_non_escaping_lambdas_expr(
+                base,
+                lambda_env,
+                scope_types,
+            )?),
+            fields: fields
+                .iter()
+                .map(|(name, value)| {
+                    Ok((
+                        name.clone(),
+                        eliminate_non_escaping_lambdas_expr(value, lambda_env, scope_types)?,
+                    ))
+                })
+                .collect::<Result<BTreeMap<_, _>>>()?,
+        },
+        TypedExprKind::Call {
+            callee,
+            args,
+            lifted_shape,
+        } => TypedExprKind::Call {
+            callee: callee.clone(),
+            args: args
+                .iter()
+                .map(|arg| {
+                    Ok(TypedArg {
+                        mode: arg.mode,
+                        expr: Box::new(eliminate_non_escaping_lambdas_expr(
+                            &arg.expr,
+                            lambda_env,
+                            scope_types,
+                        )?),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
+            lifted_shape: lifted_shape.clone(),
+        },
+        TypedExprKind::Apply { callee, arg } => {
+            let rewritten_callee =
+                eliminate_non_escaping_lambdas_expr(callee, lambda_env, scope_types)?;
+            let rewritten_arg = eliminate_non_escaping_lambdas_expr(arg, lambda_env, scope_types)?;
+            if let TypedExprKind::Lambda { param, body } = &rewritten_callee.kind {
+                let reduced = TypedExpr {
+                    ty: ty.clone(),
+                    kind: TypedExprKind::Let {
+                        bindings: vec![TypedLetBinding {
+                            name: param.clone(),
+                            expr: rewritten_arg,
+                        }],
+                        body: body.clone(),
+                    },
+                };
+                return eliminate_non_escaping_lambdas_expr(&reduced, lambda_env, scope_types);
+            }
+            if let TypedExprKind::Local(local_name) = &rewritten_callee.kind {
+                if let Some(template) = lambda_env.get(local_name) {
+                    let reduced = TypedExpr {
+                        ty: ty.clone(),
+                        kind: TypedExprKind::Let {
+                            bindings: vec![TypedLetBinding {
+                                name: template.param.clone(),
+                                expr: rewritten_arg,
+                            }],
+                            body: Box::new(template.body.clone()),
+                        },
+                    };
+                    return eliminate_non_escaping_lambdas_expr(&reduced, lambda_env, scope_types);
+                }
+            }
+            TypedExprKind::Apply {
+                callee: Box::new(rewritten_callee),
+                arg: Box::new(rewritten_arg),
+            }
+        }
+    };
+    Ok(TypedExpr { ty, kind })
+}
+
+fn free_lambda_capture_names(
+    body: &TypedExpr,
+    param: &str,
+    in_scope: &BTreeSet<String>,
+) -> Vec<String> {
+    let mut bound = BTreeSet::<String>::new();
+    bound.insert(param.to_string());
+    let mut free = BTreeSet::<String>::new();
+    collect_free_locals(body, &mut bound, &mut free);
+    free.into_iter()
+        .filter(|name| in_scope.contains(name))
+        .collect()
+}
+
+fn collect_free_locals(
+    expr: &TypedExpr,
+    bound: &mut BTreeSet<String>,
+    free: &mut BTreeSet<String>,
+) {
+    match &expr.kind {
+        TypedExprKind::Local(name) => {
+            if !bound.contains(name) {
+                free.insert(name.clone());
+            }
+        }
+        TypedExprKind::FunctionRef { .. }
+        | TypedExprKind::Int(_, _)
+        | TypedExprKind::Float(_, _) => {}
+        TypedExprKind::Lambda { param, body } => {
+            let mut nested = bound.clone();
+            nested.insert(param.clone());
+            collect_free_locals(body, &mut nested, free);
+        }
+        TypedExprKind::Let { bindings, body } => {
+            let mut nested = bound.clone();
+            for binding in bindings {
+                collect_free_locals(&binding.expr, &mut nested, free);
+                if binding.name != "_" {
+                    nested.insert(binding.name.clone());
+                }
+            }
+            collect_free_locals(body, &mut nested, free);
+        }
+        TypedExprKind::Record(fields) => {
+            for value in fields.values() {
+                collect_free_locals(value, bound, free);
+            }
+        }
+        TypedExprKind::Project { base, .. } => collect_free_locals(base, bound, free),
+        TypedExprKind::RecordUpdate { base, fields } => {
+            collect_free_locals(base, bound, free);
+            for value in fields.values() {
+                collect_free_locals(value, bound, free);
+            }
+        }
+        TypedExprKind::Call { args, .. } => {
+            for arg in args {
+                collect_free_locals(&arg.expr, bound, free);
+            }
+        }
+        TypedExprKind::Apply { callee, arg } => {
+            collect_free_locals(callee, bound, free);
+            collect_free_locals(arg, bound, free);
+        }
+    }
+}
+
+fn rename_free_locals(
+    expr: &TypedExpr,
+    mapping: &BTreeMap<String, String>,
+    bound: &BTreeSet<String>,
+) -> Result<TypedExpr> {
+    let ty = expr.ty.clone();
+    let kind = match &expr.kind {
+        TypedExprKind::Local(name) => {
+            if !bound.contains(name) {
+                if let Some(renamed) = mapping.get(name) {
+                    TypedExprKind::Local(renamed.clone())
+                } else {
+                    TypedExprKind::Local(name.clone())
+                }
+            } else {
+                TypedExprKind::Local(name.clone())
+            }
+        }
+        TypedExprKind::FunctionRef { name } => TypedExprKind::FunctionRef { name: name.clone() },
+        TypedExprKind::Int(value, prim) => TypedExprKind::Int(*value, *prim),
+        TypedExprKind::Float(value, prim) => TypedExprKind::Float(*value, *prim),
+        TypedExprKind::Lambda { param, body } => {
+            let mut nested = bound.clone();
+            nested.insert(param.clone());
+            TypedExprKind::Lambda {
+                param: param.clone(),
+                body: Box::new(rename_free_locals(body, mapping, &nested)?),
+            }
+        }
+        TypedExprKind::Let { bindings, body } => {
+            let mut nested = bound.clone();
+            let mut rewritten = Vec::with_capacity(bindings.len());
+            for binding in bindings {
+                rewritten.push(TypedLetBinding {
+                    name: binding.name.clone(),
+                    expr: rename_free_locals(&binding.expr, mapping, &nested)?,
+                });
+                if binding.name != "_" {
+                    nested.insert(binding.name.clone());
+                }
+            }
+            TypedExprKind::Let {
+                bindings: rewritten,
+                body: Box::new(rename_free_locals(body, mapping, &nested)?),
+            }
+        }
+        TypedExprKind::Record(fields) => TypedExprKind::Record(
+            fields
+                .iter()
+                .map(|(name, value)| Ok((name.clone(), rename_free_locals(value, mapping, bound)?)))
+                .collect::<Result<BTreeMap<_, _>>>()?,
+        ),
+        TypedExprKind::Project { base, field } => TypedExprKind::Project {
+            base: Box::new(rename_free_locals(base, mapping, bound)?),
+            field: field.clone(),
+        },
+        TypedExprKind::RecordUpdate { base, fields } => TypedExprKind::RecordUpdate {
+            base: Box::new(rename_free_locals(base, mapping, bound)?),
+            fields: fields
+                .iter()
+                .map(|(name, value)| Ok((name.clone(), rename_free_locals(value, mapping, bound)?)))
+                .collect::<Result<BTreeMap<_, _>>>()?,
+        },
+        TypedExprKind::Call {
+            callee,
+            args,
+            lifted_shape,
+        } => TypedExprKind::Call {
+            callee: callee.clone(),
+            args: args
+                .iter()
+                .map(|arg| {
+                    Ok(TypedArg {
+                        mode: arg.mode,
+                        expr: Box::new(rename_free_locals(&arg.expr, mapping, bound)?),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
+            lifted_shape: lifted_shape.clone(),
+        },
+        TypedExprKind::Apply { callee, arg } => TypedExprKind::Apply {
+            callee: Box::new(rename_free_locals(callee, mapping, bound)?),
+            arg: Box::new(rename_free_locals(arg, mapping, bound)?),
+        },
+    };
+    Ok(TypedExpr { ty, kind })
+}
+
+fn prune_typed_let_bindings_for_backend(
+    bindings: Vec<TypedLetBinding>,
+    body: &TypedExpr,
+) -> Vec<TypedLetBinding> {
+    let mut demanded = BTreeSet::<String>::new();
+    collect_used_locals(body, &mut demanded);
+    let mut kept = Vec::<TypedLetBinding>::new();
+    for binding in bindings.into_iter().rev() {
+        if binding.name != "_" && demanded.remove(&binding.name) {
+            collect_used_locals(&binding.expr, &mut demanded);
+            kept.push(binding);
+        }
+    }
+    kept.reverse();
+    kept
+}
+
+fn collect_used_locals(expr: &TypedExpr, names: &mut BTreeSet<String>) {
+    match &expr.kind {
+        TypedExprKind::Local(name) => {
+            names.insert(name.clone());
+        }
+        TypedExprKind::FunctionRef { .. }
+        | TypedExprKind::Int(_, _)
+        | TypedExprKind::Float(_, _) => {}
+        TypedExprKind::Lambda { body, .. } => collect_used_locals(body, names),
+        TypedExprKind::Let { bindings, body } => {
+            for binding in bindings {
+                collect_used_locals(&binding.expr, names);
+            }
+            collect_used_locals(body, names);
+        }
+        TypedExprKind::Record(fields) => {
+            for value in fields.values() {
+                collect_used_locals(value, names);
+            }
+        }
+        TypedExprKind::Project { base, .. } => collect_used_locals(base, names),
+        TypedExprKind::RecordUpdate { base, fields } => {
+            collect_used_locals(base, names);
+            for value in fields.values() {
+                collect_used_locals(value, names);
+            }
+        }
+        TypedExprKind::Call { args, .. } => {
+            for arg in args {
+                collect_used_locals(&arg.expr, names);
+            }
+        }
+        TypedExprKind::Apply { callee, arg } => {
+            collect_used_locals(callee, names);
+            collect_used_locals(arg, names);
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct KnownFunctionTemplate {
+    name: String,
+    bound_args: Vec<TypedExpr>,
+}
+
+fn canonicalize_backend_higher_order_program(checked: &CheckedProgram) -> Result<CheckedProgram> {
+    let signatures = checked
+        .functions
+        .iter()
+        .map(|function| (function.name.clone(), function))
+        .collect::<BTreeMap<_, _>>();
+    let mut functions = Vec::with_capacity(checked.functions.len());
+    for function in &checked.functions {
+        let clauses = function
+            .clauses
+            .iter()
+            .map(|clause| {
+                let body = canonicalize_backend_higher_order_expr(
+                    &clause.body,
+                    &BTreeMap::new(),
+                    &signatures,
+                )?;
+                Ok(TypedClause {
+                    patterns: clause.patterns.clone(),
+                    body,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        functions.push(CheckedFunction {
+            name: function.name.clone(),
+            signature: function.signature.clone(),
+            clauses,
+            pointwise: function.pointwise,
+            tailrec: function.tailrec.clone(),
+        });
+    }
+    Ok(CheckedProgram { functions })
+}
+
+fn canonicalize_backend_higher_order_expr(
+    expr: &TypedExpr,
+    known_functions: &BTreeMap<String, KnownFunctionTemplate>,
+    signatures: &BTreeMap<String, &CheckedFunction>,
+) -> Result<TypedExpr> {
+    let ty = expr.ty.clone();
+    let kind = match &expr.kind {
+        TypedExprKind::Local(name) => TypedExprKind::Local(name.clone()),
+        TypedExprKind::FunctionRef { name } => TypedExprKind::FunctionRef { name: name.clone() },
+        TypedExprKind::Int(value, prim) => TypedExprKind::Int(*value, *prim),
+        TypedExprKind::Float(value, prim) => TypedExprKind::Float(*value, *prim),
+        TypedExprKind::Lambda { param, body } => TypedExprKind::Lambda {
+            param: param.clone(),
+            body: Box::new(canonicalize_backend_higher_order_expr(
+                body,
+                known_functions,
+                signatures,
+            )?),
+        },
+        TypedExprKind::Let { bindings, body } => {
+            let mut next_known = known_functions.clone();
+            let mut rewritten = Vec::with_capacity(bindings.len());
+            for binding in bindings {
+                let rewritten_expr =
+                    canonicalize_backend_higher_order_expr(&binding.expr, &next_known, signatures)?;
+                if binding.name != "_" {
+                    if let Some(template) =
+                        extract_known_function_template(&rewritten_expr, &next_known)
+                    {
+                        next_known.insert(binding.name.clone(), template);
+                    } else {
+                        next_known.remove(&binding.name);
+                    }
+                }
+                rewritten.push(TypedLetBinding {
+                    name: binding.name.clone(),
+                    expr: rewritten_expr,
+                });
+            }
+            let rewritten_body =
+                canonicalize_backend_higher_order_expr(body, &next_known, signatures)?;
+            let pruned = prune_typed_let_bindings_for_backend(rewritten, &rewritten_body);
+            if pruned.is_empty() {
+                return Ok(rewritten_body);
+            }
+            TypedExprKind::Let {
+                bindings: pruned,
+                body: Box::new(rewritten_body),
+            }
+        }
+        TypedExprKind::Record(fields) => TypedExprKind::Record(
+            fields
+                .iter()
+                .map(|(name, value)| {
+                    Ok((
+                        name.clone(),
+                        canonicalize_backend_higher_order_expr(value, known_functions, signatures)?,
+                    ))
+                })
+                .collect::<Result<BTreeMap<_, _>>>()?,
+        ),
+        TypedExprKind::Project { base, field } => TypedExprKind::Project {
+            base: Box::new(canonicalize_backend_higher_order_expr(
+                base,
+                known_functions,
+                signatures,
+            )?),
+            field: field.clone(),
+        },
+        TypedExprKind::RecordUpdate { base, fields } => TypedExprKind::RecordUpdate {
+            base: Box::new(canonicalize_backend_higher_order_expr(
+                base,
+                known_functions,
+                signatures,
+            )?),
+            fields: fields
+                .iter()
+                .map(|(name, value)| {
+                    Ok((
+                        name.clone(),
+                        canonicalize_backend_higher_order_expr(value, known_functions, signatures)?,
+                    ))
+                })
+                .collect::<Result<BTreeMap<_, _>>>()?,
+        },
+        TypedExprKind::Call {
+            callee,
+            args,
+            lifted_shape,
+        } => TypedExprKind::Call {
+            callee: callee.clone(),
+            args: args
+                .iter()
+                .map(|arg| {
+                    Ok(TypedArg {
+                        mode: arg.mode,
+                        expr: Box::new(canonicalize_backend_higher_order_expr(
+                            &arg.expr,
+                            known_functions,
+                            signatures,
+                        )?),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
+            lifted_shape: lifted_shape.clone(),
+        },
+        TypedExprKind::Apply { callee, arg } => {
+            let rewritten_callee =
+                canonicalize_backend_higher_order_expr(callee, known_functions, signatures)?;
+            let rewritten_arg =
+                canonicalize_backend_higher_order_expr(arg, known_functions, signatures)?;
+            if let Some(mut template) =
+                extract_known_function_template(&rewritten_callee, known_functions)
+            {
+                template.bound_args.push(rewritten_arg);
+                return canonicalize_known_function_application(template, &ty, signatures);
+            }
+            TypedExprKind::Apply {
+                callee: Box::new(rewritten_callee),
+                arg: Box::new(rewritten_arg),
+            }
+        }
+    };
+    Ok(TypedExpr { ty, kind })
+}
+
+fn extract_known_function_template(
+    expr: &TypedExpr,
+    known_functions: &BTreeMap<String, KnownFunctionTemplate>,
+) -> Option<KnownFunctionTemplate> {
+    match &expr.kind {
+        TypedExprKind::FunctionRef { name } => Some(KnownFunctionTemplate {
+            name: name.clone(),
+            bound_args: Vec::new(),
+        }),
+        TypedExprKind::Local(name) => known_functions.get(name).cloned(),
+        TypedExprKind::Apply { callee, arg } => {
+            let mut template = extract_known_function_template(callee, known_functions)?;
+            template.bound_args.push((**arg).clone());
+            Some(template)
+        }
+        _ => None,
+    }
+}
+
+fn classify_function_value_expr_for_backend(expr: &TypedExpr) -> FunctionValueClass {
+    match &expr.kind {
+        TypedExprKind::FunctionRef { .. } => FunctionValueClass::KnownFn,
+        TypedExprKind::Lambda { .. } => FunctionValueClass::KnownLambda,
+        TypedExprKind::Local(_)
+        | TypedExprKind::Apply { .. }
+        | TypedExprKind::Let { .. }
+        | TypedExprKind::Call { .. } => FunctionValueClass::EscapingUnknown,
+        TypedExprKind::Int(_, _)
+        | TypedExprKind::Float(_, _)
+        | TypedExprKind::Record(_)
+        | TypedExprKind::Project { .. }
+        | TypedExprKind::RecordUpdate { .. } => FunctionValueClass::EscapingUnknown,
+    }
+}
+
+fn canonicalize_known_function_application(
+    template: KnownFunctionTemplate,
+    expected_ty: &Type,
+    signatures: &BTreeMap<String, &CheckedFunction>,
+) -> Result<TypedExpr> {
+    let signature = signatures.get(&template.name).copied().ok_or_else(|| {
+        SimdError::new(format!(
+            "unknown function '{}' during backend apply canonicalization",
+            template.name
+        ))
+    })?;
+    let (param_types, result_ty) = signature.signature.ty.fun_parts();
+    if template.bound_args.len() > param_types.len() {
+        return Err(SimdError::new(format!(
+            "backend apply canonicalization over-applied '{}' with {} args (arity {})",
+            template.name,
+            template.bound_args.len(),
+            param_types.len()
+        )));
+    }
+    if template.bound_args.len() < param_types.len() {
+        let mut expr = TypedExpr {
+            ty: signature.signature.ty.clone(),
+            kind: TypedExprKind::FunctionRef {
+                name: template.name.clone(),
+            },
+        };
+        for arg in template.bound_args {
+            let next_ty = match &expr.ty {
+                Type::Fun(args, ret) if !args.is_empty() => {
+                    if arg.ty != args[0] {
+                        return Err(SimdError::new(format!(
+                            "backend apply canonicalization argument type mismatch for '{}': {:?} vs {:?}",
+                            template.name, arg.ty, args[0]
+                        )));
+                    }
+                    if args.len() == 1 {
+                        ret.as_ref().clone()
+                    } else {
+                        Type::Fun(args[1..].to_vec(), ret.clone())
+                    }
+                }
+                other => {
+                    return Err(SimdError::new(format!(
+                        "backend apply canonicalization attempted to apply non-function {:?}",
+                        other
+                    )));
+                }
+            };
+            expr = TypedExpr {
+                ty: next_ty.clone(),
+                kind: TypedExprKind::Apply {
+                    callee: Box::new(expr),
+                    arg: Box::new(arg),
+                },
+            };
+        }
+        if expr.ty != *expected_ty {
+            return Err(SimdError::new(format!(
+                "backend apply canonicalization produced type {:?}, expected {:?}",
+                expr.ty, expected_ty
+            )));
+        }
+        return Ok(expr);
+    }
+    let mut dim_subst = BTreeMap::<String, Dim>::new();
+    let mut lifted_shape: Option<Shape> = None;
+    let mut typed_args = Vec::<TypedArg>::new();
+    for (arg, param_ty) in template.bound_args.into_iter().zip(param_types.iter()) {
+        let mut exact_subst = dim_subst.clone();
+        let mode = if unify_param_type(param_ty, &arg.ty, &mut exact_subst).is_ok() {
+            dim_subst = exact_subst;
+            AccessKind::Same
+        } else {
+            let mut trial_shape = lifted_shape.clone();
+            unify_lifted_type(&mut trial_shape, param_ty, &arg.ty)?;
+            lifted_shape = trial_shape;
+            AccessKind::Lane
+        };
+        typed_args.push(TypedArg {
+            mode,
+            expr: Box::new(arg),
+        });
+    }
+    let concrete_ret = apply_dim_subst(&result_ty, &dim_subst);
+    let call_ty = if let Some(shape) = &lifted_shape {
+        lift_type_over_shape(&concrete_ret, shape)?
+    } else {
+        concrete_ret
+    };
+    if call_ty != *expected_ty {
+        return Err(SimdError::new(format!(
+            "backend apply canonicalization call type mismatch for '{}': {:?} vs {:?}",
+            template.name, call_ty, expected_ty
+        )));
+    }
+    Ok(TypedExpr {
+        ty: call_ty,
+        kind: TypedExprKind::Call {
+            callee: Callee::Function(template.name),
+            args: typed_args,
+            lifted_shape,
+        },
+    })
+}
+
+fn apply_type_subst(ty: &Type, subst: &BTreeMap<String, Type>) -> Type {
+    match ty {
+        Type::Var(name) => subst.get(name).cloned().unwrap_or_else(|| ty.clone()),
+        Type::Scalar(_) | Type::Bulk(_, _) | Type::Infer(_) => ty.clone(),
+        Type::Record(fields) => Type::Record(
+            fields
+                .iter()
+                .map(|(name, field_ty)| (name.clone(), apply_type_subst(field_ty, subst)))
+                .collect(),
+        ),
+        Type::Fun(args, ret) => Type::Fun(
+            args.iter()
+                .map(|arg| apply_type_subst(arg, subst))
+                .collect(),
+            Box::new(apply_type_subst(ret, subst)),
+        ),
+    }
+}
+
+fn collect_type_var_bindings(
+    template: &Type,
+    actual: &Type,
+    subst: &mut BTreeMap<String, Type>,
+) -> Result<()> {
+    match template {
+        Type::Var(name) => match subst.get(name) {
+            Some(existing) if existing == actual => Ok(()),
+            Some(existing) => Err(SimdError::new(format!(
+                "type variable '{}' was inferred as {:?}, not {:?}",
+                name, existing, actual
+            ))),
+            None => {
+                subst.insert(name.clone(), actual.clone());
+                Ok(())
+            }
+        },
+        Type::Scalar(left) => match actual {
+            Type::Scalar(right) if left == right => Ok(()),
+            _ => Err(SimdError::new(format!(
+                "specialization expected scalar {:?}, found {:?}",
+                left, actual
+            ))),
+        },
+        Type::Bulk(left_prim, left_shape) => match actual {
+            Type::Bulk(right_prim, right_shape)
+                if left_prim == right_prim && left_shape.0.len() == right_shape.0.len() =>
+            {
+                Ok(())
+            }
+            _ => Err(SimdError::new(format!(
+                "specialization expected bulk {:?}, found {:?}",
+                template, actual
+            ))),
+        },
+        Type::Record(left_fields) => match actual {
+            Type::Record(right_fields) if left_fields.len() == right_fields.len() => {
+                for (name, left_ty) in left_fields {
+                    let right_ty = right_fields.get(name).ok_or_else(|| {
+                        SimdError::new(format!(
+                            "record field '{}' is missing in specialization",
+                            name
+                        ))
+                    })?;
+                    collect_type_var_bindings(left_ty, right_ty, subst)?;
+                }
+                Ok(())
+            }
+            _ => Err(SimdError::new(format!(
+                "specialization expected record {:?}, found {:?}",
+                template, actual
+            ))),
+        },
+        Type::Fun(left_args, left_ret) => match actual {
+            Type::Fun(right_args, right_ret) if left_args.len() == right_args.len() => {
+                for (left_arg, right_arg) in left_args.iter().zip(right_args) {
+                    collect_type_var_bindings(left_arg, right_arg, subst)?;
+                }
+                collect_type_var_bindings(left_ret, right_ret, subst)
+            }
+            _ => Err(SimdError::new(format!(
+                "specialization expected function {:?}, found {:?}",
+                template, actual
+            ))),
+        },
+        Type::Infer(_) => Ok(()),
+    }
+}
+
+fn specialization_arg_type(arg: &TypedArg) -> Result<Type> {
+    match arg.mode {
+        AccessKind::Same => Ok(arg.expr.ty.clone()),
+        AccessKind::Lane => lane_scalar_type(&arg.expr.ty),
+    }
+}
+
+fn lane_scalar_type(ty: &Type) -> Result<Type> {
+    match ty {
+        Type::Bulk(prim, _) => Ok(Type::Scalar(*prim)),
+        Type::Record(fields) => Ok(Type::Record(
+            fields
+                .iter()
+                .map(|(name, field_ty)| Ok((name.clone(), lane_scalar_type(field_ty)?)))
+                .collect::<Result<BTreeMap<_, _>>>()?,
+        )),
+        Type::Scalar(_) | Type::Var(_) | Type::Infer(_) | Type::Fun(_, _) => {
+            Err(SimdError::new(format!(
+                "lane argument expected bulk-compatible type, found {:?}",
+                ty
+            )))
+        }
+    }
+}
+
+fn collect_higher_order_reports(
+    program: &CheckedProgram,
+    origins: &BTreeMap<String, String>,
+) -> Vec<WasmHigherOrderReport> {
+    program
+        .functions
+        .iter()
+        .map(|function| {
+            let mut known_fn_values = 0usize;
+            let mut known_lambda_values = 0usize;
+            let mut escaping_unknown_values = 0usize;
+            for clause in &function.clauses {
+                collect_higher_order_expr_counts(
+                    &clause.body,
+                    &mut known_fn_values,
+                    &mut known_lambda_values,
+                    &mut escaping_unknown_values,
+                );
+            }
+            let signature_has_higher_order = function
+                .signature
+                .ty
+                .fun_parts()
+                .0
+                .iter()
+                .any(|ty| matches!(ty, Type::Fun(_, _)))
+                || matches!(function.signature.ty.fun_parts().1, Type::Fun(_, _));
+            let expr_has_higher_order = function.clauses.iter().any(|clause| {
+                typed_expr_contains_lambda_or_apply(&clause.body)
+                    || typed_expr_contains_fun_local(&clause.body)
+            });
+            let rejection_reason = if signature_has_higher_order {
+                Some("function signature remains higher-order after specialization".to_string())
+            } else if expr_has_higher_order {
+                Some("function body still contains higher-order forms".to_string())
+            } else {
+                None
+            };
+            let origin_text = origins
+                .get(&function.name)
+                .cloned()
+                .unwrap_or_else(|| "source".to_string());
+            let capture_count = parse_origin_metric(&origin_text, "captures=").unwrap_or(0);
+            let env_bytes = parse_origin_metric(&origin_text, "env-bytes=").unwrap_or(0);
+            let lambda_mode = if rejection_reason.is_some() {
+                LambdaLoweringMode::Rejected
+            } else if capture_count > 0
+                || origin_text.contains("closure-converted")
+                || origin_text.contains("lambda-lift")
+            {
+                LambdaLoweringMode::ClosureConverted
+            } else {
+                LambdaLoweringMode::DirectFirstOrder
+            };
+            WasmHigherOrderReport {
+                function: function.name.clone(),
+                specialization_origin: origin_text,
+                lambda_mode,
+                capture_count,
+                env_bytes,
+                known_fn_values,
+                known_lambda_values,
+                escaping_unknown_values,
+                rejection_reason,
+            }
+        })
+        .collect()
+}
+
+fn parse_origin_metric(origin: &str, key: &str) -> Option<usize> {
+    let index = origin.find(key)?;
+    let tail = &origin[index + key.len()..];
+    let digits = tail
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>();
+    if digits.is_empty() {
+        None
+    } else {
+        digits.parse::<usize>().ok()
+    }
+}
+
+fn collect_higher_order_expr_counts(
+    expr: &TypedExpr,
+    known_fn_values: &mut usize,
+    known_lambda_values: &mut usize,
+    escaping_unknown_values: &mut usize,
+) {
+    match &expr.kind {
+        TypedExprKind::FunctionRef { .. } => *known_fn_values += 1,
+        TypedExprKind::Lambda { body, .. } => {
+            *known_lambda_values += 1;
+            collect_higher_order_expr_counts(
+                body,
+                known_fn_values,
+                known_lambda_values,
+                escaping_unknown_values,
+            );
+        }
+        TypedExprKind::Apply { callee, arg } => {
+            *escaping_unknown_values += 1;
+            collect_higher_order_expr_counts(
+                callee,
+                known_fn_values,
+                known_lambda_values,
+                escaping_unknown_values,
+            );
+            collect_higher_order_expr_counts(
+                arg,
+                known_fn_values,
+                known_lambda_values,
+                escaping_unknown_values,
+            );
+        }
+        TypedExprKind::Let { bindings, body } => {
+            for binding in bindings {
+                collect_higher_order_expr_counts(
+                    &binding.expr,
+                    known_fn_values,
+                    known_lambda_values,
+                    escaping_unknown_values,
+                );
+            }
+            collect_higher_order_expr_counts(
+                body,
+                known_fn_values,
+                known_lambda_values,
+                escaping_unknown_values,
+            );
+        }
+        TypedExprKind::Record(fields) => {
+            for value in fields.values() {
+                collect_higher_order_expr_counts(
+                    value,
+                    known_fn_values,
+                    known_lambda_values,
+                    escaping_unknown_values,
+                );
+            }
+        }
+        TypedExprKind::Project { base, .. } => collect_higher_order_expr_counts(
+            base,
+            known_fn_values,
+            known_lambda_values,
+            escaping_unknown_values,
+        ),
+        TypedExprKind::RecordUpdate { base, fields } => {
+            collect_higher_order_expr_counts(
+                base,
+                known_fn_values,
+                known_lambda_values,
+                escaping_unknown_values,
+            );
+            for value in fields.values() {
+                collect_higher_order_expr_counts(
+                    value,
+                    known_fn_values,
+                    known_lambda_values,
+                    escaping_unknown_values,
+                );
+            }
+        }
+        TypedExprKind::Call { args, .. } => {
+            for arg in args {
+                collect_higher_order_expr_counts(
+                    &arg.expr,
+                    known_fn_values,
+                    known_lambda_values,
+                    escaping_unknown_values,
+                );
+            }
+        }
+        TypedExprKind::Local(_) | TypedExprKind::Int(_, _) | TypedExprKind::Float(_, _) => {}
+    }
+}
+
+fn typed_expr_contains_lambda_or_apply(expr: &TypedExpr) -> bool {
+    match &expr.kind {
+        TypedExprKind::Lambda { .. } | TypedExprKind::Apply { .. } => true,
+        TypedExprKind::Let { bindings, body } => {
+            bindings
+                .iter()
+                .any(|binding| typed_expr_contains_lambda_or_apply(&binding.expr))
+                || typed_expr_contains_lambda_or_apply(body)
+        }
+        TypedExprKind::Record(fields) => fields.values().any(typed_expr_contains_lambda_or_apply),
+        TypedExprKind::Project { base, .. } => typed_expr_contains_lambda_or_apply(base),
+        TypedExprKind::RecordUpdate { base, fields } => {
+            typed_expr_contains_lambda_or_apply(base)
+                || fields.values().any(typed_expr_contains_lambda_or_apply)
+        }
+        TypedExprKind::Call { args, .. } => args
+            .iter()
+            .any(|arg| typed_expr_contains_lambda_or_apply(&arg.expr)),
+        TypedExprKind::Local(_)
+        | TypedExprKind::FunctionRef { .. }
+        | TypedExprKind::Int(_, _)
+        | TypedExprKind::Float(_, _) => false,
+    }
+}
+
+fn typed_expr_contains_fun_local(expr: &TypedExpr) -> bool {
+    match &expr.kind {
+        TypedExprKind::Local(_) if matches!(expr.ty, Type::Fun(_, _)) => true,
+        TypedExprKind::Let { bindings, body } => {
+            bindings
+                .iter()
+                .any(|binding| typed_expr_contains_fun_local(&binding.expr))
+                || typed_expr_contains_fun_local(body)
+        }
+        TypedExprKind::Record(fields) => fields.values().any(typed_expr_contains_fun_local),
+        TypedExprKind::Project { base, .. } => typed_expr_contains_fun_local(base),
+        TypedExprKind::RecordUpdate { base, fields } => {
+            typed_expr_contains_fun_local(base)
+                || fields.values().any(typed_expr_contains_fun_local)
+        }
+        TypedExprKind::Call { args, .. } => args
+            .iter()
+            .any(|arg| typed_expr_contains_fun_local(&arg.expr)),
+        TypedExprKind::Apply { callee, arg } => {
+            typed_expr_contains_fun_local(callee) || typed_expr_contains_fun_local(arg)
+        }
+        TypedExprKind::Lambda { body, .. } => typed_expr_contains_fun_local(body),
+        TypedExprKind::Local(_)
+        | TypedExprKind::FunctionRef { .. }
+        | TypedExprKind::Int(_, _)
+        | TypedExprKind::Float(_, _) => false,
+    }
+}
+
+fn ensure_backend_first_order_compatibility(reports: &[WasmHigherOrderReport]) -> Result<()> {
+    if let Some(report) = reports
+        .iter()
+        .find(|report| report.rejection_reason.is_some())
+    {
+        return Err(SimdError::new(format!(
+            "Wasm backend supports only fully specialized closure-free functions; '{}' rejected: {}",
+            report.function,
+            report
+                .rejection_reason
+                .as_deref()
+                .unwrap_or("higher-order forms remain")
+        )));
+    }
+    Ok(())
+}
+
 fn compile_wasm_artifact_checked(
     checked_program: &CheckedProgram,
     main: &str,
+    origins: &BTreeMap<String, String>,
 ) -> Result<WasmArtifact> {
+    let higher_order_reports = collect_higher_order_reports(checked_program, origins);
+    ensure_backend_first_order_compatibility(&higher_order_reports)?;
     let mut plan = build_wasm_plan(checked_program, main)?;
     let normalized = normalize_records(&plan.checked)?;
     let lowered_program = optimize_lowered_program(&lower_program(&normalized)?);
@@ -1671,6 +4134,7 @@ fn compile_wasm_artifact_checked(
         grouped_export,
         leaf_exports: plan.leaf_exports,
         optimizer_reports,
+        higher_order_reports,
     })
 }
 
@@ -2883,6 +5347,10 @@ fn scalar_signature(function: &CheckedFunction) -> Result<(Vec<ValType>, Option<
                 "scalar Wasm function '{}' cannot accept record parameters",
                 function.name
             ))),
+            Type::Var(_) | Type::Infer(_) => Err(SimdError::new(format!(
+                "scalar Wasm function '{}' cannot accept unresolved polymorphic parameters",
+                function.name
+            ))),
             other => Err(SimdError::new(format!(
                 "scalar Wasm function '{}' cannot accept non-scalar parameter {:?}",
                 function.name, other
@@ -2894,6 +5362,12 @@ fn scalar_signature(function: &CheckedFunction) -> Result<(Vec<ValType>, Option<
         Type::Record(_) => {
             return Err(SimdError::new(format!(
                 "scalar Wasm function '{}' cannot return records",
+                function.name
+            )));
+        }
+        Type::Var(_) | Type::Infer(_) => {
+            return Err(SimdError::new(format!(
+                "scalar Wasm function '{}' cannot return unresolved polymorphic types",
                 function.name
             )));
         }
@@ -2924,6 +5398,11 @@ fn entry_signature(function: &CheckedFunction) -> Result<(Vec<ValType>, Option<V
                     "Wasm backend does not yet support record entry parameters",
                 ));
             }
+            Type::Var(_) | Type::Infer(_) => {
+                return Err(SimdError::new(
+                    "Wasm backend does not support unresolved polymorphic entry parameters",
+                ));
+            }
             Type::Fun(_, _) => {
                 return Err(SimdError::new(
                     "Wasm backend does not support higher-order entry parameters",
@@ -2946,6 +5425,11 @@ fn entry_signature(function: &CheckedFunction) -> Result<(Vec<ValType>, Option<V
         Type::Record(_) => {
             return Err(SimdError::new(
                 "Wasm backend does not yet support record entry results",
+            ));
+        }
+        Type::Var(_) | Type::Infer(_) => {
+            return Err(SimdError::new(
+                "Wasm backend does not support unresolved polymorphic entry results",
             ));
         }
         Type::Fun(_, _) => {
@@ -3172,6 +5656,11 @@ fn compile_kernel_entry(
             Type::Record(_) => {
                 return Err(SimdError::new(
                     "Wasm backend does not yet support record kernel parameters",
+                ));
+            }
+            Type::Var(_) | Type::Infer(_) => {
+                return Err(SimdError::new(
+                    "Wasm backend does not support unresolved polymorphic kernel parameters",
                 ));
             }
             Type::Fun(_, _) => {
@@ -5404,6 +7893,11 @@ fn flatten_clause_patterns(
                     "function parameters are not supported in Wasm record lowering",
                 ));
             }
+            Type::Var(_) | Type::Infer(_) => {
+                return Err(SimdError::new(
+                    "unresolved polymorphic parameters are not supported in Wasm record lowering",
+                ));
+            }
         }
     }
     Ok(flattened)
@@ -5456,6 +7950,11 @@ fn normalize_expr_for_leaf(
                 kind: TypedExprKind::Float(*value, *prim),
             })
         }
+        TypedExprKind::FunctionRef { .. }
+        | TypedExprKind::Lambda { .. }
+        | TypedExprKind::Apply { .. } => Err(SimdError::new(
+            "Wasm record normalization does not support higher-order expressions",
+        )),
         TypedExprKind::Record(fields) => {
             let (field, tail) = leaf_path.split_first().ok_or_else(|| {
                 SimdError::new("record expression requires a non-empty leaf path")
@@ -5658,6 +8157,9 @@ fn wasm_param_abi_from_single_type(ty: &Type) -> Result<WasmParamAbi> {
         Type::Fun(_, _) => Err(SimdError::new(
             "Wasm backend does not support higher-order entry parameters",
         )),
+        Type::Var(_) | Type::Infer(_) => Err(SimdError::new(
+            "Wasm backend does not support unresolved polymorphic entry parameters",
+        )),
     }
 }
 
@@ -5689,6 +8191,9 @@ fn wasm_result_abi_from_type(ty: &Type, param_types: &[Type]) -> Result<WasmResu
         Type::Fun(_, _) => Err(SimdError::new(
             "Wasm backend does not support higher-order entry results",
         )),
+        Type::Var(_) | Type::Infer(_) => Err(SimdError::new(
+            "Wasm backend does not support unresolved polymorphic entry results",
+        )),
     }
 }
 
@@ -5698,7 +8203,7 @@ fn type_contains_bulk_leaf(ty: &Type) -> bool {
         Type::Record(fields) => fields
             .iter()
             .any(|(_, field_ty)| type_contains_bulk_leaf(field_ty)),
-        Type::Scalar(_) | Type::Fun(_, _) => false,
+        Type::Scalar(_) | Type::Var(_) | Type::Infer(_) | Type::Fun(_, _) => false,
     }
 }
 
@@ -5708,6 +8213,9 @@ fn wasm_leaf_result_abi_from_type(ty: &Type) -> Result<WasmLeafResultAbi> {
         Type::Bulk(prim, _) => Ok(WasmLeafResultAbi::Bulk { prim: *prim }),
         Type::Record(_) => Err(SimdError::new("leaf result ABI cannot contain records")),
         Type::Fun(_, _) => Err(SimdError::new("leaf result ABI cannot contain functions")),
+        Type::Var(_) | Type::Infer(_) => Err(SimdError::new(
+            "leaf result ABI cannot contain unresolved polymorphic types",
+        )),
     }
 }
 
@@ -5740,6 +8248,9 @@ fn type_at_leaf_path(ty: &Type, leaf_path: &LeafPath) -> Result<Type> {
             Type::Record(_) => Err(SimdError::new("record type requires a non-empty leaf path")),
             Type::Fun(_, _) => Err(SimdError::new(
                 "function types cannot be used as leaf values",
+            )),
+            Type::Var(_) | Type::Infer(_) => Err(SimdError::new(
+                "unresolved polymorphic types cannot be used as leaf values",
             )),
         };
     }
@@ -6863,6 +9374,31 @@ mod tests {
             .to_json_string()
     }
 
+    fn typed_expr_has_lambda_or_apply(expr: &TypedExpr) -> bool {
+        match &expr.kind {
+            TypedExprKind::Lambda { .. } | TypedExprKind::Apply { .. } => true,
+            TypedExprKind::Let { bindings, body } => {
+                bindings
+                    .iter()
+                    .any(|binding| typed_expr_has_lambda_or_apply(&binding.expr))
+                    || typed_expr_has_lambda_or_apply(body)
+            }
+            TypedExprKind::Record(fields) => fields.values().any(typed_expr_has_lambda_or_apply),
+            TypedExprKind::Project { base, .. } => typed_expr_has_lambda_or_apply(base),
+            TypedExprKind::RecordUpdate { base, fields } => {
+                typed_expr_has_lambda_or_apply(base)
+                    || fields.values().any(typed_expr_has_lambda_or_apply)
+            }
+            TypedExprKind::Call { args, .. } => args
+                .iter()
+                .any(|arg| typed_expr_has_lambda_or_apply(&arg.expr)),
+            TypedExprKind::Local(_)
+            | TypedExprKind::FunctionRef { .. }
+            | TypedExprKind::Int(_, _)
+            | TypedExprKind::Float(_, _) => false,
+        }
+    }
+
     #[test]
     fn wasm_matches_i64_inc_for_full_vector() {
         let src = "inc : i64 -> i64\ninc x = x + 1\nmain : i64[n] -> i64[n]\nmain xs = inc xs\n";
@@ -6988,6 +9524,7 @@ mod tests {
                 reusable_param_leaf: None,
             }],
             optimizer_reports: Vec::new(),
+            higher_order_reports: Vec::new(),
         };
         assert!(can_use_direct_wasm_path(&artifact));
 
@@ -7298,6 +9835,111 @@ mod tests {
             wasm_run(src, "main", "[2,[1,2,3],[10,20,30]]"),
             "[12,24,36]"
         );
+    }
+
+    #[test]
+    fn wasm_monomorphizes_generic_direct_call() {
+        let src =
+            "square : t -> t\nsquare x = x * x\nmain : i64[n] -> i64[n]\nmain xs = square xs\n";
+        assert_eq!(wasm_run(src, "main", "[[2,3,4]]"), "[4,9,16]");
+    }
+
+    #[test]
+    fn wasm_monomorphizes_transitive_generic_calls() {
+        let src = "id : t -> t\nid x = x\nsquare : t -> t\nsquare x = let y = id x in y * y\nmain : i64 -> i64\nmain x = square x\n";
+        assert_eq!(wasm_run(src, "main", "[7]"), "49");
+    }
+
+    #[test]
+    fn wasm_specializes_higher_order_helper_with_known_function_arg() {
+        let src = "apply : (i64 -> i64) -> i64 -> i64\napply f x = f x\ninc : i64 -> i64\ninc x = x + 1\nmain : i64[n] -> i64[n]\nmain xs = apply inc xs\n";
+        let artifact = compile_wasm_main(src, "main").expect("artifact should compile");
+        assert_eq!(wasm_run(src, "main", "[[1,2,3]]"), "[2,3,4]");
+        assert!(
+            artifact
+                .higher_order_reports
+                .iter()
+                .any(|report| report.function.contains("$mono$"))
+        );
+        assert!(
+            artifact
+                .higher_order_reports
+                .iter()
+                .all(|report| report.rejection_reason.is_none())
+        );
+    }
+
+    #[test]
+    fn wasm_specializes_transitive_higher_order_calls() {
+        let src = "twice : (i64 -> i64) -> i64 -> i64\ntwice f x = f (f x)\nwrap : (i64 -> i64) -> i64 -> i64\nwrap f x = twice f x\ninc : i64 -> i64\ninc x = x + 1\nmain : i64[n] -> i64[n]\nmain xs = wrap inc xs\n";
+        assert_eq!(wasm_run(src, "main", "[[1,2,3]]"), "[3,4,5]");
+    }
+
+    #[test]
+    fn wasm_specialization_is_deterministic() {
+        let src = "apply : (i64 -> i64) -> i64 -> i64\napply f x = f x\ninc : i64 -> i64\ninc x = x + 1\nmain : i64[n] -> i64[n]\nmain xs = apply inc xs\n";
+        let first = compile_wasm_main(src, "main").expect("first compile should succeed");
+        let second = compile_wasm_main(src, "main").expect("second compile should succeed");
+        assert_eq!(first.bytes, second.bytes);
+        assert_eq!(first.higher_order_reports, second.higher_order_reports);
+    }
+
+    #[test]
+    fn backend_canonicalizes_known_partial_application_saturation() {
+        let src = "add : i64 -> i64 -> i64\nadd a b = a + b\nmain : i64 -> i64\nmain x = let plus2 = add 2 in plus2 x\n";
+        let (_surface, _module, checked) = compile_frontend(src).expect("frontend should compile");
+        let specialized =
+            specialize_checked_program_for_main(&checked, "main").expect("specialization works");
+        let lowered_ready = eliminate_non_escaping_lambdas_program(&specialized.checked)
+            .expect("lambda elimination should work");
+        let canonical = canonicalize_backend_higher_order_program(&lowered_ready)
+            .expect("backend canonicalization should succeed");
+        for function in &canonical.functions {
+            for clause in &function.clauses {
+                assert!(
+                    !typed_expr_has_lambda_or_apply(&clause.body),
+                    "function '{}' still contains lambda/apply after backend canonicalization",
+                    function.name
+                );
+            }
+        }
+        assert_eq!(wasm_run(src, "main", "[7]"), "9");
+    }
+
+    #[test]
+    fn wasm_compiles_non_capturing_escaping_lambda_value_in_higher_order_call() {
+        let src = "apply : (i64 -> i64) -> i64 -> i64\napply f x = f x\nmain : i64 -> i64\nmain x = apply (\\y -> y + 1) x\n";
+        assert_eq!(wasm_run(src, "main", "[9]"), "10");
+    }
+
+    #[test]
+    fn wasm_compiles_capturing_scalar_lambda_value_in_higher_order_call() {
+        let src = "apply : (i64 -> i64) -> i64 -> i64\napply f x = f x\nmain : i64 -> i64 -> i64\nmain a x = apply (\\y -> y + a) x\n";
+        assert_eq!(wasm_run(src, "main", "[5,9]"), "14");
+    }
+
+    #[test]
+    fn wasm_rejects_lambda_with_function_capture_for_now() {
+        let src = "callk : ((i64 -> i64) -> i64) -> i64\ncallk k = k (\\x -> x + 1)\nmain : i64\nmain = callk (\\f -> f 7)\n";
+        let _error = compile_wasm_main(src, "main").expect_err("Wasm compile should reject");
+    }
+
+    #[test]
+    fn wasm_compiles_higher_order_function_results_after_conversion() {
+        let src = "mk : i64 -> i64 -> i64\nmk a x = x + a\nmain : i64 -> i64\nmain x = (mk 1) x\n";
+        assert_eq!(wasm_run(src, "main", "[9]"), "10");
+    }
+
+    #[test]
+    fn wasm_compiles_nested_lambda_returning_lambda_chain() {
+        let src = "mk2 : i64 -> i64 -> i64 -> i64\nmk2 a b x = x + a + b\nmain : i64 -> i64\nmain x = ((mk2 1) 2) x\n";
+        assert_eq!(wasm_run(src, "main", "[9]"), "12");
+    }
+
+    #[test]
+    fn wasm_compiles_bulk_capture_lambda_value_in_higher_order_call() {
+        let src = "applyv : (i64[n] -> i64[n]) -> i64[n] -> i64[n]\napplyv f xs = f xs\nmain : i64[n] -> i64[n] -> i64[n]\nmain ys xs = applyv (\\x -> x + ys) xs\n";
+        assert_eq!(wasm_run(src, "main", "[[10,20,30],[1,2,3]]"), "[11,22,33]");
     }
 
     #[test]

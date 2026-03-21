@@ -1,0 +1,24 @@
+    pattern:  2, capture: 2 - function, start: (0, 0), end: (0, 3), text: `inc`
+    pattern: 11, capture: 10 - punctuation.delimiter, start: (0, 4), end: (0, 5), text: `:`
+    pattern:  2, capture: 3 - type, start: (0, 6), end: (0, 16), text: `i64 -> i64`
+    pattern:  1, capture: 1 - type.builtin, start: (0, 6), end: (0, 9), text: `i64`
+    pattern: 11, capture: 10 - punctuation.delimiter, start: (0, 10), end: (0, 12), text: `->`
+    pattern:  1, capture: 1 - type.builtin, start: (0, 13), end: (0, 16), text: `i64`
+    pattern:  3, capture: 2 - function, start: (1, 0), end: (1, 3), text: `inc`
+    pattern:  3, capture: 4 - variable.parameter, start: (1, 4), end: (1, 5), text: `x`
+    pattern: 11, capture: 10 - punctuation.delimiter, start: (1, 6), end: (1, 7), text: `=`
+    pattern:  9, capture: 8 - operator, start: (1, 10), end: (1, 11), text: `+`
+    pattern:  0, capture: 0 - constant.numeric, start: (1, 12), end: (1, 13), text: `1`
+    pattern:  2, capture: 2 - function, start: (3, 0), end: (3, 4), text: `main`
+    pattern: 11, capture: 10 - punctuation.delimiter, start: (3, 5), end: (3, 6), text: `:`
+    pattern:  2, capture: 3 - type, start: (3, 7), end: (3, 23), text: `i64[n] -> i64[n]`
+    pattern:  1, capture: 1 - type.builtin, start: (3, 7), end: (3, 10), text: `i64`
+    pattern: 10, capture: 9 - punctuation.bracket, start: (3, 10), end: (3, 11), text: `[`
+    pattern: 10, capture: 9 - punctuation.bracket, start: (3, 12), end: (3, 13), text: `]`
+    pattern: 11, capture: 10 - punctuation.delimiter, start: (3, 14), end: (3, 16), text: `->`
+    pattern:  1, capture: 1 - type.builtin, start: (3, 17), end: (3, 20), text: `i64`
+    pattern: 10, capture: 9 - punctuation.bracket, start: (3, 20), end: (3, 21), text: `[`
+    pattern: 10, capture: 9 - punctuation.bracket, start: (3, 22), end: (3, 23), text: `]`
+    pattern:  3, capture: 2 - function, start: (4, 0), end: (4, 4), text: `main`
+    pattern:  3, capture: 4 - variable.parameter, start: (4, 5), end: (4, 7), text: `xs`
+    pattern: 11, capture: 10 - punctuation.delimiter, start: (4, 8), end: (4, 9), text: `=`

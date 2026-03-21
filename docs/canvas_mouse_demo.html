@@ -1,0 +1,294 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>simd mouse shader demo</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #0b1020;
+        --panel: #121a31;
+        --border: #27324d;
+        --text: #e5edf7;
+        --muted: #96a4bf;
+        --accent: #7dd3fc;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        background: radial-gradient(1200px 500px at 10% -10%, #1b2b55 0%, var(--bg) 55%);
+        color: var(--text);
+      }
+
+      .app {
+        max-width: 1120px;
+        margin: 0 auto;
+        padding: 16px;
+        display: grid;
+        gap: 12px;
+      }
+
+      .toolbar {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+        align-items: center;
+        padding: 12px;
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 12px;
+      }
+
+      .toolbar strong {
+        font-size: 14px;
+      }
+
+      .toolbar label {
+        color: var(--muted);
+        font-size: 13px;
+      }
+
+      select {
+        min-width: 220px;
+        padding: 8px 10px;
+        border-radius: 8px;
+        border: 1px solid var(--border);
+        background: #0d152a;
+        color: var(--text);
+        font: inherit;
+      }
+
+      .meta {
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      .frame {
+        display: grid;
+        gap: 10px;
+        padding: 12px;
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 12px;
+      }
+
+      canvas {
+        width: 100%;
+        height: auto;
+        border-radius: 10px;
+        border: 1px solid var(--border);
+        background: #030712;
+        image-rendering: pixelated;
+      }
+
+      code {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+      }
+    </style>
+  </head>
+  <body>
+    <main class="app">
+      <section class="toolbar">
+        <strong>simd mouse shader demo</strong>
+        <label for="preset">kernel</label>
+        <select id="preset"></select>
+        <span id="status" class="meta">loading…</span>
+      </section>
+      <section class="frame">
+        <canvas id="view" width="512" height="288"></canvas>
+        <div id="details" class="meta"></div>
+        <div class="meta">
+          Runs a SIMD Wasm kernel per frame. From repo root run:
+          <code>just demo</code>, then open
+          <code>http://localhost:8000/docs/canvas_mouse_demo.html</code>.
+        </div>
+      </section>
+    </main>
+    <script>
+      const PRESETS = [
+        {
+          id: "mouse-glow-f32",
+          label: "mouse-glow-f32",
+          wasm: "./mouse_glow_f32.wasm",
+          simdFile: "examples/mouse_glow_f32.simd",
+          tint: [255, 205, 125],
+        },
+        {
+          id: "mouse-rings-f32",
+          label: "mouse-rings-f32",
+          wasm: "./mouse_rings_f32.wasm",
+          simdFile: "examples/mouse_rings_f32.simd",
+          tint: [135, 205, 255],
+        },
+      ];
+
+      const canvas = document.getElementById("view");
+      const ctx = canvas.getContext("2d", { alpha: false });
+      const presetSelect = document.getElementById("preset");
+      const status = document.getElementById("status");
+      const details = document.getElementById("details");
+      const width = canvas.width;
+      const height = canvas.height;
+      const length = width * height;
+      const image = ctx.createImageData(width, height);
+      const pixels = image.data;
+
+      for (const preset of PRESETS) {
+        const option = document.createElement("option");
+        option.value = preset.id;
+        option.textContent = preset.label;
+        presetSelect.appendChild(option);
+      }
+
+      let current = null;
+      let mouseX = 0;
+      let mouseY = 0;
+      let mouseSeen = false;
+      let frameCount = 0;
+      let fpsTime = performance.now();
+      let fps = 0;
+
+      function align16(value) {
+        return (value + 15) & ~15;
+      }
+
+      function ensureMemory(memory, bytes) {
+        const page = 65536;
+        const have = memory.buffer.byteLength;
+        if (have >= bytes) return;
+        const need = bytes - have;
+        const pages = Math.ceil(need / page);
+        memory.grow(pages);
+      }
+
+      function buildCoords(buffer, xsPtr, ysPtr) {
+        const xs = new Float32Array(buffer, xsPtr, length);
+        const ys = new Float32Array(buffer, ysPtr, length);
+        const invW = width > 1 ? 1 / (width - 1) : 0;
+        const invH = height > 1 ? 1 / (height - 1) : 0;
+        const aspect = width / Math.max(1, height);
+        let index = 0;
+        for (let y = 0; y < height; y += 1) {
+          const ny = (y * invH) * 2 - 1;
+          for (let x = 0; x < width; x += 1) {
+            const nx = ((x * invW) * 2 - 1) * aspect;
+            xs[index] = nx;
+            ys[index] = ny;
+            index += 1;
+          }
+        }
+      }
+
+      async function loadPreset(id) {
+        const preset = PRESETS.find((item) => item.id === id) ?? PRESETS[0];
+        presetSelect.value = preset.id;
+        status.textContent = `loading ${preset.label}…`;
+
+        const response = await fetch(preset.wasm);
+        if (!response.ok) {
+          throw new Error(`failed to fetch ${preset.wasm} (${response.status})`);
+        }
+        const bytes = await response.arrayBuffer();
+        const { instance } = await WebAssembly.instantiate(bytes, {});
+        const main = instance.exports.main;
+        const memory = instance.exports.memory;
+        if (typeof main !== "function" || !(memory instanceof WebAssembly.Memory)) {
+          throw new Error("wasm export shape mismatch; expected main + memory");
+        }
+
+        const bytesPerArray = length * 4;
+        const xsPtr = 0;
+        const ysPtr = align16(xsPtr + bytesPerArray);
+        const outPtr = align16(ysPtr + bytesPerArray);
+        const total = align16(outPtr + bytesPerArray);
+        ensureMemory(memory, total);
+        buildCoords(memory.buffer, xsPtr, ysPtr);
+
+        current = {
+          preset,
+          main,
+          memory,
+          xsPtr,
+          ysPtr,
+          outPtr,
+        };
+        status.textContent = `running ${preset.label}`;
+      }
+
+      function renderFrame(now) {
+        requestAnimationFrame(renderFrame);
+        if (!current) return;
+
+        const t = now * 0.001;
+        if (!mouseSeen) {
+          mouseX = Math.sin(t * 0.71) * 0.55;
+          mouseY = Math.cos(t * 0.49) * 0.45;
+        }
+        current.main(
+          t,
+          mouseX,
+          mouseY,
+          current.xsPtr,
+          length,
+          current.ysPtr,
+          length,
+          current.outPtr,
+          length
+        );
+
+        const out = new Float32Array(current.memory.buffer, current.outPtr, length);
+        const [tr, tg, tb] = current.preset.tint;
+        for (let i = 0, p = 0; i < length; i += 1, p += 4) {
+          let value = out[i];
+          if (value < 0) value = 0;
+          if (value > 1) value = 1;
+          pixels[p] = Math.min(255, (tr * value) | 0);
+          pixels[p + 1] = Math.min(255, (tg * value) | 0);
+          pixels[p + 2] = Math.min(255, (tb * value) | 0);
+          pixels[p + 3] = 255;
+        }
+        ctx.putImageData(image, 0, 0);
+
+        frameCount += 1;
+        if (now - fpsTime >= 500) {
+          fps = (frameCount * 1000) / (now - fpsTime);
+          frameCount = 0;
+          fpsTime = now;
+        }
+        details.textContent = `${current.preset.simdFile} • ${width}x${height} • mouse=(${mouseX.toFixed(3)}, ${mouseY.toFixed(3)}) • ${fps.toFixed(1)} fps`;
+      }
+
+      canvas.addEventListener("mousemove", (event) => {
+        const rect = canvas.getBoundingClientRect();
+        const x = (event.clientX - rect.left) / rect.width;
+        const y = (event.clientY - rect.top) / rect.height;
+        mouseX = (x * 2 - 1) * (width / Math.max(1, height));
+        mouseY = y * 2 - 1;
+        mouseSeen = true;
+      });
+
+      canvas.addEventListener("mouseleave", () => {
+        mouseSeen = false;
+      });
+
+      presetSelect.addEventListener("change", (event) => {
+        loadPreset(event.target.value).catch((error) => {
+          status.textContent = `error: ${error.message}`;
+        });
+      });
+
+      loadPreset(PRESETS[0].id)
+        .then(() => requestAnimationFrame(renderFrame))
+        .catch((error) => {
+          status.textContent = `error: ${error.message}`;
+        });
+    </script>
+  </body>
+</html>

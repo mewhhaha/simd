@@ -1,5 +1,8 @@
 use super::*;
-use crate::wasm_backend::{WasmLeafExport, WasmLeafResultAbi, WasmOptimizationReport};
+use crate::wasm_backend::{
+    LambdaLoweringMode, WasmHigherOrderReport, WasmLeafExport, WasmLeafResultAbi,
+    WasmOptimizationReport,
+};
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 use wasm_encoder::{
@@ -2170,6 +2173,17 @@ fn handcrafted_matrix_axpy2_record_artifact(prim: Prim) -> Result<WasmArtifact> 
             vector_unroll: 1,
             fallback_reason: None,
         }],
+        higher_order_reports: vec![WasmHigherOrderReport {
+            function: format!("handcrafted_matrix_axpy2_record_{}", prim_label(prim)),
+            specialization_origin: "handcrafted".to_string(),
+            lambda_mode: LambdaLoweringMode::DirectFirstOrder,
+            capture_count: 0,
+            env_bytes: 0,
+            known_fn_values: 0,
+            known_lambda_values: 0,
+            escaping_unknown_values: 0,
+            rejection_reason: None,
+        }],
     })
 }
 
@@ -2267,6 +2281,17 @@ fn handcrafted_matrix_image_tone_rgb_f32_artifact() -> Result<WasmArtifact> {
             vectorizable: true,
             vector_unroll: 1,
             fallback_reason: None,
+        }],
+        higher_order_reports: vec![WasmHigherOrderReport {
+            function: "handcrafted_matrix_image_tone_rgb_f32".to_string(),
+            specialization_origin: "handcrafted".to_string(),
+            lambda_mode: LambdaLoweringMode::DirectFirstOrder,
+            capture_count: 0,
+            env_bytes: 0,
+            known_fn_values: 0,
+            known_lambda_values: 0,
+            escaping_unknown_values: 0,
+            rejection_reason: None,
         }],
     })
 }
@@ -2408,6 +2433,17 @@ fn handcrafted_matrix_image_blend_rgb_f32_artifact() -> Result<WasmArtifact> {
             vector_unroll: 1,
             fallback_reason: None,
         }],
+        higher_order_reports: vec![WasmHigherOrderReport {
+            function: "handcrafted_matrix_image_blend_rgb_f32".to_string(),
+            specialization_origin: "handcrafted".to_string(),
+            lambda_mode: LambdaLoweringMode::DirectFirstOrder,
+            capture_count: 0,
+            env_bytes: 0,
+            known_fn_values: 0,
+            known_lambda_values: 0,
+            escaping_unknown_values: 0,
+            rejection_reason: None,
+        }],
     })
 }
 
@@ -2445,6 +2481,17 @@ fn build_handcrafted_single_leaf_artifact(
             vectorizable: true,
             vector_unroll: 1,
             fallback_reason: None,
+        }],
+        higher_order_reports: vec![WasmHigherOrderReport {
+            function: "handcrafted_single_leaf".to_string(),
+            specialization_origin: "handcrafted".to_string(),
+            lambda_mode: LambdaLoweringMode::DirectFirstOrder,
+            capture_count: 0,
+            env_bytes: 0,
+            known_fn_values: 0,
+            known_lambda_values: 0,
+            escaping_unknown_values: 0,
+            rejection_reason: None,
         }],
     }
 }
@@ -3276,6 +3323,17 @@ fn handcrafted_unary_i64_artifact(
             vector_unroll: 1,
             fallback_reason: None,
         }],
+        higher_order_reports: vec![WasmHigherOrderReport {
+            function: report_name.to_string(),
+            specialization_origin: "handcrafted".to_string(),
+            lambda_mode: LambdaLoweringMode::DirectFirstOrder,
+            capture_count: 0,
+            env_bytes: 0,
+            known_fn_values: 0,
+            known_lambda_values: 0,
+            escaping_unknown_values: 0,
+            rejection_reason: None,
+        }],
     })
 }
 
@@ -3411,6 +3469,17 @@ fn handcrafted_square_f32_artifact() -> Result<WasmArtifact> {
             vectorizable: true,
             vector_unroll: 1,
             fallback_reason: None,
+        }],
+        higher_order_reports: vec![WasmHigherOrderReport {
+            function: "handcrafted_square_f32".to_string(),
+            specialization_origin: "handcrafted".to_string(),
+            lambda_mode: LambdaLoweringMode::DirectFirstOrder,
+            capture_count: 0,
+            env_bytes: 0,
+            known_fn_values: 0,
+            known_lambda_values: 0,
+            escaping_unknown_values: 0,
+            rejection_reason: None,
         }],
     })
 }
@@ -3596,6 +3665,17 @@ fn handcrafted_axpy_i64_artifact() -> Result<WasmArtifact> {
             vector_unroll: 1,
             fallback_reason: None,
         }],
+        higher_order_reports: vec![WasmHigherOrderReport {
+            function: "handwritten_axpy_i64".to_string(),
+            specialization_origin: "handcrafted".to_string(),
+            lambda_mode: LambdaLoweringMode::DirectFirstOrder,
+            capture_count: 0,
+            env_bytes: 0,
+            known_fn_values: 0,
+            known_lambda_values: 0,
+            escaping_unknown_values: 0,
+            rejection_reason: None,
+        }],
     })
 }
 
@@ -3705,6 +3785,17 @@ fn handcrafted_axpy2_record_i64_artifact() -> Result<WasmArtifact> {
             vectorizable: true,
             vector_unroll: 1,
             fallback_reason: None,
+        }],
+        higher_order_reports: vec![WasmHigherOrderReport {
+            function: "handcrafted_axpy2_record_i64".to_string(),
+            specialization_origin: "handcrafted".to_string(),
+            lambda_mode: LambdaLoweringMode::DirectFirstOrder,
+            capture_count: 0,
+            env_bytes: 0,
+            known_fn_values: 0,
+            known_lambda_values: 0,
+            escaping_unknown_values: 0,
+            rejection_reason: None,
         }],
     })
 }

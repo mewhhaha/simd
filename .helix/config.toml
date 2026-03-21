@@ -1,0 +1,5 @@
+[editor]
+rainbow-brackets = true
+
+[editor.lsp]
+display-inlay-hints = true

@@ -11,7 +11,7 @@ fn run() -> simd::Result<()> {
     let mut args = env::args().skip(1).collect::<Vec<_>>();
     if args.is_empty() {
         return Err(simd::SimdError::new(
-            "usage: simd <parse|check|run|wasm|wat|run-wasm|bench|inspect-html> <file> [--main <fn>] [--args <json>] [--out <path>]",
+            "usage: simd <parse|check|fmt|run|wasm|wat|run-wasm|bench|inspect-html|lsp> ...",
         ));
     }
     let command = args.remove(0);
@@ -27,6 +27,26 @@ fn run() -> simd::Result<()> {
                 .first()
                 .ok_or_else(|| simd::SimdError::new("usage: simd check <file>"))?;
             println!("{}", simd::check_command(path)?);
+        }
+        "fmt" => {
+            if args.is_empty() {
+                return Err(simd::SimdError::new("usage: simd fmt <file> [--check]"));
+            }
+            let path = args.remove(0);
+            let mut check = false;
+            let mut index = 0usize;
+            while index < args.len() {
+                match args[index].as_str() {
+                    "--check" => {
+                        check = true;
+                        index += 1;
+                    }
+                    flag => {
+                        return Err(simd::SimdError::new(format!("unknown fmt flag '{}'", flag)));
+                    }
+                }
+            }
+            println!("{}", simd::fmt_command(&path, check)?);
         }
         "run" => {
             if args.is_empty() {
@@ -244,6 +264,12 @@ fn run() -> simd::Result<()> {
                 }
             }
             println!("{}", simd::inspect_html_command(out.as_deref())?);
+        }
+        "lsp" => {
+            if !args.is_empty() {
+                return Err(simd::SimdError::new("usage: simd lsp"));
+            }
+            simd::lsp_command()?;
         }
         other => {
             return Err(simd::SimdError::new(format!("unknown command '{}'", other)));

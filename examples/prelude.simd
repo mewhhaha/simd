@@ -1,0 +1,62 @@
+square : f32 -> f32
+square x = x * x
+
+
+cube : f32 -> f32
+cube x = x * x * x
+
+negate : f32 -> f32
+negate x = 0.0 - x
+
+dist2 : f32 -> f32 -> f32 -> f32 -> f32
+dist2 x y cx cy = let
+  dx = x - cx
+  dy = y - cy
+  in square dx + square dy
+
+inv1 : f32 -> f32
+inv1 x = 1.0 / (1.0 + x)
+
+glow : f32 -> f32 -> f32 -> f32
+glow amp falloff d2 = amp * inv1 (falloff * d2)
+
+rings : f32 -> f32 -> f32 -> f32
+rings amp freq phase = amp * inv1 (freq * phase * phase)
+
+pulse : f32 -> f32 -> f32 -> f32
+pulse center falloff x = inv1 (falloff * square (x - center))
+
+mix : f32 -> f32 -> f32 -> f32
+mix a b t = a * (1.0 - t) + b * t
+
+lerp : f32 -> f32 -> f32 -> f32
+lerp a b t = mix a b t
+
+bias_centered : f32 -> f32 -> f32
+bias_centered k x = x + k * (0.5 - x)
+
+tone_reinhard : f32 -> f32
+tone_reinhard x = x / (1.0 + x)
+
+tone_exposure : f32 -> f32 -> f32
+tone_exposure exposure x = 1.0 - inv1 (exposure * x)
+
+soft_step : f32 -> f32 -> f32
+soft_step sharpness x = tone_reinhard (sharpness * x)
+
+smoothstep01 : f32 -> f32
+smoothstep01 x = x * x * (3.0 - 2.0 * x)
+
+vignette : f32 -> f32 -> f32
+vignette strength d2 = inv1 (strength * d2)
+
+scanline : f32 -> f32 -> f32 -> f32
+scanline amount line01 color = color * (1.0 - amount * line01)
+
+ge_nat : i64 -> i64 -> i64
+ge_nat x 0 = 1
+ge_nat 0 y = 0
+ge_nat x y = ge_nat (x - 1) (y - 1)
+
+step : i64 -> i64 -> i64
+step edge x = ge_nat x edge

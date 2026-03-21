@@ -1,0 +1,14 @@
+shade : f32 -> f32 -> f32 -> f32 -> f32 -> f32
+shade t mx my x y = let
+  dx = x - mx
+  dy = y - my
+  d2 = dx * dx + dy * dy
+  core = 0.78 / (1.0 + 36.0 * d2)
+  sx = x + 0.31 * t
+  sy = y - 0.19 * t
+  s2 = sx * sx + sy * sy
+  fog = 0.22 / (1.0 + 2.8 * s2)
+  in core + fog
+
+main : f32 -> f32 -> f32 -> f32[n] -> f32[n] -> f32[n]
+main t mx my xs ys = shade t mx my xs ys

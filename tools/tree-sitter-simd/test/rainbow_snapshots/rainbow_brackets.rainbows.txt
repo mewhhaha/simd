@@ -1,0 +1,25 @@
+/home/mewhhaha/src/simd/tools/tree-sitter-simd/test/rainbow_snapshots/rainbow_brackets.simd
+    pattern:  0, capture: 0 - rainbow.scope, start: (0, 7), end: (0, 23), text: `{x:i64,y:i64[n]}`
+    pattern:  0, capture: 0 - rainbow.scope, start: (0, 7), end: (0, 23), text: `{x:i64,y:i64[n]}`
+    pattern:  1, capture: 1 - rainbow.bracket, start: (0, 7), end: (0, 8), text: `{`
+    pattern:  0, capture: 0 - rainbow.scope, start: (0, 10), end: (0, 13), text: `i64`
+    pattern:  0, capture: 0 - rainbow.scope, start: (0, 16), end: (0, 19), text: `i64`
+    pattern:  0, capture: 0 - rainbow.scope, start: (0, 19), end: (0, 22), text: `[n]`
+    pattern:  1, capture: 1 - rainbow.bracket, start: (0, 19), end: (0, 20), text: `[`
+    pattern:  1, capture: 1 - rainbow.bracket, start: (0, 21), end: (0, 22), text: `]`
+    pattern:  1, capture: 1 - rainbow.bracket, start: (0, 22), end: (0, 23), text: `}`
+    pattern:  0, capture: 0 - rainbow.scope, start: (0, 23), end: (0, 26), text: `[m]`
+    pattern:  1, capture: 1 - rainbow.bracket, start: (0, 23), end: (0, 24), text: `[`
+    pattern:  1, capture: 1 - rainbow.bracket, start: (0, 25), end: (0, 26), text: `]`
+    pattern:  0, capture: 0 - rainbow.scope, start: (0, 30), end: (0, 33), text: `i64`
+    pattern:  0, capture: 0 - rainbow.scope, start: (0, 33), end: (0, 36), text: `[n]`
+    pattern:  1, capture: 1 - rainbow.bracket, start: (0, 33), end: (0, 34), text: `[`
+    pattern:  1, capture: 1 - rainbow.bracket, start: (0, 35), end: (0, 36), text: `]`
+    pattern:  0, capture: 0 - rainbow.scope, start: (1, 10), end: (1, 27), text: `(xs { y = xs.y })`
+    pattern:  1, capture: 1 - rainbow.bracket, start: (1, 10), end: (1, 11), text: `(`
+    pattern:  0, capture: 0 - rainbow.scope, start: (1, 11), end: (1, 13), text: `xs`
+    pattern:  0, capture: 0 - rainbow.scope, start: (1, 14), end: (1, 26), text: `{ y = xs.y }`
+    pattern:  1, capture: 1 - rainbow.bracket, start: (1, 14), end: (1, 15), text: `{`
+    pattern:  0, capture: 0 - rainbow.scope, start: (1, 20), end: (1, 22), text: `xs`
+    pattern:  1, capture: 1 - rainbow.bracket, start: (1, 25), end: (1, 26), text: `}`
+    pattern:  1, capture: 1 - rainbow.bracket, start: (1, 26), end: (1, 27), text: `)`

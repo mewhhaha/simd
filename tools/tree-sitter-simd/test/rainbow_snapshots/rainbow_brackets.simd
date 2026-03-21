@@ -1,0 +1,2 @@
+main : {x:i64,y:i64[n]}[m] -> i64[n]
+main xs = (xs { y = xs.y }) .y

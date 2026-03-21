@@ -1,0 +1,2 @@
+bump : {x:i64,y:i64} -> {x:i64,y:i64}
+bump p = p { x = p.x + 1, y = p.y + 2 }

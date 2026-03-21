@@ -1,8 +1,8 @@
 use std::fs;
 
 use crate::{
-    Clause, Decl, Expr, ImportDecl, LetBinding, Pattern, Prim, PrimOp, Result, Shape, SimdError,
-    SurfaceProgram, Type, parse_source, read_source_file,
+    Clause, Decl, Expr, ImportDecl, LetBinding, Pattern, Prim, PrimOp, RefExpr, Result, Shape,
+    SimdError, SurfaceProgram, Type, parse_source, read_source_file,
 };
 
 const PREC_LET: u8 = 0;
@@ -120,6 +120,8 @@ fn format_type_atom(ty: &Type) -> String {
             }
             format!("{{{}}}", parts.join(","))
         }
+        Type::Var(name) => name.clone(),
+        Type::Infer(index) => format!("?{}", index),
         Type::Fun(_, _) => format!("({})", format_type(ty)),
     }
 }
@@ -147,9 +149,12 @@ fn format_pattern(pattern: &Pattern) -> String {
 
 fn format_expr(expr: &Expr, min_prec: u8) -> String {
     let rendered = match expr {
-        Expr::Name(name) => name.clone(),
+        Expr::Ref(reference) => format_ref_expr(reference),
         Expr::Int(value) => value.to_string(),
         Expr::Float(value) => super::format_float(*value),
+        Expr::Lambda { param, body } => {
+            format!("\\{} -> {}", param, format_expr(body, PREC_LET))
+        }
         Expr::Let { bindings, body } => format_let_expr(bindings, body),
         Expr::Record(fields) => format_record_fields(fields),
         Expr::Project(base, field) => {
@@ -246,8 +251,26 @@ fn expr_precedence(expr: &Expr) -> u8 {
         },
         Expr::App(_, _) => PREC_APP,
         Expr::Project(_, _) | Expr::RecordUpdate { .. } => PREC_POSTFIX,
-        Expr::Name(_) | Expr::Int(_) | Expr::Float(_) | Expr::Record(_) => PREC_ATOM,
+        Expr::Lambda { .. } => PREC_LET,
+        Expr::Ref(_) | Expr::Int(_) | Expr::Float(_) | Expr::Record(_) => PREC_ATOM,
     }
+}
+
+fn format_ref_expr(reference: &RefExpr) -> String {
+    let mut out = String::new();
+    if let Some(alias) = &reference.alias {
+        out.push_str(alias);
+        out.push('\\');
+    }
+    out.push_str(&reference.name);
+    for type_arg in &reference.type_args {
+        out.push('\\');
+        match type_arg {
+            crate::TypeArg::Prim(prim) => out.push_str(format_prim(*prim)),
+            crate::TypeArg::Name(name) => out.push_str(name),
+        }
+    }
+    out
 }
 
 fn infix_binding_power(op: PrimOp) -> (u8, u8) {
@@ -333,12 +356,20 @@ mod tests {
 
     #[test]
     fn formats_imports_and_qualified_names_without_division_spacing() {
-        let source = "import math/scalar as scalar\naxpy:i64->i64->i64->i64\naxpy a x y=a*x+y\nmain:i64->i64[n]->i64[n]->i64[n]\nmain a xs ys=scalar/axpy a xs ys\n";
+        let source = "import math/scalar as scalar\naxpy:i64->i64->i64->i64\naxpy a x y=a*x+y\nmain:i64->i64[n]->i64[n]->i64[n]\nmain a xs ys=scalar\\axpy a xs ys\n";
         let formatted = format_source_text(source).expect("format should succeed");
         assert_eq!(
             formatted,
-            "import math/scalar as scalar\n\naxpy : i64 -> i64 -> i64 -> i64\naxpy a x y = a * x + y\n\nmain : i64 -> i64[n] -> i64[n] -> i64[n]\nmain a xs ys = scalar/axpy a xs ys\n"
+            "import math/scalar as scalar\n\naxpy : i64 -> i64 -> i64 -> i64\naxpy a x y = a * x + y\n\nmain : i64 -> i64[n] -> i64[n] -> i64[n]\nmain a xs ys = scalar\\axpy a xs ys\n"
         );
+    }
+
+    #[test]
+    fn formats_lambda_and_specialized_refs() {
+        let source = "id:t->t\nid x=x\nmain:(i64->i64)->i64->i64\nmain f x=f (id\\i64 x)\nhelper:i64->i64\nhelper x=(\\y->y+1) x\n";
+        let formatted = format_source_text(source).expect("format should succeed");
+        assert!(formatted.contains("id\\i64"));
+        assert!(formatted.contains("\\y -> y + 1"));
     }
 
     #[test]

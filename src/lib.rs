@@ -14,9 +14,9 @@ pub use formatter::{fmt_command, format_program, format_source_text};
 pub use lsp::lsp_command;
 pub use wasm_backend::{
     BoundPreparedRun, PreparedLayout, PreparedSlotKind, PreparedSlotMetadata, PreparedSlotRole,
-    PreparedWasmMain, WasmArtifact, WasmExecutable, WasmParamAbi, WasmResultAbi, compile_wasm_main,
-    prepare_wasm_artifact, prepare_wasm_main, run_wasm_artifact, run_wasm_command, run_wasm_main,
-    wasm_command, wat_command, wat_main,
+    PreparedWasmMain, WasmArtifact, WasmExecutable, WasmHigherOrderReport, WasmParamAbi,
+    WasmResultAbi, compile_wasm_main, prepare_wasm_artifact, prepare_wasm_main, run_wasm_artifact,
+    run_wasm_command, run_wasm_main, wasm_command, wat_command, wat_main,
 };
 
 pub type Result<T> = std::result::Result<T, SimdError>;
@@ -79,6 +79,19 @@ pub struct LetBinding {
     pub expr: Expr,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefExpr {
+    pub alias: Option<String>,
+    pub name: String,
+    pub type_args: Vec<TypeArg>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TypeArg {
+    Prim(Prim),
+    Name(String),
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Pattern {
     Int(i64),
@@ -89,10 +102,14 @@ pub enum Pattern {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
-    Name(String),
+    Ref(RefExpr),
     Int(i64),
     Float(f64),
     App(Box<Expr>, Box<Expr>),
+    Lambda {
+        param: String,
+        body: Box<Expr>,
+    },
     Let {
         bindings: Vec<LetBinding>,
         body: Box<Expr>,
@@ -147,6 +164,8 @@ pub enum Type {
     Scalar(Prim),
     Bulk(Prim, Shape),
     Record(BTreeMap<String, Type>),
+    Var(String),
+    Infer(u32),
     Fun(Vec<Type>, Box<Type>),
 }
 
@@ -257,8 +276,15 @@ pub struct TypedExpr {
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypedExprKind {
     Local(String),
+    FunctionRef {
+        name: String,
+    },
     Int(i64, Prim),
     Float(f64, Prim),
+    Lambda {
+        param: String,
+        body: Box<TypedExpr>,
+    },
     Let {
         bindings: Vec<TypedLetBinding>,
         body: Box<TypedExpr>,
@@ -276,6 +302,10 @@ pub enum TypedExprKind {
         callee: Callee,
         args: Vec<TypedArg>,
         lifted_shape: Option<Shape>,
+    },
+    Apply {
+        callee: Box<TypedExpr>,
+        arg: Box<TypedExpr>,
     },
 }
 
@@ -495,7 +525,7 @@ impl Type {
     fn prim(&self) -> Option<Prim> {
         match self {
             Self::Scalar(prim) | Self::Bulk(prim, _) => Some(*prim),
-            Self::Record(_) | Self::Fun(_, _) => None,
+            Self::Record(_) | Self::Var(_) | Self::Infer(_) | Self::Fun(_, _) => None,
         }
     }
 }
@@ -760,6 +790,9 @@ fn collect_lifted_value(values: &[Value], scalar_ty: &Type, shape: &[usize]) -> 
         Type::Bulk(_, _) => Err(SimdError::new(
             "lifted result type unexpectedly contained bulk leaves already",
         )),
+        Type::Var(_) | Type::Infer(_) => Err(SimdError::new(
+            "lifted result type unexpectedly contained an unresolved type variable",
+        )),
         Type::Fun(_, _) => Err(SimdError::new(
             "lifted result type unexpectedly contained a function",
         )),
@@ -783,7 +816,7 @@ fn collect_type_leaves(ty: &Type, prefix: &LeafPath, leaves: &mut Vec<TypeLeaf>)
                 collect_type_leaves(field_ty, &prefix.child(name), leaves);
             }
         }
-        Type::Fun(_, _) => {}
+        Type::Var(_) | Type::Infer(_) | Type::Fun(_, _) => {}
     }
 }
 
@@ -838,6 +871,9 @@ pub fn rebuild_value_from_leaves(ty: &Type, leaves: &BTreeMap<LeafPath, Value>) 
             }
             Ok(Value::Record(record))
         }
+        Type::Var(_) | Type::Infer(_) => {
+            Err(SimdError::new("cannot rebuild values for unresolved types"))
+        }
         Type::Fun(_, _) => Err(SimdError::new(
             "cannot rebuild function values from flattened leaves",
         )),
@@ -890,6 +926,7 @@ enum TokenKind {
     Gt,
     Le,
     Ge,
+    Backslash,
     Dot,
     LParen,
     RParen,
@@ -963,6 +1000,15 @@ fn lex(source: &str) -> Result<Vec<Token>> {
             tokens.push(Token {
                 kind: TokenKind::Ident,
                 text: "_".to_string(),
+                leading_space,
+            });
+            index += 1;
+            continue;
+        }
+        if ch == '\\' {
+            tokens.push(Token {
+                kind: TokenKind::Backslash,
+                text: "\\".to_string(),
                 leading_space,
             });
             index += 1;
@@ -1179,7 +1225,11 @@ impl Parser {
     }
 
     fn parse_nonfun_type(&mut self) -> Result<Type> {
-        let mut head = if self.eat(TokenKind::LBrace) {
+        let mut head = if self.eat(TokenKind::LParen) {
+            let ty = self.parse_type()?;
+            self.expect(TokenKind::RParen)?;
+            ty
+        } else if self.eat(TokenKind::LBrace) {
             let mut fields = BTreeMap::new();
             if !self.eat(TokenKind::RBrace) {
                 loop {
@@ -1202,9 +1252,13 @@ impl Parser {
             Type::Record(fields)
         } else {
             let name = self.expect_ident()?;
-            let prim = Prim::parse(&name)
-                .ok_or_else(|| SimdError::new(format!("unknown primitive type '{name}'")))?;
-            Type::Scalar(prim)
+            match Prim::parse(&name) {
+                Some(prim) => Type::Scalar(prim),
+                None if is_implicit_type_var_name(&name) => Type::Var(name),
+                None => {
+                    return Err(SimdError::new(format!("unknown primitive type '{name}'")));
+                }
+            }
         };
 
         while self.eat(TokenKind::LBracket) {
@@ -1290,14 +1344,10 @@ impl Parser {
             .ok_or_else(|| SimdError::new("unexpected end of input in expression"))?;
         match token.kind {
             TokenKind::Let => self.parse_let_expr(),
+            TokenKind::Backslash => self.parse_lambda_expr(),
             TokenKind::Ident => {
                 self.pos += 1;
-                if self.can_parse_qualified_name(&token.text) {
-                    self.pos += 1;
-                    let member = self.expect_ident()?;
-                    return Ok(Expr::Name(format!("{}/{}", token.text, member)));
-                }
-                Ok(Expr::Name(token.text))
+                Ok(Expr::Ref(self.parse_ref_expr(token.text)?))
             }
             TokenKind::Int => {
                 self.pos += 1;
@@ -1361,12 +1411,54 @@ impl Parser {
             self.peek().map(|token| &token.kind),
             Some(
                 TokenKind::Ident
+                    | TokenKind::Backslash
                     | TokenKind::Let
                     | TokenKind::Int
                     | TokenKind::Float
                     | TokenKind::LParen
             )
         )
+    }
+
+    fn parse_lambda_expr(&mut self) -> Result<Expr> {
+        self.expect(TokenKind::Backslash)?;
+        let param = self.expect_ident()?;
+        self.expect(TokenKind::Arrow)?;
+        let body = self.parse_expr(0)?;
+        Ok(Expr::Lambda {
+            param,
+            body: Box::new(body),
+        })
+    }
+
+    fn parse_ref_expr(&mut self, head: String) -> Result<RefExpr> {
+        let mut segments = vec![head];
+        while self.can_parse_backslash_chain() {
+            self.pos += 1;
+            segments.push(self.expect_ident()?);
+        }
+        let (alias, name, type_args) =
+            if self.import_aliases.contains_key(&segments[0]) && segments.len() >= 2 {
+                let alias = Some(segments[0].clone());
+                let name = segments[1].clone();
+                let type_args = segments[2..]
+                    .iter()
+                    .map(|segment| parse_type_arg(segment))
+                    .collect::<Result<Vec<_>>>()?;
+                (alias, name, type_args)
+            } else {
+                let name = segments[0].clone();
+                let type_args = segments[1..]
+                    .iter()
+                    .map(|segment| parse_type_arg(segment))
+                    .collect::<Result<Vec<_>>>()?;
+                (None, name, type_args)
+            };
+        Ok(RefExpr {
+            alias,
+            name,
+            type_args,
+        })
     }
 
     fn parse_let_expr(&mut self) -> Result<Expr> {
@@ -1476,20 +1568,17 @@ impl Parser {
         self.peek().map(|token| token.kind.clone()) == Some(kind)
     }
 
-    fn can_parse_qualified_name(&self, alias: &str) -> bool {
-        if !self.import_aliases.contains_key(alias) {
-            return false;
-        }
-        let Some(slash) = self.peek() else {
+    fn can_parse_backslash_chain(&self) -> bool {
+        let Some(backslash) = self.peek() else {
             return false;
         };
-        let Some(member) = self.tokens.get(self.pos + 1) else {
+        let Some(segment) = self.tokens.get(self.pos + 1) else {
             return false;
         };
-        slash.kind == TokenKind::Slash
-            && member.kind == TokenKind::Ident
-            && !slash.leading_space
-            && !member.leading_space
+        backslash.kind == TokenKind::Backslash
+            && segment.kind == TokenKind::Ident
+            && !backslash.leading_space
+            && !segment.leading_space
     }
 
     fn peek(&self) -> Option<&Token> {
@@ -1521,6 +1610,24 @@ fn parse_int(text: &str) -> Result<i64> {
 fn parse_nat(text: &str) -> Result<usize> {
     text.parse::<usize>()
         .map_err(|_| SimdError::new(format!("invalid natural literal '{text}'")))
+}
+
+fn is_implicit_type_var_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
+}
+
+fn parse_type_arg(segment: &str) -> Result<TypeArg> {
+    match Prim::parse(segment) {
+        Some(prim) => Ok(TypeArg::Prim(prim)),
+        None if is_implicit_type_var_name(segment) => Ok(TypeArg::Name(segment.to_string())),
+        None => Err(SimdError::new(format!(
+            "explicit specialization segment '{}' must be a primitive type or in-scope type variable",
+            segment
+        ))),
+    }
 }
 
 fn parse_float(text: &str) -> Result<f64> {
@@ -1646,22 +1753,8 @@ fn group_program(surface: &SurfaceProgram) -> Result<Module> {
 }
 
 fn validate_signature_shape_contract(signature: &Signature) -> Result<()> {
-    let (args, ret) = signature.ty.fun_parts();
-    if args.iter().any(type_contains_function) || type_contains_function(&ret) {
-        return Err(SimdError::new(format!(
-            "function '{}' uses unsupported higher-order types",
-            signature.name
-        )));
-    }
+    let _ = signature;
     Ok(())
-}
-
-fn type_contains_function(ty: &Type) -> bool {
-    match ty {
-        Type::Scalar(_) | Type::Bulk(_, _) => false,
-        Type::Record(fields) => fields.values().any(type_contains_function),
-        Type::Fun(_, _) => true,
-    }
 }
 
 fn analyze_pointwise(module: &Module) -> Result<BTreeMap<String, bool>> {
@@ -1686,7 +1779,8 @@ fn analyze_pointwise(module: &Module) -> Result<BTreeMap<String, bool>> {
 
 fn validate_pointwise_expr(expr: &Expr, known: &BTreeMap<String, usize>) -> Result<()> {
     match expr {
-        Expr::Name(_) | Expr::Int(_) | Expr::Float(_) => Ok(()),
+        Expr::Ref(_) | Expr::Int(_) | Expr::Float(_) => Ok(()),
+        Expr::Lambda { body, .. } => validate_pointwise_expr(body, known),
         Expr::Let { bindings, body } => {
             for binding in bindings {
                 validate_pointwise_expr(&binding.expr, known)?;
@@ -1695,8 +1789,11 @@ fn validate_pointwise_expr(expr: &Expr, known: &BTreeMap<String, usize>) -> Resu
         }
         Expr::App(_, _) => {
             let (head, _args) = flatten_apps(expr);
-            if let Expr::Name(name) = head {
-                if known.contains_key(name) {
+            if let Expr::Ref(reference) = head {
+                if reference.alias.is_none()
+                    && reference.type_args.is_empty()
+                    && known.contains_key(&reference.name)
+                {
                     let (_, args) = flatten_apps(expr);
                     for arg in args {
                         validate_pointwise_expr(arg, known)?;
@@ -1706,9 +1803,7 @@ fn validate_pointwise_expr(expr: &Expr, known: &BTreeMap<String, usize>) -> Resu
                     validate_pointwise_expr(head, known)
                 }
             } else {
-                Err(SimdError::new(
-                    "v0 only supports direct named function application",
-                ))
+                validate_pointwise_expr(head, known)
             }
         }
         Expr::Infix { lhs, rhs, .. } => {
@@ -1832,21 +1927,7 @@ fn infer_expr(
     expected: Option<&Type>,
 ) -> Result<TypedExpr> {
     match expr {
-        Expr::Name(name) => {
-            if let Some(ty) = context.locals.get(name) {
-                return Ok(TypedExpr {
-                    ty: ty.clone(),
-                    kind: TypedExprKind::Local(name.clone()),
-                });
-            }
-            if resolve_signature_name(name, context).is_some() {
-                return Err(SimdError::new(format!(
-                    "function '{}' must be called directly; first-class functions are not in v0",
-                    name
-                )));
-            }
-            Err(SimdError::new(format!("unknown name '{}'", name)))
-        }
+        Expr::Ref(reference) => infer_ref_expr(reference, context, expected),
         Expr::Int(value) => {
             let prim = match expected.and_then(Type::prim) {
                 Some(prim) if prim.is_int() => prim,
@@ -1879,13 +1960,102 @@ fn infer_expr(
                 kind: TypedExprKind::Float(*value, prim),
             })
         }
+        Expr::Lambda { param, body } => infer_lambda_expr(param, body, context, expected),
         Expr::Let { bindings, body } => infer_let_expr(bindings, body, context, expected),
         Expr::Record(fields) => infer_record_expr(fields, context, expected),
         Expr::Project(base, field) => infer_projection_expr(base, field, context),
         Expr::RecordUpdate { base, fields } => infer_record_update_expr(base, fields, context),
         Expr::Infix { op, lhs, rhs } => infer_primitive_call(*op, lhs, rhs, context, expected),
-        Expr::App(_, _) => infer_function_call(expr, context, expected),
+        Expr::App(_, _) => infer_apply_expr(expr, context, expected),
     }
+}
+
+fn infer_ref_expr(
+    reference: &RefExpr,
+    context: &TypeContext<'_>,
+    expected: Option<&Type>,
+) -> Result<TypedExpr> {
+    if reference.alias.is_none() && reference.type_args.is_empty() {
+        if let Some(ty) = context.locals.get(&reference.name) {
+            return Ok(TypedExpr {
+                ty: ty.clone(),
+                kind: TypedExprKind::Local(reference.name.clone()),
+            });
+        }
+    }
+    let resolved_name = resolve_ref_name(reference, context).ok_or_else(|| {
+        SimdError::new(format!(
+            "unknown function reference '{}'{}",
+            render_ref_expr(reference),
+            render_ref_resolution_suffix(reference, context)
+        ))
+    })?;
+    let signature = context
+        .signatures
+        .get(&resolved_name)
+        .ok_or_else(|| SimdError::new(format!("unknown function '{}'", resolved_name)))?;
+    let ty = instantiate_ref_type(&signature.ty, &reference.type_args)?;
+    if reference.type_args.is_empty() && type_contains_var(&ty) {
+        return Err(SimdError::new(format!(
+            "polymorphic function '{}' requires explicit specialization in value position",
+            render_ref_expr(reference)
+        )));
+    }
+    if let Some(expected_ty) = expected {
+        if &ty != expected_ty {
+            return Err(SimdError::new(format!(
+                "function reference '{}' has type {:?}, expected {:?}",
+                render_ref_expr(reference),
+                ty,
+                expected_ty
+            )));
+        }
+    }
+    Ok(TypedExpr {
+        ty,
+        kind: TypedExprKind::FunctionRef {
+            name: resolved_name,
+        },
+    })
+}
+
+fn infer_lambda_expr(
+    param: &str,
+    body: &Expr,
+    context: &TypeContext<'_>,
+    expected: Option<&Type>,
+) -> Result<TypedExpr> {
+    let expected_fun = expected.and_then(|ty| match ty {
+        Type::Fun(args, ret) if args.len() == 1 => Some((args[0].clone(), ret.as_ref().clone())),
+        _ => None,
+    });
+    let Some((param_ty, ret_ty)) = expected_fun else {
+        return Err(SimdError::new(
+            "lambda expressions currently require an expected unary function type",
+        ));
+    };
+    let mut locals = context.locals.clone();
+    locals.insert(param.to_string(), param_ty.clone());
+    let body_context = TypeContext {
+        locals: &locals,
+        signatures: context.signatures,
+        imports: context.imports,
+        pointwise: context.pointwise,
+    };
+    let typed_body = infer_expr(body, &body_context, Some(&ret_ty))?;
+    if typed_body.ty != ret_ty {
+        return Err(SimdError::new(format!(
+            "lambda body has type {:?}, expected {:?}",
+            typed_body.ty, ret_ty
+        )));
+    }
+    Ok(TypedExpr {
+        ty: Type::Fun(vec![param_ty], Box::new(ret_ty)),
+        kind: TypedExprKind::Lambda {
+            param: param.to_string(),
+            body: Box::new(typed_body),
+        },
+    })
 }
 
 fn infer_let_expr(
@@ -2017,10 +2187,15 @@ fn collect_expr_local_names(expr: &Expr) -> BTreeSet<String> {
 
 fn collect_expr_local_names_into(expr: &Expr, names: &mut BTreeSet<String>) {
     match expr {
-        Expr::Name(name) => {
-            names.insert(name.clone());
+        Expr::Ref(reference) => {
+            if reference.alias.is_none() && reference.type_args.is_empty() {
+                names.insert(reference.name.clone());
+            }
         }
         Expr::Int(_) | Expr::Float(_) => {}
+        Expr::Lambda { body, .. } => {
+            collect_expr_local_names_into(body, names);
+        }
         Expr::App(fun, arg) => {
             collect_expr_local_names_into(fun, names);
             collect_expr_local_names_into(arg, names);
@@ -2059,6 +2234,129 @@ fn combined_locals(
         locals.insert(name.clone(), ty.clone());
     }
     locals
+}
+
+fn type_contains_var(ty: &Type) -> bool {
+    match ty {
+        Type::Var(_) | Type::Infer(_) => true,
+        Type::Scalar(_) | Type::Bulk(_, _) => false,
+        Type::Record(fields) => fields.values().any(type_contains_var),
+        Type::Fun(args, ret) => args.iter().any(type_contains_var) || type_contains_var(ret),
+    }
+}
+
+fn collect_type_vars_in_order(ty: &Type) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    let mut vars = Vec::new();
+    collect_type_vars_in_order_into(ty, &mut seen, &mut vars);
+    vars
+}
+
+fn collect_type_vars_in_order_into(ty: &Type, seen: &mut BTreeSet<String>, vars: &mut Vec<String>) {
+    match ty {
+        Type::Var(name) => {
+            if seen.insert(name.clone()) {
+                vars.push(name.clone());
+            }
+        }
+        Type::Scalar(_) | Type::Bulk(_, _) | Type::Infer(_) => {}
+        Type::Record(fields) => {
+            for field_ty in fields.values() {
+                collect_type_vars_in_order_into(field_ty, seen, vars);
+            }
+        }
+        Type::Fun(args, ret) => {
+            for arg in args {
+                collect_type_vars_in_order_into(arg, seen, vars);
+            }
+            collect_type_vars_in_order_into(ret, seen, vars);
+        }
+    }
+}
+
+fn apply_type_subst(ty: &Type, subst: &BTreeMap<String, Type>) -> Type {
+    match ty {
+        Type::Var(name) => subst.get(name).cloned().unwrap_or_else(|| ty.clone()),
+        Type::Scalar(_) | Type::Bulk(_, _) | Type::Infer(_) => ty.clone(),
+        Type::Record(fields) => Type::Record(
+            fields
+                .iter()
+                .map(|(name, field_ty)| (name.clone(), apply_type_subst(field_ty, subst)))
+                .collect(),
+        ),
+        Type::Fun(args, ret) => Type::Fun(
+            args.iter()
+                .map(|arg| apply_type_subst(arg, subst))
+                .collect(),
+            Box::new(apply_type_subst(ret, subst)),
+        ),
+    }
+}
+
+fn unify_type_template(
+    template: &Type,
+    actual: &Type,
+    subst: &mut BTreeMap<String, Type>,
+) -> Result<()> {
+    match template {
+        Type::Var(name) => match subst.get(name) {
+            Some(existing) if existing == actual => Ok(()),
+            Some(existing) => Err(SimdError::new(format!(
+                "type variable '{}' was inferred as {:?}, not {:?}",
+                name, existing, actual
+            ))),
+            None => {
+                subst.insert(name.clone(), actual.clone());
+                Ok(())
+            }
+        },
+        Type::Scalar(left) => match actual {
+            Type::Scalar(right) if left == right => Ok(()),
+            _ => Err(SimdError::new(format!(
+                "expected scalar {:?}, found {:?}",
+                left, actual
+            ))),
+        },
+        Type::Bulk(left_prim, left_shape) => match actual {
+            Type::Bulk(right_prim, right_shape)
+                if left_prim == right_prim && left_shape == right_shape =>
+            {
+                Ok(())
+            }
+            _ => Err(SimdError::new(format!(
+                "expected bulk {:?}, found {:?}",
+                template, actual
+            ))),
+        },
+        Type::Record(left_fields) => match actual {
+            Type::Record(right_fields) if left_fields.len() == right_fields.len() => {
+                for (name, left_ty) in left_fields {
+                    let right_ty = right_fields.get(name).ok_or_else(|| {
+                        SimdError::new(format!("record field '{}' is missing", name))
+                    })?;
+                    unify_type_template(left_ty, right_ty, subst)?;
+                }
+                Ok(())
+            }
+            _ => Err(SimdError::new(format!(
+                "expected record {:?}, found {:?}",
+                template, actual
+            ))),
+        },
+        Type::Fun(left_args, left_ret) => match actual {
+            Type::Fun(right_args, right_ret) if left_args.len() == right_args.len() => {
+                for (left_arg, right_arg) in left_args.iter().zip(right_args) {
+                    unify_type_template(left_arg, right_arg, subst)?;
+                }
+                unify_type_template(left_ret, right_ret, subst)
+            }
+            _ => Err(SimdError::new(format!(
+                "expected function {:?}, found {:?}",
+                template, actual
+            ))),
+        },
+        Type::Infer(_) => Ok(()),
+    }
 }
 
 fn infer_record_expr(
@@ -2182,39 +2480,124 @@ fn infer_record_update_expr(
     })
 }
 
-fn infer_function_call(
+fn infer_apply_expr(
     expr: &Expr,
     context: &TypeContext<'_>,
     expected: Option<&Type>,
 ) -> Result<TypedExpr> {
     let (head, args_exprs) = flatten_apps(expr);
-    let raw_name = match head {
-        Expr::Name(name) => name,
-        _ => {
-            return Err(SimdError::new(
-                "v0 only supports direct application of named top-level functions",
-            ));
+    if let Some(direct_call) = infer_direct_function_call(head, &args_exprs, context, expected)? {
+        return Ok(direct_call);
+    }
+    let mut typed = infer_expr(head, context, None)?;
+    for arg_expr in args_exprs {
+        let (param_ty, rest_ty) = match &typed.ty {
+            Type::Fun(params, ret) if !params.is_empty() => {
+                let param_ty = params[0].clone();
+                let rest_ty = if params.len() == 1 {
+                    ret.as_ref().clone()
+                } else {
+                    Type::Fun(params[1..].to_vec(), ret.clone())
+                };
+                (param_ty, rest_ty)
+            }
+            other => {
+                return Err(SimdError::new(format!(
+                    "cannot apply non-function value of type {:?}",
+                    other
+                )));
+            }
+        };
+        let typed_arg = infer_expr(arg_expr, context, Some(&param_ty))?;
+        if typed_arg.ty != param_ty {
+            return Err(SimdError::new(format!(
+                "application argument has type {:?}, expected {:?}",
+                typed_arg.ty, param_ty
+            )));
         }
+        typed = TypedExpr {
+            ty: rest_ty,
+            kind: TypedExprKind::Apply {
+                callee: Box::new(typed),
+                arg: Box::new(typed_arg),
+            },
+        };
+    }
+    if let Some(expected_ty) = expected {
+        if &typed.ty != expected_ty {
+            return Err(SimdError::new(format!(
+                "application has type {:?}, expected {:?}",
+                typed.ty, expected_ty
+            )));
+        }
+    }
+    Ok(typed)
+}
+
+fn infer_direct_function_call(
+    head: &Expr,
+    args_exprs: &[&Expr],
+    context: &TypeContext<'_>,
+    expected: Option<&Type>,
+) -> Result<Option<TypedExpr>> {
+    let Expr::Ref(reference) = head else {
+        return Ok(None);
     };
-    let name = resolve_signature_name(raw_name, context).ok_or_else(|| {
-        SimdError::new(format!(
-            "unknown function '{}'{}",
-            raw_name,
-            render_import_resolution_suffix(raw_name, context)
-        ))
-    })?;
+    let Some(name) = resolve_ref_name(reference, context) else {
+        return Ok(None);
+    };
     let signature = context
         .signatures
         .get(&name)
         .ok_or_else(|| SimdError::new(format!("unknown function '{}'", name)))?;
-    let (param_types, ret_type) = signature.ty.fun_parts();
-    if args_exprs.len() != param_types.len() {
+    let (param_types, ret_type) = instantiate_call_signature(
+        signature,
+        &reference.type_args,
+        args_exprs,
+        context,
+        expected,
+    )?;
+    if args_exprs.len() > param_types.len() {
         return Err(SimdError::new(format!(
             "function '{}' expects {} arguments, found {}",
-            name,
+            render_ref_expr(reference),
             param_types.len(),
             args_exprs.len()
         )));
+    }
+    if args_exprs.len() < param_types.len() {
+        let mut typed = infer_ref_expr(reference, context, None)?;
+        for (expr_arg, param_ty) in args_exprs.iter().zip(param_types.iter()) {
+            let typed_arg = infer_expr(expr_arg, context, Some(param_ty))?;
+            typed = TypedExpr {
+                ty: match &typed.ty {
+                    Type::Fun(params, ret) if !params.is_empty() => {
+                        if typed_arg.ty != params[0] {
+                            return Err(SimdError::new(format!(
+                                "application argument has type {:?}, expected {:?}",
+                                typed_arg.ty, params[0]
+                            )));
+                        }
+                        if params.len() == 1 {
+                            ret.as_ref().clone()
+                        } else {
+                            Type::Fun(params[1..].to_vec(), ret.clone())
+                        }
+                    }
+                    other => {
+                        return Err(SimdError::new(format!(
+                            "cannot apply non-function value of type {:?}",
+                            other
+                        )));
+                    }
+                },
+                kind: TypedExprKind::Apply {
+                    callee: Box::new(typed),
+                    arg: Box::new(typed_arg),
+                },
+            };
+        }
+        return Ok(Some(typed));
     }
     let mut dim_subst = BTreeMap::<String, Dim>::new();
     let mut lifted_shape: Option<Shape> = None;
@@ -2261,48 +2644,123 @@ fn infer_function_call(
             )));
         }
     }
-    Ok(TypedExpr {
+    Ok(Some(TypedExpr {
         ty,
         kind: TypedExprKind::Call {
             callee: Callee::Function(name),
             args,
             lifted_shape,
         },
-    })
+    }))
 }
 
-fn resolve_signature_name(name: &str, context: &TypeContext<'_>) -> Option<String> {
-    if context.signatures.contains_key(name) {
-        return Some(name.to_string());
+fn resolve_ref_name(reference: &RefExpr, context: &TypeContext<'_>) -> Option<String> {
+    if reference.alias.is_none() && context.signatures.contains_key(&reference.name) {
+        return Some(reference.name.clone());
     }
-    let (alias, member) = split_qualified_name(name)?;
+    let alias = reference.alias.as_ref()?;
     let path = context.imports.get(alias)?;
-    let qualified = format!("{}/{}", path, member);
+    let qualified = format!("{}/{}", path, reference.name);
     if context.signatures.contains_key(&qualified) {
-        return Some(qualified);
+        return Some(qualified.clone());
     }
-    if context.signatures.contains_key(member) {
-        return Some(member.to_string());
+    if context.signatures.contains_key(&reference.name) {
+        return Some(reference.name.clone());
     }
     None
 }
 
-fn render_import_resolution_suffix(name: &str, context: &TypeContext<'_>) -> String {
-    let Some((alias, member)) = split_qualified_name(name) else {
+fn render_ref_resolution_suffix(reference: &RefExpr, context: &TypeContext<'_>) -> String {
+    let Some(alias) = &reference.alias else {
         return String::new();
     };
     let Some(path) = context.imports.get(alias) else {
         return String::new();
     };
-    format!(" (import '{}' resolves to '{}/{}')", alias, path, member)
+    format!(
+        " (import '{}' resolves to '{}/{}')",
+        alias, path, reference.name
+    )
 }
 
-fn split_qualified_name(name: &str) -> Option<(&str, &str)> {
-    let (alias, member) = name.split_once('/')?;
-    if alias.is_empty() || member.is_empty() || member.contains('/') {
-        return None;
+fn render_ref_expr(reference: &RefExpr) -> String {
+    let mut out = String::new();
+    if let Some(alias) = &reference.alias {
+        out.push_str(alias);
+        out.push('\\');
     }
-    Some((alias, member))
+    out.push_str(&reference.name);
+    for type_arg in &reference.type_args {
+        out.push('\\');
+        match type_arg {
+            TypeArg::Prim(prim) => out.push_str(match prim {
+                Prim::I32 => "i32",
+                Prim::I64 => "i64",
+                Prim::F32 => "f32",
+                Prim::F64 => "f64",
+            }),
+            TypeArg::Name(name) => out.push_str(name),
+        }
+    }
+    out
+}
+
+fn instantiate_ref_type(ty: &Type, type_args: &[TypeArg]) -> Result<Type> {
+    let vars = collect_type_vars_in_order(ty);
+    if type_args.is_empty() {
+        return Ok(ty.clone());
+    }
+    if vars.len() != type_args.len() {
+        return Err(SimdError::new(format!(
+            "explicit specialization expects {} type arguments, found {}",
+            vars.len(),
+            type_args.len()
+        )));
+    }
+    let subst = vars
+        .into_iter()
+        .zip(type_args.iter())
+        .map(|(name, arg)| {
+            let ty = match arg {
+                TypeArg::Prim(prim) => Type::Scalar(*prim),
+                TypeArg::Name(name) => Type::Var(name.clone()),
+            };
+            (name, ty)
+        })
+        .collect::<BTreeMap<_, _>>();
+    Ok(apply_type_subst(ty, &subst))
+}
+
+fn instantiate_call_signature(
+    signature: &Signature,
+    explicit_type_args: &[TypeArg],
+    args_exprs: &[&Expr],
+    context: &TypeContext<'_>,
+    expected: Option<&Type>,
+) -> Result<(Vec<Type>, Type)> {
+    let (mut params, mut ret) = signature.ty.fun_parts();
+    if !explicit_type_args.is_empty() {
+        let specialized = instantiate_ref_type(&signature.ty, explicit_type_args)?;
+        return Ok(specialized.fun_parts());
+    }
+    let vars = collect_type_vars_in_order(&signature.ty);
+    if vars.is_empty() {
+        return Ok((params, ret));
+    }
+    let mut subst = BTreeMap::<String, Type>::new();
+    for (expr_arg, param_ty) in args_exprs.iter().zip(params.iter()) {
+        let typed_arg = infer_expr(expr_arg, context, None)?;
+        unify_type_template(param_ty, &typed_arg.ty, &mut subst)?;
+    }
+    if let Some(expected_ty) = expected {
+        unify_type_template(&ret, expected_ty, &mut subst)?;
+    }
+    params = params
+        .into_iter()
+        .map(|ty| apply_type_subst(&ty, &subst))
+        .collect();
+    ret = apply_type_subst(&ret, &subst);
+    Ok((params, ret))
 }
 
 fn infer_primitive_call(
@@ -2378,6 +2836,16 @@ fn infer_primitive_signature(
     right: &Type,
 ) -> Result<(AccessKind, AccessKind, Type)> {
     match (left, right) {
+        (Type::Var(left_name), Type::Var(right_name)) if left_name == right_name => Ok((
+            AccessKind::Same,
+            AccessKind::Same,
+            match op {
+                PrimOp::Eq | PrimOp::Lt | PrimOp::Gt | PrimOp::Le | PrimOp::Ge => {
+                    Type::Scalar(Prim::I64)
+                }
+                _ => Type::Var(left_name.clone()),
+            },
+        )),
         (Type::Scalar(left_prim), Type::Scalar(right_prim)) if left_prim == right_prim => {
             ensure_valid_primitive_prim(op, *left_prim)?;
             let result = primitive_result_type(op, *left_prim);
@@ -2463,6 +2931,8 @@ fn unify_lifted_shape(slot: &mut Option<Shape>, shape: &Shape) -> Result<()> {
 fn lift_type_over_shape(ty: &Type, shape: &Shape) -> Result<Type> {
     match ty {
         Type::Scalar(prim) => Ok(Type::Bulk(*prim, shape.clone())),
+        Type::Var(name) => Ok(Type::Var(name.clone())),
+        Type::Infer(index) => Ok(Type::Infer(*index)),
         Type::Record(fields) => Ok(Type::Record(
             fields
                 .iter()
@@ -2480,6 +2950,7 @@ fn lift_type_over_shape(ty: &Type, shape: &Shape) -> Result<Type> {
 
 fn unify_lifted_type(slot: &mut Option<Shape>, param: &Type, actual: &Type) -> Result<()> {
     match (param, actual) {
+        (Type::Var(_), _) | (Type::Infer(_), _) => Ok(()),
         (Type::Scalar(left), Type::Bulk(right, shape)) if left == right => {
             unify_lifted_shape(slot, shape)
         }
@@ -2508,6 +2979,8 @@ fn unify_param_type(
     dim_subst: &mut BTreeMap<String, Dim>,
 ) -> Result<()> {
     match (param, actual) {
+        (Type::Var(_), _) => Ok(()),
+        (Type::Infer(_), _) => Ok(()),
         (Type::Scalar(left), Type::Scalar(right)) if left == right => Ok(()),
         (Type::Bulk(left_prim, left_shape), Type::Bulk(right_prim, right_shape))
             if left_prim == right_prim && left_shape.0.len() == right_shape.0.len() =>
@@ -2547,6 +3020,14 @@ fn unify_param_type(
             }
             Ok(())
         }
+        (Type::Fun(left_args, left_ret), Type::Fun(right_args, right_ret))
+            if left_args.len() == right_args.len() =>
+        {
+            for (left_arg, right_arg) in left_args.iter().zip(right_args) {
+                unify_param_type(left_arg, right_arg, dim_subst)?;
+            }
+            unify_param_type(left_ret, right_ret, dim_subst)
+        }
         _ => Err(SimdError::new(format!(
             "expected argument type {:?}, found {:?}",
             param, actual
@@ -2556,7 +3037,7 @@ fn unify_param_type(
 
 fn apply_dim_subst(ty: &Type, subst: &BTreeMap<String, Dim>) -> Type {
     match ty {
-        Type::Scalar(_) => ty.clone(),
+        Type::Scalar(_) | Type::Var(_) | Type::Infer(_) => ty.clone(),
         Type::Bulk(prim, shape) => Type::Bulk(
             *prim,
             Shape(
@@ -2617,7 +3098,13 @@ fn visit_tail_calls(
     valid: &mut bool,
 ) {
     match &expr.kind {
-        TypedExprKind::Local(_) | TypedExprKind::Int(_, _) | TypedExprKind::Float(_, _) => {}
+        TypedExprKind::Local(_)
+        | TypedExprKind::FunctionRef { .. }
+        | TypedExprKind::Int(_, _)
+        | TypedExprKind::Float(_, _) => {}
+        TypedExprKind::Lambda { body, .. } => {
+            visit_tail_calls(body, self_name, false, recursive, valid);
+        }
         TypedExprKind::Let { bindings, body } => {
             for binding in bindings {
                 visit_tail_calls(&binding.expr, self_name, false, recursive, valid);
@@ -2648,6 +3135,11 @@ fn visit_tail_calls(
             for arg in args {
                 visit_tail_calls(&arg.expr, self_name, false, recursive, valid);
             }
+        }
+        TypedExprKind::Apply { callee, arg } => {
+            visit_tail_calls(callee, self_name, false, recursive, valid);
+            visit_tail_calls(arg, self_name, false, recursive, valid);
+            *valid = false;
         }
     }
 }
@@ -2859,6 +3351,13 @@ fn normalize_expr_to_leaf(
                 kind: TypedExprKind::Float(*value, *prim),
             })
         }
+        TypedExprKind::FunctionRef { .. }
+        | TypedExprKind::Lambda { .. }
+        | TypedExprKind::Apply { .. } => {
+            return Err(SimdError::new(
+                "record normalization does not yet support higher-order expressions",
+            ));
+        }
         TypedExprKind::Let { bindings, body } => {
             let mut normalized_bindings = Vec::<TypedLetBinding>::new();
             let mut local_leaves = locals.clone();
@@ -3008,6 +3507,9 @@ fn lookup_leaf_type(ty: &Type, path: &LeafPath) -> Result<Type> {
                 "record type {:?} requires a concrete leaf path",
                 ty
             ))),
+            Type::Var(_) | Type::Infer(_) => Err(SimdError::new(
+                "unresolved type variables cannot appear as normalized leaves",
+            )),
             Type::Fun(_, _) => Err(SimdError::new(
                 "function type cannot appear as a normalized leaf",
             )),
@@ -3044,7 +3546,10 @@ fn collect_typed_local_names(expr: &TypedExpr, names: &mut BTreeSet<String>) {
         TypedExprKind::Local(name) => {
             names.insert(name.clone());
         }
-        TypedExprKind::Int(_, _) | TypedExprKind::Float(_, _) => {}
+        TypedExprKind::FunctionRef { .. }
+        | TypedExprKind::Int(_, _)
+        | TypedExprKind::Float(_, _) => {}
+        TypedExprKind::Lambda { body, .. } => collect_typed_local_names(body, names),
         TypedExprKind::Let { bindings, body } => {
             for binding in bindings {
                 collect_typed_local_names(&binding.expr, names);
@@ -3067,6 +3572,10 @@ fn collect_typed_local_names(expr: &TypedExpr, names: &mut BTreeSet<String>) {
             for arg in args {
                 collect_typed_local_names(&arg.expr, names);
             }
+        }
+        TypedExprKind::Apply { callee, arg } => {
+            collect_typed_local_names(callee, names);
+            collect_typed_local_names(arg, names);
         }
     }
 }
@@ -3616,6 +4125,7 @@ fn lower_function(function: &NormalizedFunction) -> Result<LoweredFunction> {
             Type::Scalar(_) => AccessKind::Same,
             Type::Bulk(_, _) => AccessKind::Lane,
             Type::Record(_) => AccessKind::Same,
+            Type::Var(_) | Type::Infer(_) => AccessKind::Same,
             Type::Fun(_, _) => AccessKind::Same,
         })
         .collect();
@@ -3646,6 +4156,12 @@ fn lower_function(function: &NormalizedFunction) -> Result<LoweredFunction> {
             return Err(SimdError::new(
                 "normalized lowering encountered an unexpected record result",
             ));
+        }
+        Type::Var(_) | Type::Infer(_) => {
+            return Err(SimdError::new(format!(
+                "function '{}' still contains unresolved polymorphic types during lowering",
+                function.name
+            )));
         }
         Type::Fun(_, _) => {
             return Err(SimdError::new(format!(
@@ -3786,6 +4302,11 @@ fn lower_expr_to_ir(
             ty: Type::Scalar(*prim),
             kind: IrExprKind::Float(*value, *prim),
         }),
+        TypedExprKind::FunctionRef { .. }
+        | TypedExprKind::Lambda { .. }
+        | TypedExprKind::Apply { .. } => Err(SimdError::new(
+            "higher-order expressions are not supported by loop lowering",
+        )),
         TypedExprKind::Let { bindings, body } => {
             let mut lowered_bindings = Vec::new();
             let mut extended_locals = locals.clone();
@@ -3846,9 +4367,28 @@ fn lower_expr_to_ir(
 
 #[derive(Clone)]
 enum Binding<'a> {
-    Ready(Value),
+    Ready(EvalValue<'a>),
     Thunk {
         expr: &'a TypedExpr,
+        env: Rc<Env<'a>>,
+    },
+}
+
+#[derive(Clone)]
+enum EvalValue<'a> {
+    Host(Value),
+    Closure(Closure<'a>),
+}
+
+#[derive(Clone)]
+enum Closure<'a> {
+    Function {
+        name: String,
+        bound_args: Vec<Binding<'a>>,
+    },
+    Lambda {
+        param: String,
+        body: &'a TypedExpr,
         env: Rc<Env<'a>>,
     },
 }
@@ -3920,15 +4460,18 @@ impl<'a> Evaluator<'a> {
                 args.len()
             )));
         }
-        let bindings = args.into_iter().map(Binding::Ready).collect();
-        self.call_function(function, bindings)
+        let bindings = args
+            .into_iter()
+            .map(|value| Binding::Ready(EvalValue::Host(value)))
+            .collect();
+        self.expect_host_value(self.call_function(function, bindings)?)
     }
 
     fn call_function(
         &self,
         function: &'a CheckedFunction,
         args: Vec<Binding<'a>>,
-    ) -> Result<Value> {
+    ) -> Result<EvalValue<'a>> {
         for clause in &function.clauses {
             if let Some(env) = self.match_clause(clause, &args)? {
                 let env = Rc::new(env);
@@ -3968,13 +4511,15 @@ impl<'a> Evaluator<'a> {
                 Ok(true)
             }
             Pattern::Int(expected) => {
-                let Value::Scalar(value) = self.force_binding(binding)? else {
+                let Value::Scalar(value) = self.expect_host_value(self.force_binding(binding)?)?
+                else {
                     return Err(SimdError::new("literal pattern cannot match bulk input"));
                 };
                 Ok(matches_int_pattern(*expected, &value))
             }
             Pattern::Float(expected) => {
-                let Value::Scalar(value) = self.force_binding(binding)? else {
+                let Value::Scalar(value) = self.expect_host_value(self.force_binding(binding)?)?
+                else {
                     return Err(SimdError::new("literal pattern cannot match bulk input"));
                 };
                 Ok(matches_float_pattern(*expected, &value))
@@ -3982,14 +4527,23 @@ impl<'a> Evaluator<'a> {
         }
     }
 
-    fn force_binding(&self, binding: &Binding<'a>) -> Result<Value> {
+    fn force_binding(&self, binding: &Binding<'a>) -> Result<EvalValue<'a>> {
         match binding {
             Binding::Ready(value) => Ok(value.clone()),
             Binding::Thunk { expr, env } => self.eval_expr(expr, env),
         }
     }
 
-    fn eval_expr(&self, expr: &'a TypedExpr, env: &Rc<Env<'a>>) -> Result<Value> {
+    fn expect_host_value(&self, value: EvalValue<'a>) -> Result<Value> {
+        match value {
+            EvalValue::Host(value) => Ok(value),
+            EvalValue::Closure(_) => Err(SimdError::new(
+                "function values cannot cross the host evaluation boundary",
+            )),
+        }
+    }
+
+    fn eval_expr(&self, expr: &'a TypedExpr, env: &Rc<Env<'a>>) -> Result<EvalValue<'a>> {
         match &expr.kind {
             TypedExprKind::Local(name) => {
                 let binding = env
@@ -3997,8 +4551,21 @@ impl<'a> Evaluator<'a> {
                     .ok_or_else(|| SimdError::new(format!("unknown local '{}'", name)))?;
                 self.force_binding(binding)
             }
-            TypedExprKind::Int(value, prim) => Ok(Value::Scalar(make_int_value(*value, *prim)?)),
-            TypedExprKind::Float(value, prim) => Ok(Value::Scalar(make_float_value(*value, *prim))),
+            TypedExprKind::FunctionRef { name } => Ok(EvalValue::Closure(Closure::Function {
+                name: name.clone(),
+                bound_args: Vec::new(),
+            })),
+            TypedExprKind::Int(value, prim) => Ok(EvalValue::Host(Value::Scalar(make_int_value(
+                *value, *prim,
+            )?))),
+            TypedExprKind::Float(value, prim) => Ok(EvalValue::Host(Value::Scalar(
+                make_float_value(*value, *prim),
+            ))),
+            TypedExprKind::Lambda { param, body } => Ok(EvalValue::Closure(Closure::Lambda {
+                param: param.clone(),
+                body,
+                env: env.clone(),
+            })),
             TypedExprKind::Let { bindings, body } => {
                 let mut scope = (**env).clone();
                 for binding in bindings {
@@ -4016,30 +4583,63 @@ impl<'a> Evaluator<'a> {
                 }
                 self.eval_expr(body, &Rc::new(scope))
             }
-            TypedExprKind::Record(fields) => Ok(Value::Record(
+            TypedExprKind::Record(fields) => Ok(EvalValue::Host(Value::Record(
                 fields
                     .iter()
-                    .map(|(name, expr)| Ok((name.clone(), self.eval_expr(expr, env)?)))
+                    .map(|(name, expr)| {
+                        Ok((
+                            name.clone(),
+                            self.expect_host_value(self.eval_expr(expr, env)?)?,
+                        ))
+                    })
                     .collect::<Result<BTreeMap<_, _>>>()?,
-            )),
+            ))),
             TypedExprKind::Project { base, field } => {
-                let Value::Record(fields) = self.eval_expr(base, env)? else {
+                let Value::Record(fields) = self.expect_host_value(self.eval_expr(base, env)?)?
+                else {
                     return Err(SimdError::new(
                         "record projection evaluated a non-record base",
                     ));
                 };
-                fields.get(field).cloned().ok_or_else(|| {
-                    SimdError::new(format!("record field '{}' does not exist", field))
-                })
+                fields
+                    .get(field)
+                    .cloned()
+                    .map(EvalValue::Host)
+                    .ok_or_else(|| {
+                        SimdError::new(format!("record field '{}' does not exist", field))
+                    })
             }
             TypedExprKind::RecordUpdate { base, fields } => {
-                let Value::Record(mut base_fields) = self.eval_expr(base, env)? else {
+                let Value::Record(mut base_fields) =
+                    self.expect_host_value(self.eval_expr(base, env)?)?
+                else {
                     return Err(SimdError::new("record update evaluated a non-record base"));
                 };
                 for (name, expr) in fields {
-                    base_fields.insert(name.clone(), self.eval_expr(expr, env)?);
+                    base_fields.insert(
+                        name.clone(),
+                        self.expect_host_value(self.eval_expr(expr, env)?)?,
+                    );
                 }
-                Ok(Value::Record(base_fields))
+                Ok(EvalValue::Host(Value::Record(base_fields)))
+            }
+            TypedExprKind::Apply { callee, arg } => {
+                let closure = match self.eval_expr(callee, env)? {
+                    EvalValue::Closure(closure) => closure,
+                    EvalValue::Host(value) => {
+                        return Err(SimdError::new(format!(
+                            "cannot apply non-function runtime value {:?}",
+                            value
+                        )));
+                    }
+                };
+                self.apply_closure(
+                    closure,
+                    Binding::Thunk {
+                        expr: arg,
+                        env: env.clone(),
+                    },
+                )
             }
             TypedExprKind::Call {
                 callee,
@@ -4052,23 +4652,51 @@ impl<'a> Evaluator<'a> {
         }
     }
 
+    fn apply_closure(&self, closure: Closure<'a>, arg: Binding<'a>) -> Result<EvalValue<'a>> {
+        match closure {
+            Closure::Function {
+                name,
+                mut bound_args,
+            } => {
+                bound_args.push(arg);
+                let function = self
+                    .functions
+                    .get(&name)
+                    .copied()
+                    .ok_or_else(|| SimdError::new(format!("unknown function '{}'", name)))?;
+                if bound_args.len() == function.signature.ty.arity() {
+                    self.call_function(function, bound_args)
+                } else {
+                    Ok(EvalValue::Closure(Closure::Function { name, bound_args }))
+                }
+            }
+            Closure::Lambda { param, body, env } => {
+                let mut scope = (*env).clone();
+                scope.insert(param, arg);
+                self.eval_expr(body, &Rc::new(scope))
+            }
+        }
+    }
+
     fn eval_scalar_call(
         &self,
         callee: &Callee,
         args: &'a [TypedArg],
         env: &Rc<Env<'a>>,
-    ) -> Result<Value> {
+    ) -> Result<EvalValue<'a>> {
         match callee {
             Callee::Prim(op) => {
                 let mut values = Vec::new();
                 for arg in args {
-                    let value = self.eval_expr(&arg.expr, env)?;
+                    let value = self.expect_host_value(self.eval_expr(&arg.expr, env)?)?;
                     let Value::Scalar(value) = value else {
                         return Err(SimdError::new("primitive scalar call received bulk input"));
                     };
                     values.push(value);
                 }
-                Ok(Value::Scalar(apply_primitive(*op, &values[0], &values[1])?))
+                Ok(EvalValue::Host(Value::Scalar(apply_primitive(
+                    *op, &values[0], &values[1],
+                )?)))
             }
             Callee::Function(name) => {
                 let function = self
@@ -4093,11 +4721,11 @@ impl<'a> Evaluator<'a> {
         callee: &Callee,
         args: &'a [TypedArg],
         env: &Rc<Env<'a>>,
-    ) -> Result<Value> {
+    ) -> Result<EvalValue<'a>> {
         let mut same_args = Vec::<Value>::new();
         let mut lane_args = Vec::<Value>::new();
         for arg in args {
-            let value = self.eval_expr(&arg.expr, env)?;
+            let value = self.expect_host_value(self.eval_expr(&arg.expr, env)?)?;
             match (arg.mode, value_lift_shape(&value), value) {
                 (AccessKind::Same, None, value) => same_args.push(value),
                 (AccessKind::Lane, Some(_), value) => lane_args.push(value),
@@ -4152,14 +4780,16 @@ impl<'a> Evaluator<'a> {
             for arg in args {
                 match arg.mode {
                     AccessKind::Same => {
-                        scalar_args.push(Binding::Ready(same_args[same_index].clone()));
+                        scalar_args.push(Binding::Ready(EvalValue::Host(
+                            same_args[same_index].clone(),
+                        )));
                         same_index += 1;
                     }
                     AccessKind::Lane => {
-                        scalar_args.push(Binding::Ready(extract_lifted_lane(
+                        scalar_args.push(Binding::Ready(EvalValue::Host(extract_lifted_lane(
                             &lane_args[lane_index],
                             offset,
-                        )?));
+                        )?)));
                         lane_index += 1;
                     }
                 }
@@ -4169,7 +4799,7 @@ impl<'a> Evaluator<'a> {
                     let scalars = scalar_args
                         .into_iter()
                         .map(|binding| match binding {
-                            Binding::Ready(Value::Scalar(value)) => value,
+                            Binding::Ready(EvalValue::Host(Value::Scalar(value))) => value,
                             _ => unreachable!(),
                         })
                         .collect::<Vec<_>>();
@@ -4180,13 +4810,17 @@ impl<'a> Evaluator<'a> {
                         self.functions.get(name).copied().ok_or_else(|| {
                             SimdError::new(format!("unknown function '{}'", name))
                         })?;
-                    self.call_function(function, scalar_args)?
+                    self.expect_host_value(self.call_function(function, scalar_args)?)?
                 }
             };
             lane_results.push(value);
         }
 
-        collect_lifted_value(&lane_results, &scalar_result_ty, &shape)
+        Ok(EvalValue::Host(collect_lifted_value(
+            &lane_results,
+            &scalar_result_ty,
+            &shape,
+        )?))
     }
 }
 
@@ -4835,6 +5469,9 @@ fn value_from_json(
             }
             Ok(Value::Record(record))
         }
+        Type::Var(_) | Type::Infer(_) => Err(SimdError::new(
+            "host JSON cannot provide values for unresolved polymorphic types",
+        )),
         Type::Fun(_, _) => Err(SimdError::new("host JSON cannot provide function values")),
     }
 }
@@ -5277,11 +5914,20 @@ mod tests {
     #[test]
     fn parses_import_and_qualified_call() {
         let program = parse_source(
-            "import math/scalar as scalar\naxpy : i64 -> i64 -> i64 -> i64\naxpy a x y = a * x + y\nmain : i64 -> i64[n] -> i64[n] -> i64[n]\nmain a xs ys = scalar/axpy a xs ys\n",
+            "import math/scalar as scalar\naxpy : i64 -> i64 -> i64 -> i64\naxpy a x y = a * x + y\nmain : i64 -> i64[n] -> i64[n] -> i64[n]\nmain a xs ys = scalar\\axpy a xs ys\n",
         )
         .unwrap();
         assert_eq!(program.decls.len(), 5);
         assert!(matches!(program.decls[0], Decl::Import(_)));
+    }
+
+    #[test]
+    fn parses_lambda_and_specialized_refs() {
+        let program = parse_source(
+            "main : i64 -> i64\nmain x = apply (id\\i64) (\\y -> y) x\napply : (i64 -> i64) -> i64 -> i64\napply f x = f x\nid : t -> t\nid y = y\n",
+        )
+        .unwrap();
+        assert_eq!(program.decls.len(), 6);
     }
 
     #[test]
@@ -5337,7 +5983,7 @@ mod tests {
 
     #[test]
     fn evaluates_qualified_alias_call() {
-        let src = "import math/scalar as scalar\naxpy : i64 -> i64 -> i64 -> i64\naxpy a x y = a * x + y\nmain : i64 -> i64[n] -> i64[n] -> i64[n]\nmain a xs ys = scalar/axpy a xs ys\n";
+        let src = "import math/scalar as scalar\naxpy : i64 -> i64 -> i64 -> i64\naxpy a x y = a * x + y\nmain : i64 -> i64[n] -> i64[n] -> i64[n]\nmain a xs ys = scalar\\axpy a xs ys\n";
         assert_eq!(run(src, "main", "[2,[1,2,3],[10,20,30]]"), "[12,24,36]");
     }
 
@@ -5374,9 +6020,48 @@ mod tests {
     }
 
     #[test]
+    fn rejects_unspecialized_polymorphic_value_ref() {
+        let error = run_main(
+            "id : t -> t\nid x = x\nmain : i64 -> i64\nmain x = let f = id in f x\n",
+            "main",
+            "[7]",
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("requires explicit specialization in value position")
+        );
+    }
+
+    #[test]
     fn let_wildcard_has_zero_demand() {
         let src =
             "trap : i64 -> i64\ntrap 0 = 0\nmain : i64 -> i64\nmain x = let _ = trap 1 in x\n";
+        assert_eq!(run(src, "main", "[7]"), "7");
+    }
+
+    #[test]
+    fn evaluates_lambda_through_higher_order_argument() {
+        let src = "apply : (i64 -> i64) -> i64 -> i64\napply f x = f x\nmain : i64 -> i64\nmain x = apply (\\y -> y + 1) x\n";
+        assert_eq!(run(src, "main", "[7]"), "8");
+    }
+
+    #[test]
+    fn evaluates_partial_application_of_top_level_function() {
+        let src = "add : i64 -> i64 -> i64\nadd x y = x + y\napply : (i64 -> i64) -> i64 -> i64\napply f x = f x\nmain : i64 -> i64\nmain x = let inc = add 1 in apply inc x\n";
+        assert_eq!(run(src, "main", "[7]"), "8");
+    }
+
+    #[test]
+    fn evaluates_inferred_top_level_polymorphism() {
+        let src = "square : t -> t\nsquare x = x * x\nmain : i64 -> i64\nmain x = square x\n";
+        assert_eq!(run(src, "main", "[7]"), "49");
+    }
+
+    #[test]
+    fn evaluates_explicit_specialization_in_value_position() {
+        let src = "id : t -> t\nid x = x\nmain : i64 -> i64\nmain x = let f = id\\i64 in f x\n";
         assert_eq!(run(src, "main", "[7]"), "7");
     }
 
@@ -5563,9 +6248,33 @@ mod tests {
     }
 
     #[test]
-    fn shader_prelude_example_compiles() {
-        let source = include_str!("../examples/shader_prelude_f32.simd");
-        let compiled = compile_source(source).expect("shader prelude should compile");
+    fn prelude_example_compiles() {
+        let source = include_str!("../examples/prelude.simd");
+        let compiled = compile_source(source).expect("prelude should compile");
         assert!(!compiled.checked.functions.is_empty());
+    }
+
+    #[test]
+    fn prelude_step_behaves_for_natural_numbers() {
+        let prelude = include_str!("../examples/prelude.simd");
+        let source = format!("{prelude}\nmain : i64 -> i64 -> i64\nmain edge x = step edge x\n");
+        assert_eq!(
+            run_main(&source, "main", "[3,2]")
+                .expect("step should run")
+                .to_json_string(),
+            "0"
+        );
+        assert_eq!(
+            run_main(&source, "main", "[3,3]")
+                .expect("step should run")
+                .to_json_string(),
+            "1"
+        );
+        assert_eq!(
+            run_main(&source, "main", "[3,9]")
+                .expect("step should run")
+                .to_json_string(),
+            "1"
+        );
     }
 }

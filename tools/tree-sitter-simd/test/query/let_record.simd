@@ -1,0 +1,2 @@
+main : {x:i64,y:i64} -> {x:i64,y:i64}
+main p = let q = p { x = 3 }; r = q.x in r
