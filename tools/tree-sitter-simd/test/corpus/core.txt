@@ -258,9 +258,9 @@ main x = scalar\axpy\i64 x
                         head: (identifier)
                         segment: (identifier)
                         segment: (prim_type)))))
-                    argument: (postfix_expr
-                      (atom
-                        (identifier)))))))))))
+                argument: (postfix_expr
+                  (atom
+                    (identifier)))))))))))
 
 ==================
 type alias declaration
@@ -316,6 +316,7 @@ operator instance declarations
     (signature
       head: (decl_head
         (operator_head
+          operator: (prim_operator)
           segment: (identifier)
           segment: (identifier)))
       type: (type
@@ -346,6 +347,7 @@ operator instance declarations
     (clause
       head: (decl_head
         (operator_head
+          operator: (prim_operator)
           segment: (identifier)
           segment: (identifier)))
       pattern: (pattern

@@ -1,8 +1,8 @@
 use std::fs;
 
 use crate::{
-    Clause, Decl, Expr, ImportDecl, LetBinding, OperatorInstanceSpec, Pattern, Prim, PrimOp,
-    RefExpr, Result, Shape, Signature, SimdError, SurfaceProgram, Type, TypeAliasDecl,
+    Clause, Decl, Expr, FamilyDecl, ImportDecl, LetBinding, OperatorInstanceSpec, Pattern, Prim,
+    PrimOp, RefExpr, Result, Shape, Signature, SimdError, SurfaceProgram, Type, TypeAliasDecl,
     parse_source, read_source_file,
 };
 
@@ -47,6 +47,9 @@ pub fn format_program(program: &SurfaceProgram) -> String {
                 (Decl::Import(_), Decl::Import(_)) => "\n",
                 (Decl::Import(_), _) => "\n\n",
                 (_, Decl::Import(_)) => "\n\n",
+                (Decl::Family(_), Decl::Family(_)) => "\n",
+                (Decl::Family(_), _) => "\n\n",
+                (_, Decl::Family(_)) => "\n\n",
                 (Decl::TypeAlias(_), Decl::TypeAlias(_)) => "\n",
                 (Decl::TypeAlias(_), _) => "\n\n",
                 (_, Decl::TypeAlias(_)) => "\n\n",
@@ -73,6 +76,7 @@ fn normalize_for_compare(source: &str) -> String {
 fn format_decl(decl: &Decl) -> String {
     match decl {
         Decl::Import(import_decl) => format_import(import_decl),
+        Decl::Family(family) => format_family_decl(family),
         Decl::TypeAlias(alias) => format_type_alias(alias),
         Decl::Signature(signature) => format_signature(signature),
         Decl::Clause(clause) => format_clause(clause),
@@ -81,6 +85,14 @@ fn format_decl(decl: &Decl) -> String {
 
 fn format_import(import_decl: &ImportDecl) -> String {
     format!("import {} as {}", import_decl.path, import_decl.alias)
+}
+
+fn format_family_decl(family: &FamilyDecl) -> String {
+    let head = match family.op {
+        Some(op) => format!("({})", format_prim_op(op)),
+        None => family.name.clone(),
+    };
+    format!("family {} : {}", head, format_type(&family.ty))
 }
 
 fn format_type_alias(alias: &TypeAliasDecl) -> String {
@@ -195,6 +207,7 @@ fn format_expr(expr: &Expr, min_prec: u8) -> String {
         Expr::Ref(reference) => format_ref_expr(reference),
         Expr::Int(value) => value.to_string(),
         Expr::Float(value) => super::format_float(*value),
+        Expr::String(value) => format_string_literal(value),
         Expr::Lambda { param, body } => {
             format!("\\{} -> {}", param, format_expr(body, PREC_LET))
         }
@@ -295,7 +308,9 @@ fn expr_precedence(expr: &Expr) -> u8 {
         Expr::App(_, _) => PREC_APP,
         Expr::Project(_, _) | Expr::RecordUpdate { .. } => PREC_POSTFIX,
         Expr::Lambda { .. } => PREC_LET,
-        Expr::Ref(_) | Expr::Int(_) | Expr::Float(_) | Expr::Record(_) => PREC_ATOM,
+        Expr::Ref(_) | Expr::Int(_) | Expr::Float(_) | Expr::String(_) | Expr::Record(_) => {
+            PREC_ATOM
+        }
     }
 }
 
@@ -313,6 +328,22 @@ fn format_ref_expr(reference: &RefExpr) -> String {
             crate::TypeArg::Name(name) => out.push_str(name),
         }
     }
+    out
+}
+
+fn format_string_literal(value: &str) -> String {
+    let mut out = String::from("\"");
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(ch),
+        }
+    }
+    out.push('"');
     out
 }
 
@@ -401,6 +432,16 @@ mod tests {
     }
 
     #[test]
+    fn formats_family_declarations_canonically() {
+        let source = "family(+) : i64 -> i64\nfamily Eq : i64 -> i64 -> i64\n";
+        let formatted = format_source_text(source).expect("format should succeed");
+        assert_eq!(
+            formatted,
+            "family (+) : i64 -> i64\nfamily Eq : i64 -> i64 -> i64\n"
+        );
+    }
+
+    #[test]
     fn formatter_is_parse_stable() {
         let source = "axpy:i64->i64->i64->i64\naxpy a x y=a*x+y\nmain:i64->i64[n]->i64[n]->i64[n]\nmain a xs ys=axpy a xs ys\n";
         let formatted = format_source_text(source).expect("format should succeed");
@@ -442,5 +483,18 @@ mod tests {
         let source = "main : f32 -> f32 -> f32\nmain x y = x/y\n";
         let formatted = format_source_text(source).expect("format should succeed");
         assert_eq!(formatted, "main : f32 -> f32 -> f32\nmain x y = x / y\n");
+    }
+
+    #[test]
+    fn formats_string_literals_with_escapes() {
+        let source = "main : i64 -> i64\nmain x = \"a\\n\\t\\\\\\\"\"\n";
+        let formatted = format_source_text(source).expect("format should succeed");
+        assert_eq!(
+            formatted,
+            "main : i64 -> i64\nmain x = \"a\\n\\t\\\\\\\"\"\n"
+        );
+        let parsed_original = parse_source(source).expect("original parses");
+        let parsed_formatted = parse_source(&formatted).expect("formatted parses");
+        assert_eq!(parsed_original, parsed_formatted);
     }
 }

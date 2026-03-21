@@ -1104,6 +1104,11 @@ fn load_prepared_args(bound: &mut BoundPreparedRun, args: &[Value]) -> Result<()
                     "prepared flattened input should not contain record values",
                 ));
             }
+            Value::String(_) => {
+                return Err(SimdError::new(
+                    "prepared execution does not support string arguments",
+                ));
+            }
             Value::TypeToken(_) => {
                 return Err(SimdError::new(
                     "prepared execution does not support type witness runtime values",
@@ -1745,6 +1750,7 @@ fn specialize_function_instance(
         name: pending.output_name.clone(),
         ty: Type::Fun(kept_param_types, Box::new(applied_result_ty)),
         operator_instance: None,
+        family_instance: None,
     };
     if type_contains_unresolved_vars(&specialized_signature.ty) {
         return Err(SimdError::new(format!(
@@ -1913,6 +1919,7 @@ fn specialize_expr(
             _ => TypedExprKind::Float(*value, *prim),
         },
         TypedExprKind::TypeToken(prim) => TypedExprKind::TypeToken(*prim),
+        TypedExprKind::String(value) => TypedExprKind::String(value.clone()),
         TypedExprKind::Lambda { param, body } => TypedExprKind::Lambda {
             param: param.clone(),
             body: {
@@ -2078,6 +2085,11 @@ fn specialize_expr(
                 .collect::<Result<Vec<_>>>()?;
             let callee = match callee {
                 Callee::Prim(op) => Callee::Prim(*op),
+                Callee::Builtin(_) => {
+                    return Err(SimdError::new(
+                        "Wasm backend does not support builtin callee calls in specialization",
+                    ));
+                }
                 Callee::Function(name) => {
                     if let Some(inlined) = try_inline_lambda_result_call(
                         name,
@@ -2177,6 +2189,7 @@ fn extract_known_function_binding(expr: &TypedExpr) -> Option<KnownFunctionBindi
         | TypedExprKind::Call { .. }
         | TypedExprKind::Int(_, _)
         | TypedExprKind::Float(_, _)
+        | TypedExprKind::String(_)
         | TypedExprKind::TypeToken(_) => None,
     }
 }
@@ -2602,6 +2615,7 @@ fn lift_lambda_for_specialization(
                 name: lift_name.clone(),
                 ty: Type::Fun(signature_params, ret.clone()),
                 operator_instance: None,
+                family_instance: None,
             },
             clauses: vec![TypedClause {
                 patterns,
@@ -3014,6 +3028,7 @@ fn eliminate_non_escaping_lambdas_expr(
         TypedExprKind::FunctionRef { name } => TypedExprKind::FunctionRef { name: name.clone() },
         TypedExprKind::Int(value, prim) => TypedExprKind::Int(*value, *prim),
         TypedExprKind::Float(value, prim) => TypedExprKind::Float(*value, *prim),
+        TypedExprKind::String(value) => TypedExprKind::String(value.clone()),
         TypedExprKind::TypeToken(prim) => TypedExprKind::TypeToken(*prim),
         TypedExprKind::Lambda { param, body } => TypedExprKind::Lambda {
             param: param.clone(),
@@ -3227,6 +3242,7 @@ fn collect_free_locals(
         TypedExprKind::FunctionRef { .. }
         | TypedExprKind::Int(_, _)
         | TypedExprKind::Float(_, _)
+        | TypedExprKind::String(_)
         | TypedExprKind::TypeToken(_) => {}
         TypedExprKind::Lambda { param, body } => {
             let mut nested = bound.clone();
@@ -3288,6 +3304,7 @@ fn rename_free_locals(
         TypedExprKind::FunctionRef { name } => TypedExprKind::FunctionRef { name: name.clone() },
         TypedExprKind::Int(value, prim) => TypedExprKind::Int(*value, *prim),
         TypedExprKind::Float(value, prim) => TypedExprKind::Float(*value, *prim),
+        TypedExprKind::String(value) => TypedExprKind::String(value.clone()),
         TypedExprKind::TypeToken(prim) => TypedExprKind::TypeToken(*prim),
         TypedExprKind::Lambda { param, body } => {
             let mut nested = bound.clone();
@@ -3381,6 +3398,7 @@ fn collect_used_locals(expr: &TypedExpr, names: &mut BTreeSet<String>) {
         TypedExprKind::FunctionRef { .. }
         | TypedExprKind::Int(_, _)
         | TypedExprKind::Float(_, _)
+        | TypedExprKind::String(_)
         | TypedExprKind::TypeToken(_) => {}
         TypedExprKind::Lambda { body, .. } => collect_used_locals(body, names),
         TypedExprKind::Let { bindings, body } => {
@@ -3464,6 +3482,7 @@ fn canonicalize_backend_higher_order_expr(
         TypedExprKind::FunctionRef { name } => TypedExprKind::FunctionRef { name: name.clone() },
         TypedExprKind::Int(value, prim) => TypedExprKind::Int(*value, *prim),
         TypedExprKind::Float(value, prim) => TypedExprKind::Float(*value, *prim),
+        TypedExprKind::String(value) => TypedExprKind::String(value.clone()),
         TypedExprKind::TypeToken(prim) => TypedExprKind::TypeToken(*prim),
         TypedExprKind::Lambda { param, body } => TypedExprKind::Lambda {
             param: param.clone(),
@@ -3609,6 +3628,7 @@ fn classify_function_value_expr_for_backend(expr: &TypedExpr) -> FunctionValueCl
         | TypedExprKind::Call { .. } => FunctionValueClass::EscapingUnknown,
         TypedExprKind::Int(_, _)
         | TypedExprKind::Float(_, _)
+        | TypedExprKind::String(_)
         | TypedExprKind::TypeToken(_)
         | TypedExprKind::Record(_)
         | TypedExprKind::Project { .. }
@@ -4042,6 +4062,7 @@ fn collect_higher_order_expr_counts(
         TypedExprKind::Local(_)
         | TypedExprKind::Int(_, _)
         | TypedExprKind::Float(_, _)
+        | TypedExprKind::String(_)
         | TypedExprKind::TypeToken(_) => {}
     }
 }
@@ -4068,6 +4089,7 @@ fn typed_expr_contains_lambda_or_apply(expr: &TypedExpr) -> bool {
         | TypedExprKind::FunctionRef { .. }
         | TypedExprKind::Int(_, _)
         | TypedExprKind::Float(_, _)
+        | TypedExprKind::String(_)
         | TypedExprKind::TypeToken(_) => false,
     }
 }
@@ -4098,6 +4120,7 @@ fn typed_expr_contains_fun_local(expr: &TypedExpr) -> bool {
         | TypedExprKind::FunctionRef { .. }
         | TypedExprKind::Int(_, _)
         | TypedExprKind::Float(_, _)
+        | TypedExprKind::String(_)
         | TypedExprKind::TypeToken(_) => false,
     }
 }
@@ -5415,6 +5438,11 @@ fn inline_grouped_kernel_expr(
                         })
                     }
                 }
+                Callee::Builtin(_) => {
+                    return Err(SimdError::new(
+                        "Wasm grouped-kernel inlining does not support builtin calls",
+                    ));
+                }
             }
         }
     }
@@ -5501,6 +5529,7 @@ fn expr_contains_non_scalar_calls(expr: &IrExpr, scalar_indices: &BTreeMap<Strin
                         .iter()
                         .any(|arg| expr_contains_non_scalar_calls(arg, scalar_indices))
             }
+            Callee::Builtin(_) => true,
         },
     }
 }
@@ -6588,6 +6617,7 @@ fn hoist_callee_key(callee: &Callee) -> HoistCalleeKey {
     match callee {
         Callee::Prim(op) => HoistCalleeKey::Prim(prim_op_key(*op)),
         Callee::Function(name) => HoistCalleeKey::Function(name.clone()),
+        Callee::Builtin(builtin) => HoistCalleeKey::Function(format!("__builtin::{builtin:?}")),
     }
 }
 
@@ -7049,6 +7079,11 @@ fn compile_scalar_ir_expr_with_hoists(
                 })?;
                 function.instruction(&Instruction::Call(index));
             }
+            Callee::Builtin(_) => {
+                return Err(SimdError::new(
+                    "Wasm scalar codegen does not support builtin calls",
+                ));
+            }
         },
     }
     Ok(())
@@ -7313,6 +7348,7 @@ fn is_vectorizable_expr(
         }
         IrExprKind::Call { callee, args } => match callee {
             Callee::Function(_) => false,
+            Callee::Builtin(_) => false,
             Callee::Prim(op) => match op {
                 PrimOp::Add | PrimOp::Sub | PrimOp::Mul => args
                     .iter()
@@ -7675,6 +7711,11 @@ fn compile_vector_ir_expr_with_hoists(
                     args[0].ty.prim().unwrap(),
                     expr.ty.prim().unwrap_or(args[0].ty.prim().unwrap()),
                 )?;
+            }
+            Callee::Builtin(_) => {
+                return Err(SimdError::new(
+                    "vectorized kernel cannot call builtin helper",
+                ));
             }
         },
     }
@@ -8066,6 +8107,7 @@ fn build_leaf_function(
             name: leaf_export_name(&function.name, leaf_path),
             ty: Type::Fun(leaf_param_types, Box::new(leaf_result_ty)),
             operator_instance: None,
+            family_instance: None,
         },
         clauses,
         pointwise: function.pointwise,
@@ -8188,6 +8230,17 @@ fn normalize_expr_for_leaf(
             Ok(TypedExpr {
                 ty: leaf_ty,
                 kind: TypedExprKind::Float(*value, *prim),
+            })
+        }
+        TypedExprKind::String(value) => {
+            if !leaf_path.is_root() {
+                return Err(SimdError::new(
+                    "string literal cannot be projected into a record leaf",
+                ));
+            }
+            Ok(TypedExpr {
+                ty: leaf_ty,
+                kind: TypedExprKind::String(value.clone()),
             })
         }
         TypedExprKind::TypeToken(_) => Err(SimdError::new(
@@ -8333,6 +8386,11 @@ fn normalize_expr_for_leaf(
                         lifted_shape: lifted_shape.clone(),
                     },
                 })
+            }
+            Callee::Builtin(_) => {
+                return Err(SimdError::new(
+                    "Wasm normalization does not support builtin calls",
+                ));
             }
             Callee::Function(name) => {
                 let function = checked_map.get(name).copied().ok_or_else(|| {
@@ -8703,6 +8761,9 @@ fn summarize_ir_param_uses_with_lets(
                     add_usage_vec(&mut summary, &scaled);
                 }
                 summary
+            }
+            Callee::Builtin(_) => {
+                vec![UsageCount::Many; arity]
             }
         },
     }
@@ -9234,6 +9295,23 @@ fn flatten_wasm_value(
                 prim
             )));
         }
+        (Value::String(_), WasmParamAbi::Scalar { prim }) => {
+            return Err(SimdError::new(format!(
+                "Wasm scalar argument expected {:?}, found string",
+                prim
+            )));
+        }
+        (Value::String(_), WasmParamAbi::Bulk { prim }) => {
+            return Err(SimdError::new(format!(
+                "Wasm bulk argument expected {:?}, found string",
+                prim
+            )));
+        }
+        (Value::String(_), WasmParamAbi::Record { .. }) => {
+            return Err(SimdError::new(
+                "Wasm record argument expected a record value, found string",
+            ));
+        }
         (Value::TypeToken(_), WasmParamAbi::Scalar { .. })
         | (Value::TypeToken(_), WasmParamAbi::Bulk { .. }) => {
             return Err(SimdError::new(
@@ -9660,6 +9738,7 @@ mod tests {
             | TypedExprKind::FunctionRef { .. }
             | TypedExprKind::Int(_, _)
             | TypedExprKind::Float(_, _)
+            | TypedExprKind::String(_)
             | TypedExprKind::TypeToken(_) => false,
         }
     }

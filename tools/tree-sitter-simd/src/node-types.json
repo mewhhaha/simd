@@ -24,6 +24,10 @@
           {
             "type": "-",
             "named": false
+          },
+          {
+            "type": "infix_function_operator",
+            "named": true
           }
         ]
       },
@@ -119,6 +123,14 @@
         },
         {
           "type": "record_expr",
+          "named": true
+        },
+        {
+          "type": "string",
+          "named": true
+        },
+        {
+          "type": "string_type",
           "named": true
         }
       ]
@@ -231,6 +243,10 @@
       "required": true,
       "types": [
         {
+          "type": "family_instance_head",
+          "named": true
+        },
+        {
           "type": "identifier",
           "named": true
         },
@@ -251,6 +267,10 @@
       "types": [
         {
           "type": "clause",
+          "named": true
+        },
+        {
+          "type": "family_decl",
           "named": true
         },
         {
@@ -311,6 +331,88 @@
     }
   },
   {
+    "type": "family_decl",
+    "named": true,
+    "fields": {
+      "head": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "family_head",
+            "named": true
+          }
+        ]
+      },
+      "type": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "type",
+            "named": true
+          }
+        ]
+      }
+    }
+  },
+  {
+    "type": "family_head",
+    "named": true,
+    "fields": {
+      "operator": {
+        "multiple": false,
+        "required": false,
+        "types": [
+          {
+            "type": "prim_operator",
+            "named": true
+          }
+        ]
+      }
+    },
+    "children": {
+      "multiple": false,
+      "required": false,
+      "types": [
+        {
+          "type": "identifier",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "family_instance_head",
+    "named": true,
+    "fields": {
+      "name": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "identifier",
+            "named": true
+          }
+        ]
+      },
+      "segment": {
+        "multiple": true,
+        "required": true,
+        "types": [
+          {
+            "type": "identifier",
+            "named": true
+          },
+          {
+            "type": "prim_type",
+            "named": true
+          }
+        ]
+      }
+    }
+  },
+  {
     "type": "import_decl",
     "named": true,
     "fields": {
@@ -330,6 +432,26 @@
         "types": [
           {
             "type": "module_path",
+            "named": true
+          }
+        ]
+      }
+    }
+  },
+  {
+    "type": "infix_function_operator",
+    "named": true,
+    "fields": {
+      "function": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "identifier",
+            "named": true
+          },
+          {
+            "type": "qualified_ref",
             "named": true
           }
         ]
@@ -484,44 +606,8 @@
         "required": true,
         "types": [
           {
-            "type": "%",
-            "named": false
-          },
-          {
-            "type": "*",
-            "named": false
-          },
-          {
-            "type": "+",
-            "named": false
-          },
-          {
-            "type": "-",
-            "named": false
-          },
-          {
-            "type": "/",
-            "named": false
-          },
-          {
-            "type": "<",
-            "named": false
-          },
-          {
-            "type": "<=",
-            "named": false
-          },
-          {
-            "type": "==",
-            "named": false
-          },
-          {
-            "type": ">",
-            "named": false
-          },
-          {
-            "type": ">=",
-            "named": false
+            "type": "prim_operator",
+            "named": true
           }
         ]
       },
@@ -617,6 +703,11 @@
         }
       ]
     }
+  },
+  {
+    "type": "prim_operator",
+    "named": true,
+    "fields": {}
   },
   {
     "type": "prim_type",
@@ -904,6 +995,10 @@
           "named": true
         },
         {
+          "type": "string_type",
+          "named": true
+        },
+        {
           "type": "type",
           "named": true
         },
@@ -1085,6 +1180,10 @@
     "named": false
   },
   {
+    "type": "`",
+    "named": false
+  },
+  {
     "type": "as",
     "named": false
   },
@@ -1099,6 +1198,10 @@
   },
   {
     "type": "f64",
+    "named": false
+  },
+  {
+    "type": "family",
     "named": false
   },
   {
@@ -1131,6 +1234,14 @@
   },
   {
     "type": "module_path",
+    "named": true
+  },
+  {
+    "type": "string",
+    "named": true
+  },
+  {
+    "type": "string_type",
     "named": true
   },
   {

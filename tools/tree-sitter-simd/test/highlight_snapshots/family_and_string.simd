@@ -1,0 +1,7 @@
+family concat : t -> t -> t
+family (==) : t -> t -> i64
+
+concat\string x y = y
+(==)\string a b = contains a b
+main : i64
+main = "a" `concat` "b" == "ab"

@@ -14,7 +14,7 @@ use tower_lsp::{Client, LanguageServer, LspService, Server};
 
 use crate::formatter::format_type_for_display;
 use crate::{
-    Pattern, Prim, Result, SimdError, Type, TypedExpr, TypedExprKind, compile_frontend,
+    Pattern, Prim, PrimOp, Result, SimdError, Type, TypedExpr, TypedExprKind, compile_frontend,
     format_source_text, parse_source,
 };
 
@@ -235,6 +235,28 @@ fn hover_for_position(source: &str, position: Position) -> Option<Hover> {
         });
     }
 
+    if let Some(family) = module
+        .families
+        .iter()
+        .find(|family| family.name == ident.name)
+    {
+        let head = match family.op {
+            Some(op) => format!("({})", format_prim_op(op)),
+            None => family.name.clone(),
+        };
+        return Some(Hover {
+            contents: HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: format!(
+                    "```simd\nfamily {} : {}\n```",
+                    head,
+                    format_type_for_display(&family.ty)
+                ),
+            }),
+            range: Some(ident.range),
+        });
+    }
+
     if let Some(function) = module
         .functions
         .iter()
@@ -408,6 +430,13 @@ fn function_name_at_line(source: &str, line: usize) -> Option<String> {
         if index > line {
             break;
         }
+        let trimmed_prefix = raw_line.trim_start();
+        if trimmed_prefix.starts_with("family ")
+            || trimmed_prefix.starts_with("family(")
+            || trimmed_prefix.starts_with("family\t")
+        {
+            continue;
+        }
         if raw_line
             .chars()
             .next()
@@ -433,18 +462,35 @@ fn parse_decl_head_and_rest(trimmed: &str) -> Option<(String, &str)> {
     if let Some((name, rest)) = parse_operator_decl_head(trimmed) {
         return Some((name, rest));
     }
-    let mut end = 0usize;
-    for byte in trimmed.as_bytes() {
-        if is_ident_char(*byte) {
-            end += 1;
-        } else {
-            break;
-        }
+    let bytes = trimmed.as_bytes();
+    let mut index = 0usize;
+    while bytes.get(index).is_some_and(|byte| is_ident_char(*byte)) {
+        index += 1;
     }
-    if end == 0 {
+    if index == 0 {
         return None;
     }
-    Some((trimmed[..end].to_string(), &trimmed[end..]))
+    let head = trimmed[..index].to_string();
+    let mut segments = Vec::<String>::new();
+    while bytes.get(index) == Some(&b'\\') {
+        index += 1;
+        let segment_start = index;
+        while bytes.get(index).is_some_and(|byte| is_ident_char(*byte)) {
+            index += 1;
+        }
+        if index == segment_start {
+            return None;
+        }
+        segments.push(trimmed[segment_start..index].to_string());
+    }
+    if segments.is_empty() {
+        return Some((head, &trimmed[index..]));
+    }
+    let mut name_parts = Vec::with_capacity(segments.len() + 2);
+    name_parts.push("__fam".to_string());
+    name_parts.push(head);
+    name_parts.extend(segments);
+    Some((name_parts.join("$"), &trimmed[index..]))
 }
 
 fn parse_operator_decl_head(trimmed: &str) -> Option<(String, &str)> {
@@ -472,7 +518,7 @@ fn parse_operator_decl_head(trimmed: &str) -> Option<(String, &str)> {
         return None;
     }
     let mut name_parts = Vec::with_capacity(segments.len() + 2);
-    name_parts.push("__op".to_string());
+    name_parts.push("__fam".to_string());
     name_parts.push(key.to_string());
     name_parts.extend(segments);
     Some((name_parts.join("$"), &trimmed[index..]))
@@ -491,6 +537,21 @@ fn operator_key_for_lsp(operator: &str) -> Option<&'static str> {
         "<=" => Some("le"),
         ">=" => Some("ge"),
         _ => None,
+    }
+}
+
+fn format_prim_op(op: PrimOp) -> &'static str {
+    match op {
+        PrimOp::Add => "+",
+        PrimOp::Sub => "-",
+        PrimOp::Mul => "*",
+        PrimOp::Div => "/",
+        PrimOp::Mod => "%",
+        PrimOp::Eq => "==",
+        PrimOp::Lt => "<",
+        PrimOp::Gt => ">",
+        PrimOp::Le => "<=",
+        PrimOp::Ge => ">=",
     }
 }
 
@@ -520,6 +581,7 @@ fn collect_expr_local_types(expr: &TypedExpr, map: &mut BTreeMap<String, Vec<Typ
         TypedExprKind::FunctionRef { .. }
         | TypedExprKind::Int(_, _)
         | TypedExprKind::Float(_, _)
+        | TypedExprKind::String(_)
         | TypedExprKind::TypeToken(_) => {}
         TypedExprKind::Lambda { body, .. } => collect_expr_local_types(body, map),
         TypedExprKind::Let { bindings, body } => {
@@ -702,6 +764,26 @@ mod tests {
             panic!("expected markdown hover content");
         };
         assert!(content.value.contains("type v3 a = {x:a,y:a,z:a}"));
+    }
+
+    #[test]
+    fn hover_shows_family_declaration() {
+        let source = "family Eq : i64 -> i64 -> i64\nmain : i64 -> i64\nmain x = x + 1\n";
+        let hover = hover_for_position(source, Position::new(0, 8)).expect("hover");
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markdown hover content");
+        };
+        assert!(content.value.contains("family Eq : i64 -> i64 -> i64"));
+    }
+
+    #[test]
+    fn hover_uses_function_context_after_family_declaration() {
+        let source = "family Eq : i64 -> i64 -> i64\nmain : i64 -> i64\nmain x = x + 1\n";
+        let hover = hover_for_position(source, Position::new(2, 9)).expect("hover");
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markdown hover content");
+        };
+        assert!(content.value.contains("x : i64"));
     }
 
     #[test]

@@ -26,7 +26,14 @@ module.exports = grammar({
         ),
       ),
 
-    declaration: ($) => choice($.import_decl, $.type_alias, $.signature, $.clause),
+    declaration: ($) =>
+      choice(
+        $.import_decl,
+        $.type_alias,
+        $.family_decl,
+        $.signature,
+        $.clause,
+      ),
 
     import_decl: ($) =>
       seq("import", field("path", $.module_path), "as", field("alias", $.identifier)),
@@ -46,6 +53,14 @@ module.exports = grammar({
         field("body", $.type),
       ),
 
+    family_decl: ($) =>
+      seq(
+        "family",
+        field("head", $.family_head),
+        ":",
+        field("type", $.type),
+      ),
+
     signature: ($) =>
       seq(field("head", $.decl_head), ":", field("type", $.type)),
 
@@ -57,15 +72,29 @@ module.exports = grammar({
         field("body", $.expr),
       ),
 
-    decl_head: ($) => choice($.identifier, $.operator_head),
+    decl_head: ($) => choice($.identifier, $.operator_head, $.family_instance_head),
+
+    family_head: ($) =>
+      choice(
+        $.identifier,
+        seq("(", field("operator", $.prim_operator), ")"),
+      ),
+
+    family_instance_head: ($) =>
+      seq(
+        field("name", $.identifier),
+        repeat1(seq("\\", field("segment", choice($.identifier, $.prim_type)))),
+      ),
 
     operator_head: ($) =>
       seq(
         "(",
-        field("operator", choice("+", "-", "*", "/", "%", "==", "<", ">", "<=", ">=")),
+        field("operator", $.prim_operator),
         ")",
         repeat1(seq("\\", field("segment", choice($.identifier, $.prim_type)))),
       ),
+
+    prim_operator: (_) => choice("+", "-", "*", "/", "%", "==", "<", ">", "<=", ">="),
 
     pattern: ($) => choice($.wildcard, $.prim_type, $.identifier, $.int, $.float),
 
@@ -88,7 +117,16 @@ module.exports = grammar({
       ),
 
     type_base: ($) =>
-      choice($.prim_type, $.type_witness, $.identifier, $.record_type, seq("(", $.type, ")")),
+      choice(
+        $.prim_type,
+        $.type_witness,
+        $.identifier,
+        $.string_type,
+        $.record_type,
+        seq("(", $.type, ")"),
+      ),
+
+    string_type: (_) => "string",
 
     prim_type: (_) => choice("i32", "i64", "f32", "f64"),
 
@@ -148,7 +186,22 @@ module.exports = grammar({
             field("right", $.mul_expr),
           ),
         ),
+        prec.left(
+          PREC.add,
+          seq(
+            field("left", $.add_expr),
+            field("operator", $.infix_function_operator),
+            field("right", $.mul_expr),
+          ),
+        ),
         $.mul_expr,
+      ),
+
+    infix_function_operator: ($) =>
+      seq(
+        "`",
+        field("function", choice($.qualified_ref, $.identifier)),
+        "`",
       ),
 
     mul_expr: ($) =>
@@ -196,6 +249,8 @@ module.exports = grammar({
       choice(
         $.qualified_ref,
         $.prim_type,
+        $.string,
+        $.string_type,
         $.identifier,
         $.int,
         $.float,
@@ -216,6 +271,14 @@ module.exports = grammar({
       seq(field("name", $.identifier), "=", field("value", $.expr)),
 
     wildcard: (_) => "_",
+    string: () =>
+      token(
+        seq(
+          '"',
+          repeat(choice(/[^"\\\n]/, seq("\\", /./))),
+          '"',
+        ),
+      ),
     identifier: (_) => /[a-z][a-zA-Z0-9_]*/,
     nat: (_) => /[0-9]+/,
     int: (_) => /[0-9]+/,

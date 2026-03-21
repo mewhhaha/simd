@@ -1,0 +1,23 @@
+/home/mewhhaha/src/simd/tools/tree-sitter-simd/test/query/family_and_string.simd
+    pattern:  3, capture: 4 - keyword, start: (0, 0), end: (0, 6), text: `family`
+    pattern:  3, capture: 1 - type, start: (0, 7), end: (0, 13), text: `concat`
+    pattern: 29, capture: 12 - punctuation.bracket, start: (1, 7), end: (1, 8), text: `(`
+    pattern:  4, capture: 6 - operator, start: (1, 8), end: (1, 10), text: `==`
+    pattern: 29, capture: 12 - punctuation.bracket, start: (1, 10), end: (1, 11), text: `)`
+    pattern:  8, capture: 0 - function, start: (3, 0), end: (3, 6), text: `concat`
+    pattern:  8, capture: 1 - type, start: (3, 7), end: (3, 13), text: `string`
+    pattern: 29, capture: 12 - punctuation.bracket, start: (4, 0), end: (4, 1), text: `(`
+    pattern:  7, capture: 6 - operator, start: (4, 1), end: (4, 3), text: `==`
+    pattern: 29, capture: 12 - punctuation.bracket, start: (4, 3), end: (4, 4), text: `)`
+    pattern:  7, capture: 1 - type, start: (4, 5), end: (4, 11), text: `string`
+    pattern: 17, capture: 10 - function.call, start: (4, 18), end: (4, 28), text: `contains a`
+    pattern: 17, capture: 10 - function.call, start: (4, 18), end: (4, 26), text: `contains`
+    pattern: 17, capture: 8 - expression, start: (4, 27), end: (4, 28), text: `a`
+    pattern: 17, capture: 8 - expression, start: (4, 29), end: (4, 30), text: `b`
+    pattern:  0, capture: 0 - function, start: (5, 0), end: (5, 4), text: `main`
+    pattern:  0, capture: 1 - type, start: (5, 7), end: (5, 10), text: `i64`
+    pattern: 28, capture: 11 - string, start: (6, 7), end: (6, 10), text: `"a"`
+    pattern: 10, capture: 0 - function, start: (6, 12), end: (6, 18), text: `concat`
+    pattern: 28, capture: 11 - string, start: (6, 20), end: (6, 23), text: `"b"`
+    pattern: 18, capture: 6 - operator, start: (6, 24), end: (6, 26), text: `==`
+    pattern: 28, capture: 11 - string, start: (6, 27), end: (6, 31), text: `"ab"`

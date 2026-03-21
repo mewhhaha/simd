@@ -1,0 +1,3 @@
+main : string -> string -> string
+main a b = a `concat` b
+

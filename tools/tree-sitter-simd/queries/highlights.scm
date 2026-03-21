@@ -12,6 +12,14 @@
   head: (identifier) @function
   segment: (identifier) @function)
 
+(infix_function_operator
+  function: (identifier) @function)
+
+(infix_function_operator
+  function: (qualified_ref
+    head: (identifier) @function
+    segment: (identifier) @function))
+
 (type_alias
   "type" @keyword
   name: (identifier) @type
@@ -28,6 +36,17 @@
       operator: (_) @operator
       segment: (identifier) @type)))
 
+(family_decl
+  "family" @keyword)
+
+(family_decl
+  head: (family_head
+    (identifier) @type))
+
+(family_decl
+  head: (family_head
+    (prim_operator) @operator))
+
 (clause
   head: (decl_head
     (identifier) @function)
@@ -37,6 +56,12 @@
   head: (decl_head
     (operator_head
       operator: (_) @operator
+      segment: (identifier) @type)))
+
+(clause
+  head: (decl_head
+    (family_instance_head
+      name: (identifier) @function
       segment: (identifier) @type)))
 
 (let_expr
@@ -55,6 +80,8 @@
 (postfix_expr
   field: (identifier) @property)
 
+(string) @string
+
 [
   "=="
   "<"
@@ -67,6 +94,8 @@
   "/"
   "%"
 ] @operator
+
+(string_type) @type.builtin
 
 [
   "{"
@@ -84,4 +113,5 @@
   "."
   ","
   ";"
+  "`"
 ] @punctuation.delimiter

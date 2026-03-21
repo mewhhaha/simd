@@ -7,8 +7,8 @@
     pattern:  1, capture: 2 - variable.parameter, start: (1, 5), end: (1, 6), text: `a`
     pattern:  1, capture: 2 - variable.parameter, start: (1, 7), end: (1, 8), text: `x`
     pattern:  1, capture: 2 - variable.parameter, start: (1, 9), end: (1, 10), text: `y`
-    pattern: 19, capture: 6 - operator, start: (1, 15), end: (1, 16), text: `*`
-    pattern: 17, capture: 6 - operator, start: (1, 19), end: (1, 20), text: `+`
+    pattern: 25, capture: 6 - operator, start: (1, 15), end: (1, 16), text: `*`
+    pattern: 23, capture: 6 - operator, start: (1, 19), end: (1, 20), text: `+`
     pattern:  0, capture: 0 - function, start: (2, 0), end: (2, 4), text: `main`
     pattern:  0, capture: 1 - type, start: (2, 7), end: (2, 31), text: `i64 -> i64 -> i64 -> i64`
     pattern:  1, capture: 0 - function, start: (3, 0), end: (3, 4), text: `main`
@@ -17,9 +17,9 @@
     pattern:  1, capture: 2 - variable.parameter, start: (3, 5), end: (3, 6), text: `a`
     pattern:  1, capture: 2 - variable.parameter, start: (3, 7), end: (3, 8), text: `x`
     pattern:  1, capture: 2 - variable.parameter, start: (3, 9), end: (3, 10), text: `y`
-    pattern: 11, capture: 10 - function.call, start: (3, 13), end: (3, 21), text: `axpy a x`
-    pattern: 11, capture: 10 - function.call, start: (3, 13), end: (3, 19), text: `axpy a`
-    pattern: 11, capture: 10 - function.call, start: (3, 13), end: (3, 17), text: `axpy`
-    pattern: 11, capture: 8 - expression, start: (3, 18), end: (3, 19), text: `a`
-    pattern: 11, capture: 8 - expression, start: (3, 20), end: (3, 21), text: `x`
-    pattern: 11, capture: 8 - expression, start: (3, 22), end: (3, 23), text: `y`
+    pattern: 17, capture: 10 - function.call, start: (3, 13), end: (3, 21), text: `axpy a x`
+    pattern: 17, capture: 10 - function.call, start: (3, 13), end: (3, 19), text: `axpy a`
+    pattern: 17, capture: 10 - function.call, start: (3, 13), end: (3, 17), text: `axpy`
+    pattern: 17, capture: 8 - expression, start: (3, 18), end: (3, 19), text: `a`
+    pattern: 17, capture: 8 - expression, start: (3, 20), end: (3, 21), text: `x`
+    pattern: 17, capture: 8 - expression, start: (3, 22), end: (3, 23), text: `y`

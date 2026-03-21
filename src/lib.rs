@@ -50,6 +50,7 @@ pub struct SurfaceProgram {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Decl {
     Import(ImportDecl),
+    Family(FamilyDecl),
     TypeAlias(TypeAliasDecl),
     Signature(Signature),
     Clause(Clause),
@@ -68,9 +69,23 @@ pub struct TypeAliasDecl {
     pub body: Type,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct FamilyDecl {
+    pub name: String,
+    pub ty: Type,
+    pub op: Option<PrimOp>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OperatorInstanceSpec {
+    pub family: String,
     pub op: PrimOp,
+    pub segments: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FamilyInstanceSpec {
+    pub family: String,
     pub segments: Vec<String>,
 }
 
@@ -79,6 +94,7 @@ pub struct Signature {
     pub name: String,
     pub ty: Type,
     pub operator_instance: Option<OperatorInstanceSpec>,
+    pub family_instance: Option<FamilyInstanceSpec>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -87,6 +103,7 @@ pub struct Clause {
     pub patterns: Vec<Pattern>,
     pub body: Expr,
     pub operator_instance: Option<OperatorInstanceSpec>,
+    pub family_instance: Option<FamilyInstanceSpec>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -122,6 +139,7 @@ pub enum Expr {
     Ref(RefExpr),
     Int(i64),
     Float(f64),
+    String(String),
     App(Box<Expr>, Box<Expr>),
     Lambda {
         param: String,
@@ -208,8 +226,10 @@ pub enum Dim {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Module {
     pub imports: Vec<ImportDecl>,
+    pub families: Vec<FamilyDecl>,
     pub type_aliases: Vec<TypeAliasDecl>,
     pub operator_instances: Vec<OperatorInstanceDecl>,
+    pub family_instances: Vec<FamilyInstanceDecl>,
     pub functions: Vec<FunctionDef>,
 }
 
@@ -217,6 +237,12 @@ pub struct Module {
 pub struct OperatorInstanceDecl {
     pub function_name: String,
     pub spec: OperatorInstanceSpec,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FamilyInstanceDecl {
+    pub function_name: String,
+    pub spec: FamilyInstanceSpec,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -308,6 +334,7 @@ pub enum TypedExprKind {
     },
     Int(i64, Prim),
     Float(f64, Prim),
+    String(String),
     TypeToken(Prim),
     Lambda {
         param: String,
@@ -347,6 +374,16 @@ pub struct TypedArg {
 pub enum Callee {
     Function(String),
     Prim(PrimOp),
+    Builtin(BuiltinFamilyCallee),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BuiltinFamilyCallee {
+    ConcatString,
+    LenString,
+    SliceString,
+    ContainsString,
+    EqString,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -517,6 +554,7 @@ pub struct CompiledProgram {
 pub enum Value {
     Scalar(ScalarValue),
     Bulk(BulkValue),
+    String(String),
     TypeToken(Prim),
     Record(BTreeMap<String, Value>),
 }
@@ -654,6 +692,7 @@ impl Value {
                 value.prim,
                 Shape(value.shape.iter().copied().map(Dim::Const).collect()),
             ),
+            Self::String(_) => Type::Named("string".to_string(), Vec::new()),
             Self::TypeToken(prim) => Type::TypeToken(Box::new(Type::Scalar(*prim))),
             Self::Record(fields) => Type::Record(
                 fields
@@ -668,6 +707,7 @@ impl Value {
         match self {
             Self::Scalar(value) => value.to_json_string(),
             Self::Bulk(value) => render_bulk_json(&value.elements, &value.shape, 0),
+            Self::String(value) => json_string(value),
             Self::TypeToken(prim) => format!("\"{}\"", format_prim(*prim)),
             Self::Record(fields) => render_record_json(fields),
         }
@@ -753,7 +793,7 @@ fn render_lifted_value_json(value: &Value, shape: &[usize], offset: usize) -> St
 
 fn value_lift_shape(value: &Value) -> Option<Vec<usize>> {
     match value {
-        Value::Scalar(_) | Value::TypeToken(_) => None,
+        Value::Scalar(_) | Value::String(_) | Value::TypeToken(_) => None,
         Value::Bulk(bulk) => Some(bulk.shape.clone()),
         Value::Record(fields) => {
             let mut shape = None::<Vec<usize>>;
@@ -776,7 +816,7 @@ fn value_leaf_prim(value: &Value) -> Option<Prim> {
     match value {
         Value::Scalar(value) => Some(value.prim()),
         Value::Bulk(value) => Some(value.prim),
-        Value::TypeToken(_) => None,
+        Value::String(_) | Value::TypeToken(_) => None,
         Value::Record(fields) => fields.values().find_map(value_leaf_prim),
     }
 }
@@ -793,7 +833,7 @@ fn extract_lifted_lane(value: &Value, index: usize) -> Result<Value> {
         Value::TypeToken(_) => Err(SimdError::new(
             "cannot extract a lifted lane from a type witness value",
         )),
-        Value::Scalar(_) => Err(SimdError::new(
+        Value::Scalar(_) | Value::String(_) => Err(SimdError::new(
             "cannot extract a lifted lane from a scalar value",
         )),
     }
@@ -878,6 +918,9 @@ pub fn flatten_value_leaves(value: &Value, ty: &Type) -> Result<Vec<(LeafPath, V
         (Value::Scalar(_), Type::Scalar(_)) | (Value::Bulk(_), Type::Bulk(_, _)) => {
             Ok(vec![(LeafPath::root(), value.clone())])
         }
+        (Value::String(_), Type::Named(name, args)) if name == "string" && args.is_empty() => {
+            Ok(vec![(LeafPath::root(), value.clone())])
+        }
         (Value::TypeToken(_), Type::TypeToken(_)) => Ok(Vec::new()),
         (Value::Record(fields), Type::Record(field_types)) => {
             let mut leaves = Vec::new();
@@ -904,6 +947,10 @@ pub fn flatten_value_leaves(value: &Value, ty: &Type) -> Result<Vec<(LeafPath, V
 pub fn rebuild_value_from_leaves(ty: &Type, leaves: &BTreeMap<LeafPath, Value>) -> Result<Value> {
     match ty {
         Type::Scalar(_) | Type::Bulk(_, _) => leaves
+            .get(&LeafPath::root())
+            .cloned()
+            .ok_or_else(|| SimdError::new(format!("missing root leaf for type {:?}", ty))),
+        Type::Named(name, args) if name == "string" && args.is_empty() => leaves
             .get(&LeafPath::root())
             .cloned()
             .ok_or_else(|| SimdError::new(format!("missing root leaf for type {:?}", ty))),
@@ -964,11 +1011,13 @@ enum TokenKind {
     Ident,
     Import,
     As,
+    Family,
     TypeDecl,
     Let,
     In,
     Int,
     Float,
+    StringLit,
     Newline,
     Semicolon,
     Colon,
@@ -984,6 +1033,7 @@ enum TokenKind {
     Gt,
     Le,
     Ge,
+    Backtick,
     Backslash,
     Dot,
     LParen,
@@ -1043,6 +1093,7 @@ fn lex(source: &str) -> Result<Vec<Token>> {
             let kind = match text.as_str() {
                 "import" => TokenKind::Import,
                 "as" => TokenKind::As,
+                "family" => TokenKind::Family,
                 "type" => TokenKind::TypeDecl,
                 "let" => TokenKind::Let,
                 "in" => TokenKind::In,
@@ -1071,6 +1122,42 @@ fn lex(source: &str) -> Result<Vec<Token>> {
                 leading_space,
             });
             index += 1;
+            continue;
+        }
+        if ch == '"' {
+            let start = index;
+            index += 1;
+            let mut escaped = false;
+            while index < chars.len() {
+                let current = chars[index];
+                if escaped {
+                    escaped = false;
+                    index += 1;
+                    continue;
+                }
+                if current == '\\' {
+                    escaped = true;
+                    index += 1;
+                    continue;
+                }
+                if current == '"' {
+                    index += 1;
+                    break;
+                }
+                if current == '\n' {
+                    return Err(SimdError::new("string literal cannot contain newlines"));
+                }
+                index += 1;
+            }
+            if index > chars.len() || chars.get(index.saturating_sub(1)) != Some(&'"') {
+                return Err(SimdError::new("unterminated string literal"));
+            }
+            let text: String = chars[start..index].iter().collect();
+            tokens.push(Token {
+                kind: TokenKind::StringLit,
+                text,
+                leading_space,
+            });
             continue;
         }
         if ch.is_ascii_digit() {
@@ -1139,6 +1226,7 @@ fn lex(source: &str) -> Result<Vec<Token>> {
             '{' => (TokenKind::LBrace, 1),
             '}' => (TokenKind::RBrace, 1),
             '.' => (TokenKind::Dot, 1),
+            '`' => (TokenKind::Backtick, 1),
             ',' => (TokenKind::Comma, 1),
             ';' => (TokenKind::Semicolon, 1),
             _ => {
@@ -1170,6 +1258,7 @@ struct Parser {
 struct DeclHead {
     name: String,
     operator_instance: Option<OperatorInstanceSpec>,
+    family_instance: Option<FamilyInstanceSpec>,
 }
 
 impl Parser {
@@ -1201,6 +1290,10 @@ impl Parser {
             }
             return self.parse_import_decl();
         }
+        if self.peek_is(TokenKind::Family) {
+            self.saw_non_import_decl = true;
+            return self.parse_family_decl();
+        }
         if self.peek_is(TokenKind::TypeDecl) {
             self.saw_non_import_decl = true;
             return self.parse_type_alias_decl();
@@ -1213,6 +1306,7 @@ impl Parser {
                 name: head.name,
                 ty,
                 operator_instance: head.operator_instance,
+                family_instance: head.family_instance,
             }));
         }
         let mut patterns = Vec::new();
@@ -1225,6 +1319,7 @@ impl Parser {
             patterns,
             body,
             operator_instance: head.operator_instance,
+            family_instance: head.family_instance,
         }))
     }
 
@@ -1269,45 +1364,81 @@ impl Parser {
         Ok(Decl::TypeAlias(TypeAliasDecl { name, params, body }))
     }
 
+    fn parse_family_decl(&mut self) -> Result<Decl> {
+        self.expect(TokenKind::Family)?;
+        let (name, op) = if self.peek_is(TokenKind::LParen) {
+            self.expect(TokenKind::LParen)?;
+            let op = parse_operator_token_kind(
+                &self
+                    .peek()
+                    .ok_or_else(|| SimdError::new("expected operator token in family declaration"))?
+                    .kind,
+            )
+            .ok_or_else(|| {
+                SimdError::new(
+                    "expected primitive operator token inside '(...)' family declaration",
+                )
+            })?;
+            self.pos += 1;
+            self.expect(TokenKind::RParen)?;
+            (operator_key(op).to_string(), Some(op))
+        } else {
+            (self.expect_ident()?, None)
+        };
+        self.expect(TokenKind::Colon)?;
+        let ty = self.parse_type()?;
+        Ok(Decl::Family(FamilyDecl { name, ty, op }))
+    }
+
     fn parse_decl_head(&mut self) -> Result<DeclHead> {
         if self.peek_is(TokenKind::LParen) {
             let (op, segments) = self.parse_operator_decl_head()?;
             let name = encode_operator_instance_name(op, &segments);
             return Ok(DeclHead {
                 name,
-                operator_instance: Some(OperatorInstanceSpec { op, segments }),
+                operator_instance: Some(OperatorInstanceSpec {
+                    family: operator_key(op).to_string(),
+                    op,
+                    segments,
+                }),
+                family_instance: None,
             });
         }
         let name = self.expect_ident()?;
+        let mut segments = Vec::new();
+        while self.can_parse_backslash_chain() {
+            self.pos += 1;
+            segments.push(self.expect_ident()?);
+        }
+        if segments.is_empty() {
+            return Ok(DeclHead {
+                name,
+                operator_instance: None,
+                family_instance: None,
+            });
+        }
+        let internal_name = encode_family_instance_name(&name, &segments);
         Ok(DeclHead {
-            name,
+            name: internal_name,
             operator_instance: None,
+            family_instance: Some(FamilyInstanceSpec {
+                family: name,
+                segments,
+            }),
         })
     }
 
     fn parse_operator_decl_head(&mut self) -> Result<(PrimOp, Vec<String>)> {
         self.expect(TokenKind::LParen)?;
-        let op = match self
-            .peek()
-            .ok_or_else(|| SimdError::new("expected operator token in declaration head"))?
-            .kind
-        {
-            TokenKind::Plus => PrimOp::Add,
-            TokenKind::Minus => PrimOp::Sub,
-            TokenKind::Star => PrimOp::Mul,
-            TokenKind::Slash => PrimOp::Div,
-            TokenKind::Percent => PrimOp::Mod,
-            TokenKind::EqEq => PrimOp::Eq,
-            TokenKind::Lt => PrimOp::Lt,
-            TokenKind::Gt => PrimOp::Gt,
-            TokenKind::Le => PrimOp::Le,
-            TokenKind::Ge => PrimOp::Ge,
-            _ => {
-                return Err(SimdError::new(
-                    "expected primitive operator token inside '(...)' declaration head",
-                ));
-            }
-        };
+        let op = parse_operator_token_kind(
+            &self
+                .peek()
+                .ok_or_else(|| SimdError::new("expected operator token in declaration head"))?
+                .kind,
+        )
+        .ok_or_else(|| {
+            SimdError::new("expected primitive operator token inside '(...)' declaration head")
+        })?;
         self.pos += 1;
         self.expect(TokenKind::RParen)?;
         let mut segments = Vec::new();
@@ -1430,6 +1561,7 @@ impl Parser {
             } else {
                 match Prim::parse(&name) {
                     Some(prim) => Type::Scalar(prim),
+                    None if name == "string" => Type::Named(name, Vec::new()),
                     None => Type::Named(name, Vec::new()),
                 }
             }
@@ -1499,6 +1631,32 @@ impl Parser {
                 Some(token) => token.clone(),
                 None => break,
             };
+            if token.kind == TokenKind::Backtick {
+                let (lbp, rbp) = infix_function_binding_power();
+                if lbp < min_bp {
+                    break;
+                }
+                self.pos += 1;
+                let name_token = self
+                    .peek()
+                    .cloned()
+                    .ok_or_else(|| SimdError::new("expected function name after '`'"))?;
+                if name_token.kind != TokenKind::Ident {
+                    return Err(SimdError::new(format!(
+                        "expected function name after '`', found '{}'",
+                        name_token.text
+                    )));
+                }
+                self.pos += 1;
+                let reference = self.parse_ref_expr(name_token.text)?;
+                self.expect(TokenKind::Backtick)?;
+                let rhs = self.parse_expr(rbp)?;
+                lhs = Expr::App(
+                    Box::new(Expr::App(Box::new(Expr::Ref(reference)), Box::new(lhs))),
+                    Box::new(rhs),
+                );
+                continue;
+            }
             let op = match PrimOp::from_token(&token.kind) {
                 Some(op) => op,
                 None => break,
@@ -1537,6 +1695,10 @@ impl Parser {
             TokenKind::Float => {
                 self.pos += 1;
                 Ok(Expr::Float(parse_float(&token.text)?))
+            }
+            TokenKind::StringLit => {
+                self.pos += 1;
+                Ok(Expr::String(parse_string_literal(&token.text)?))
             }
             TokenKind::LParen => {
                 self.pos += 1;
@@ -1596,6 +1758,7 @@ impl Parser {
                     | TokenKind::Let
                     | TokenKind::Int
                     | TokenKind::Float
+                    | TokenKind::StringLit
                     | TokenKind::LParen
             )
         )
@@ -1790,6 +1953,22 @@ fn operator_token(op: PrimOp) -> &'static str {
     }
 }
 
+fn parse_operator_token_kind(kind: &TokenKind) -> Option<PrimOp> {
+    match kind {
+        TokenKind::Plus => Some(PrimOp::Add),
+        TokenKind::Minus => Some(PrimOp::Sub),
+        TokenKind::Star => Some(PrimOp::Mul),
+        TokenKind::Slash => Some(PrimOp::Div),
+        TokenKind::Percent => Some(PrimOp::Mod),
+        TokenKind::EqEq => Some(PrimOp::Eq),
+        TokenKind::Lt => Some(PrimOp::Lt),
+        TokenKind::Gt => Some(PrimOp::Gt),
+        TokenKind::Le => Some(PrimOp::Le),
+        TokenKind::Ge => Some(PrimOp::Ge),
+        _ => None,
+    }
+}
+
 fn operator_key(op: PrimOp) -> &'static str {
     match op {
         PrimOp::Add => "add",
@@ -1822,28 +2001,51 @@ fn parse_operator_key(name: &str) -> Option<PrimOp> {
 }
 
 fn encode_operator_instance_name(op: PrimOp, segments: &[String]) -> String {
-    let mut parts = Vec::with_capacity(segments.len() + 2);
-    parts.push("__op".to_string());
-    parts.push(operator_key(op).to_string());
-    parts.extend(segments.iter().cloned());
-    parts.join("$")
+    encode_family_instance_name(operator_key(op), segments)
 }
 
 fn decode_operator_instance_name(name: &str) -> Option<OperatorInstanceSpec> {
+    let spec = decode_family_instance_name(name)?;
+    let op = parse_operator_key(&spec.family)?;
+    Some(OperatorInstanceSpec {
+        family: spec.family,
+        op,
+        segments: spec.segments,
+    })
+}
+
+fn encode_family_instance_name(family: &str, segments: &[String]) -> String {
+    let mut rendered = Vec::with_capacity(segments.len() + 2);
+    rendered.push("__fam".to_string());
+    rendered.push(family.to_string());
+    rendered.extend(segments.iter().cloned());
+    rendered.join("$")
+}
+
+fn decode_family_instance_name(name: &str) -> Option<FamilyInstanceSpec> {
     let mut parts = name.split('$');
-    if parts.next()? != "__op" {
+    if parts.next()? != "__fam" {
         return None;
     }
-    let op = parse_operator_key(parts.next()?)?;
+    let family = parts.next()?.to_string();
     let segments = parts.map(|segment| segment.to_string()).collect::<Vec<_>>();
-    if segments.is_empty() {
+    if family.is_empty() || segments.is_empty() {
         return None;
     }
-    Some(OperatorInstanceSpec { op, segments })
+    Some(FamilyInstanceSpec { family, segments })
 }
 
 fn render_operator_instance_spec(spec: &OperatorInstanceSpec) -> String {
     let mut out = format!("({})", operator_token(spec.op));
+    for segment in &spec.segments {
+        out.push('\\');
+        out.push_str(segment);
+    }
+    out
+}
+
+fn render_family_instance_spec(spec: &FamilyInstanceSpec) -> String {
+    let mut out = spec.family.clone();
     for segment in &spec.segments {
         out.push('\\');
         out.push_str(segment);
@@ -1857,6 +2059,10 @@ fn infix_binding_power(op: PrimOp) -> (u8, u8) {
         PrimOp::Add | PrimOp::Sub => (40, 41),
         PrimOp::Eq | PrimOp::Lt | PrimOp::Gt | PrimOp::Le | PrimOp::Ge => (30, 31),
     }
+}
+
+fn infix_function_binding_power() -> (u8, u8) {
+    (40, 41)
 }
 
 fn parse_int(text: &str) -> Result<i64> {
@@ -1890,6 +2096,38 @@ fn parse_type_arg(segment: &str) -> Result<TypeArg> {
 fn parse_float(text: &str) -> Result<f64> {
     text.parse::<f64>()
         .map_err(|_| SimdError::new(format!("invalid float literal '{text}'")))
+}
+
+fn parse_string_literal(text: &str) -> Result<String> {
+    if text.len() < 2 || !text.starts_with('"') || !text.ends_with('"') {
+        return Err(SimdError::new(format!("invalid string literal '{}'", text)));
+    }
+    let inner = &text[1..text.len() - 1];
+    let mut out = String::new();
+    let mut chars = inner.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            out.push(ch);
+            continue;
+        }
+        let escaped = chars
+            .next()
+            .ok_or_else(|| SimdError::new("unterminated string escape"))?;
+        match escaped {
+            '"' => out.push('"'),
+            '\\' => out.push('\\'),
+            'n' => out.push('\n'),
+            'r' => out.push('\r'),
+            't' => out.push('\t'),
+            other => {
+                return Err(SimdError::new(format!(
+                    "unsupported string escape '\\{}'",
+                    other
+                )));
+            }
+        }
+    }
+    Ok(out)
 }
 
 pub fn parse_source(source: &str) -> Result<SurfaceProgram> {
@@ -1927,11 +2165,144 @@ pub(crate) fn compile_frontend(source: &str) -> Result<(SurfaceProgram, Module, 
     Ok((surface, module, checked))
 }
 
+fn builtin_family_declarations() -> Vec<FamilyDecl> {
+    vec![
+        FamilyDecl {
+            name: "add".to_string(),
+            ty: Type::Fun(
+                vec![Type::Var("t".to_string()), Type::Var("t".to_string())],
+                Box::new(Type::Var("t".to_string())),
+            ),
+            op: Some(PrimOp::Add),
+        },
+        FamilyDecl {
+            name: "sub".to_string(),
+            ty: Type::Fun(
+                vec![Type::Var("t".to_string()), Type::Var("t".to_string())],
+                Box::new(Type::Var("t".to_string())),
+            ),
+            op: Some(PrimOp::Sub),
+        },
+        FamilyDecl {
+            name: "mul".to_string(),
+            ty: Type::Fun(
+                vec![Type::Var("t".to_string()), Type::Var("t".to_string())],
+                Box::new(Type::Var("t".to_string())),
+            ),
+            op: Some(PrimOp::Mul),
+        },
+        FamilyDecl {
+            name: "div".to_string(),
+            ty: Type::Fun(
+                vec![Type::Var("t".to_string()), Type::Var("t".to_string())],
+                Box::new(Type::Var("t".to_string())),
+            ),
+            op: Some(PrimOp::Div),
+        },
+        FamilyDecl {
+            name: "mod".to_string(),
+            ty: Type::Fun(
+                vec![Type::Var("t".to_string()), Type::Var("t".to_string())],
+                Box::new(Type::Var("t".to_string())),
+            ),
+            op: Some(PrimOp::Mod),
+        },
+        FamilyDecl {
+            name: "eq".to_string(),
+            ty: Type::Fun(
+                vec![Type::Var("t".to_string()), Type::Var("t".to_string())],
+                Box::new(Type::Scalar(Prim::I64)),
+            ),
+            op: Some(PrimOp::Eq),
+        },
+        FamilyDecl {
+            name: "lt".to_string(),
+            ty: Type::Fun(
+                vec![Type::Var("t".to_string()), Type::Var("t".to_string())],
+                Box::new(Type::Scalar(Prim::I64)),
+            ),
+            op: Some(PrimOp::Lt),
+        },
+        FamilyDecl {
+            name: "gt".to_string(),
+            ty: Type::Fun(
+                vec![Type::Var("t".to_string()), Type::Var("t".to_string())],
+                Box::new(Type::Scalar(Prim::I64)),
+            ),
+            op: Some(PrimOp::Gt),
+        },
+        FamilyDecl {
+            name: "le".to_string(),
+            ty: Type::Fun(
+                vec![Type::Var("t".to_string()), Type::Var("t".to_string())],
+                Box::new(Type::Scalar(Prim::I64)),
+            ),
+            op: Some(PrimOp::Le),
+        },
+        FamilyDecl {
+            name: "ge".to_string(),
+            ty: Type::Fun(
+                vec![Type::Var("t".to_string()), Type::Var("t".to_string())],
+                Box::new(Type::Scalar(Prim::I64)),
+            ),
+            op: Some(PrimOp::Ge),
+        },
+        FamilyDecl {
+            name: "concat".to_string(),
+            ty: Type::Fun(
+                vec![Type::Var("t".to_string()), Type::Var("t".to_string())],
+                Box::new(Type::Var("t".to_string())),
+            ),
+            op: None,
+        },
+        FamilyDecl {
+            name: "len".to_string(),
+            ty: Type::Fun(
+                vec![Type::Var("t".to_string())],
+                Box::new(Type::Scalar(Prim::I64)),
+            ),
+            op: None,
+        },
+        FamilyDecl {
+            name: "slice".to_string(),
+            ty: Type::Fun(
+                vec![
+                    Type::Var("t".to_string()),
+                    Type::Scalar(Prim::I64),
+                    Type::Scalar(Prim::I64),
+                ],
+                Box::new(Type::Var("t".to_string())),
+            ),
+            op: None,
+        },
+        FamilyDecl {
+            name: "contains".to_string(),
+            ty: Type::Fun(
+                vec![Type::Var("t".to_string()), Type::Var("t".to_string())],
+                Box::new(Type::Scalar(Prim::I64)),
+            ),
+            op: None,
+        },
+    ]
+}
+
 fn group_program(surface: &SurfaceProgram) -> Result<Module> {
     let mut imports = Vec::<ImportDecl>::new();
     let mut import_aliases = BTreeSet::<String>::new();
     let mut order = Vec::<String>::new();
+    let mut family_order = Vec::<String>::new();
     let mut type_alias_order = Vec::<String>::new();
+    let builtin_families = builtin_family_declarations();
+    let builtin_family_names = builtin_families
+        .iter()
+        .map(|family| family.name.clone())
+        .collect::<BTreeSet<_>>();
+    let mut families = builtin_families
+        .iter()
+        .cloned()
+        .into_iter()
+        .map(|family| (family.name.clone(), family))
+        .collect::<BTreeMap<_, _>>();
     let mut type_aliases = BTreeMap::<String, TypeAliasDecl>::new();
     let mut signatures = BTreeMap::<String, Signature>::new();
     let mut clauses = BTreeMap::<String, Vec<Clause>>::new();
@@ -1946,6 +2317,25 @@ fn group_program(surface: &SurfaceProgram) -> Result<Module> {
                     )));
                 }
                 imports.push(import_decl.clone());
+            }
+            Decl::Family(family) => {
+                if builtin_family_names.contains(&family.name) {
+                    // Builtin families are injected already; allow source-level redeclaration
+                    // to keep authoring ergonomic and avoid duplicate diagnostics.
+                    continue;
+                }
+                if !family_order.contains(&family.name) {
+                    family_order.push(family.name.clone());
+                }
+                if families
+                    .insert(family.name.clone(), family.clone())
+                    .is_some()
+                {
+                    return Err(SimdError::new(format!(
+                        "family '{}' is declared more than once",
+                        family.name
+                    )));
+                }
             }
             Decl::TypeAlias(alias) => {
                 if !type_alias_order.contains(&alias.name) {
@@ -2067,14 +2457,32 @@ fn group_program(surface: &SurfaceProgram) -> Result<Module> {
         )));
     }
 
+    let mut resolved_families = builtin_families;
+    for name in family_order {
+        let family = families
+            .get(&name)
+            .cloned()
+            .ok_or_else(|| SimdError::new(format!("missing family declaration '{}'", name)))?;
+        resolved_families.push(family);
+    }
+    let family_names = resolved_families
+        .iter()
+        .map(|family| family.name.clone())
+        .collect::<BTreeSet<_>>();
+
     let alias_names = type_aliases.keys().cloned().collect::<BTreeSet<_>>();
     let operator_instances = collect_operator_instances(&functions)?;
+    let family_instances = collect_family_instances(&functions)?;
     validate_operator_coherence(&operator_instances, &alias_names)?;
+    validate_family_instance_targets(&operator_instances, &family_instances, &family_names)?;
+    validate_family_coherence(&family_instances, &alias_names)?;
 
     Ok(Module {
         imports,
+        families: resolved_families,
         type_aliases: resolved_aliases,
         operator_instances,
+        family_instances,
         functions,
     })
 }
@@ -2111,6 +2519,89 @@ fn collect_operator_instances(functions: &[FunctionDef]) -> Result<Vec<OperatorI
         });
     }
     Ok(instances)
+}
+
+fn collect_family_instances(functions: &[FunctionDef]) -> Result<Vec<FamilyInstanceDecl>> {
+    let mut instances = Vec::new();
+    for function in functions {
+        let Some(spec) = function.signature.family_instance.clone() else {
+            continue;
+        };
+        let decoded = decode_family_instance_name(&function.name).ok_or_else(|| {
+            SimdError::new(format!(
+                "family instance '{}' has an invalid internal name",
+                function.name
+            ))
+        })?;
+        if decoded != spec {
+            return Err(SimdError::new(format!(
+                "family instance '{}' internal name does not match its declaration head",
+                function.name
+            )));
+        }
+        instances.push(FamilyInstanceDecl {
+            function_name: function.name.clone(),
+            spec,
+        });
+    }
+    Ok(instances)
+}
+
+fn validate_family_instance_targets(
+    operator_instances: &[OperatorInstanceDecl],
+    family_instances: &[FamilyInstanceDecl],
+    family_names: &BTreeSet<String>,
+) -> Result<()> {
+    for instance in operator_instances {
+        if !family_names.contains(&instance.spec.family) {
+            return Err(SimdError::new(format!(
+                "operator instance '{}' targets undeclared family '{}'",
+                render_operator_instance_spec(&instance.spec),
+                instance.spec.family
+            )));
+        }
+    }
+    for instance in family_instances {
+        if !family_names.contains(&instance.spec.family) {
+            return Err(SimdError::new(format!(
+                "family instance '{}' targets undeclared family '{}'",
+                render_family_instance_spec(&instance.spec),
+                instance.spec.family
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_family_coherence(
+    instances: &[FamilyInstanceDecl],
+    alias_names: &BTreeSet<String>,
+) -> Result<()> {
+    for (index, left) in instances.iter().enumerate() {
+        for right in instances.iter().skip(index + 1) {
+            if left.spec.family != right.spec.family {
+                continue;
+            }
+            if left.spec.segments.len() != right.spec.segments.len() {
+                continue;
+            }
+            if left
+                .spec
+                .segments
+                .iter()
+                .zip(&right.spec.segments)
+                .all(|(a, b)| operator_segment_compatible(a, b, alias_names))
+            {
+                return Err(SimdError::new(format!(
+                    "overlapping family instances for '{}': '{}' and '{}'",
+                    left.spec.family,
+                    render_family_instance_spec(&left.spec),
+                    render_family_instance_spec(&right.spec)
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_operator_coherence(
@@ -2232,7 +2723,11 @@ fn resolve_type_aliases_in_type(
                     .collect::<BTreeMap<_, _>>();
                 Ok(apply_type_subst(&alias_body, &subst))
             } else if resolved_args.is_empty() {
-                Ok(Type::Var(name.clone()))
+                if name == "string" {
+                    Ok(Type::Named(name.clone(), Vec::new()))
+                } else {
+                    Ok(Type::Var(name.clone()))
+                }
             } else {
                 Err(SimdError::new(format!(
                     "unknown type constructor '{}' with {} arguments",
@@ -2289,7 +2784,7 @@ fn analyze_pointwise(module: &Module) -> Result<BTreeMap<String, bool>> {
 
 fn validate_pointwise_expr(expr: &Expr, known: &BTreeMap<String, usize>) -> Result<()> {
     match expr {
-        Expr::Ref(_) | Expr::Int(_) | Expr::Float(_) => Ok(()),
+        Expr::Ref(_) | Expr::Int(_) | Expr::Float(_) | Expr::String(_) => Ok(()),
         Expr::Lambda { body, .. } => validate_pointwise_expr(body, known),
         Expr::Let { bindings, body } => {
             for binding in bindings {
@@ -2349,6 +2844,12 @@ fn check_program(module: &Module, pointwise: &BTreeMap<String, bool>) -> Result<
         .map(|import| (import.alias.clone(), import.path.clone()))
         .collect::<BTreeMap<_, _>>();
     let operator_index = build_operator_index(&module.operator_instances);
+    let family_index = build_family_index(&module.family_instances);
+    let family_types = module
+        .families
+        .iter()
+        .map(|family| (family.name.clone(), family.ty.clone()))
+        .collect::<BTreeMap<_, _>>();
 
     let mut checked_functions = Vec::new();
     for function in &module.functions {
@@ -2370,6 +2871,8 @@ fn check_program(module: &Module, pointwise: &BTreeMap<String, bool>) -> Result<
                 imports: &import_aliases,
                 pointwise,
                 operator_instances: &operator_index,
+                family_instances: &family_index,
+                families: &family_types,
             };
             let body = infer_expr(&clause.body, &context, Some(&ret_type))?;
             if body.ty != ret_type {
@@ -2453,6 +2956,8 @@ struct TypeContext<'a> {
     imports: &'a BTreeMap<String, String>,
     pointwise: &'a BTreeMap<String, bool>,
     operator_instances: &'a BTreeMap<PrimOp, Vec<String>>,
+    family_instances: &'a BTreeMap<String, Vec<String>>,
+    families: &'a BTreeMap<String, Type>,
 }
 
 fn build_operator_index(instances: &[OperatorInstanceDecl]) -> BTreeMap<PrimOp, Vec<String>> {
@@ -2460,6 +2965,17 @@ fn build_operator_index(instances: &[OperatorInstanceDecl]) -> BTreeMap<PrimOp, 
     for instance in instances {
         index
             .entry(instance.spec.op)
+            .or_default()
+            .push(instance.function_name.clone());
+    }
+    index
+}
+
+fn build_family_index(instances: &[FamilyInstanceDecl]) -> BTreeMap<String, Vec<String>> {
+    let mut index = BTreeMap::<String, Vec<String>>::new();
+    for instance in instances {
+        index
+            .entry(instance.spec.family.clone())
             .or_default()
             .push(instance.function_name.clone());
     }
@@ -2515,6 +3031,22 @@ fn infer_expr(
             Ok(TypedExpr {
                 ty: Type::Scalar(prim),
                 kind: TypedExprKind::Float(*value, prim),
+            })
+        }
+        Expr::String(value) => {
+            let ty = Type::Named("string".to_string(), Vec::new());
+            if let Some(expected_ty) = expected
+                && expected_ty != &ty
+                && !matches!(expected_ty, Type::Var(_) | Type::Infer(_))
+            {
+                return Err(SimdError::new(format!(
+                    "string literal has type {:?}, expected {:?}",
+                    ty, expected_ty
+                )));
+            }
+            Ok(TypedExpr {
+                ty,
+                kind: TypedExprKind::String(value.clone()),
             })
         }
         Expr::Lambda { param, body } => infer_lambda_expr(param, body, context, expected),
@@ -2626,6 +3158,8 @@ fn infer_lambda_expr(
         imports: context.imports,
         pointwise: context.pointwise,
         operator_instances: context.operator_instances,
+        family_instances: context.family_instances,
+        families: context.families,
     };
     let typed_body = infer_expr(body, &body_context, Some(&ret_ty))?;
     if typed_body.ty != ret_ty {
@@ -2662,6 +3196,8 @@ fn infer_let_expr(
             imports: context.imports,
             pointwise: context.pointwise,
             operator_instances: context.operator_instances,
+            family_instances: context.family_instances,
+            families: context.families,
         };
         let typed = infer_expr(&binding.expr, &binding_context, None)?;
         if binding.name != "_" {
@@ -2680,6 +3216,8 @@ fn infer_let_expr(
         imports: context.imports,
         pointwise: context.pointwise,
         operator_instances: context.operator_instances,
+        family_instances: context.family_instances,
+        families: context.families,
     };
     let typed_body = infer_expr(body, &body_context, expected)?;
     Ok(TypedExpr {
@@ -2782,7 +3320,7 @@ fn collect_expr_local_names_into(expr: &Expr, names: &mut BTreeSet<String>) {
                 names.insert(reference.name.clone());
             }
         }
-        Expr::Int(_) | Expr::Float(_) => {}
+        Expr::Int(_) | Expr::Float(_) | Expr::String(_) => {}
         Expr::Lambda { body, .. } => {
             collect_expr_local_names_into(body, names);
         }
@@ -3188,21 +3726,179 @@ fn infer_direct_function_call(
     let Expr::Ref(reference) = head else {
         return Ok(None);
     };
-    let Some(name) = resolve_ref_name(reference, context) else {
+    if let Some(name) = resolve_ref_name(reference, context) {
+        let explicit_type_args = if name.starts_with("__fam$") {
+            &[][..]
+        } else {
+            reference.type_args.as_slice()
+        };
+        let signature = context
+            .signatures
+            .get(&name)
+            .ok_or_else(|| SimdError::new(format!("unknown function '{}'", name)))?;
+        return infer_direct_named_call(
+            &name,
+            signature,
+            explicit_type_args,
+            args_exprs,
+            context,
+            expected,
+        );
+    }
+    if reference.alias.is_none() && context.families.contains_key(&reference.name) {
+        return infer_named_family_call(
+            &reference.name,
+            &reference.type_args,
+            args_exprs,
+            context,
+            expected,
+        );
+    }
+    Ok(None)
+}
+
+fn infer_named_family_call(
+    family: &str,
+    explicit_type_args: &[TypeArg],
+    args_exprs: &[&Expr],
+    context: &TypeContext<'_>,
+    expected: Option<&Type>,
+) -> Result<Option<TypedExpr>> {
+    let mut matches = Vec::<TypedExpr>::new();
+    let mut match_names = Vec::<String>::new();
+    if let Some(candidates) = context.family_instances.get(family) {
+        for name in candidates {
+            let signature = context
+                .signatures
+                .get(name)
+                .ok_or_else(|| SimdError::new(format!("unknown family instance '{}'", name)))?;
+            match infer_direct_named_call(
+                name,
+                signature,
+                explicit_type_args,
+                args_exprs,
+                context,
+                expected,
+            ) {
+                Ok(Some(typed)) => {
+                    matches.push(typed);
+                    match_names.push(name.clone());
+                }
+                Ok(None) => {}
+                Err(_) => {}
+            }
+        }
+    }
+
+    match matches.len() {
+        0 => infer_builtin_named_family_call(
+            family,
+            explicit_type_args,
+            args_exprs,
+            context,
+            expected,
+        ),
+        1 => Ok(Some(matches.into_iter().next().unwrap())),
+        _ => {
+            let rendered = match_names
+                .iter()
+                .map(|name| {
+                    decode_family_instance_name(name)
+                        .map(|spec| render_family_instance_spec(&spec))
+                        .unwrap_or_else(|| name.clone())
+                })
+                .collect::<Vec<_>>();
+            Err(SimdError::new(format!(
+                "ambiguous family resolution for '{}': {}",
+                family,
+                rendered.join(", ")
+            )))
+        }
+    }
+}
+
+fn infer_builtin_named_family_call(
+    family: &str,
+    explicit_type_args: &[TypeArg],
+    args_exprs: &[&Expr],
+    context: &TypeContext<'_>,
+    expected: Option<&Type>,
+) -> Result<Option<TypedExpr>> {
+    if !explicit_type_args.is_empty() {
+        return Err(SimdError::new(format!(
+            "explicit specialization expects 0 type arguments, found {}",
+            explicit_type_args.len()
+        )));
+    }
+    let Some((callee, signature_ty)) =
+        infer_named_family_builtin_signature(family, args_exprs.len())
+    else {
         return Ok(None);
     };
-    let signature = context
-        .signatures
-        .get(&name)
-        .ok_or_else(|| SimdError::new(format!("unknown function '{}'", name)))?;
-    infer_direct_named_call(
-        &name,
-        signature,
-        &reference.type_args,
-        args_exprs,
-        context,
-        expected,
-    )
+    let signature = Signature {
+        name: family.to_string(),
+        ty: signature_ty,
+        operator_instance: None,
+        family_instance: None,
+    };
+    let typed =
+        infer_direct_named_call("__builtin", &signature, &[], args_exprs, context, expected)?;
+    let Some(TypedExpr {
+        ty,
+        kind: TypedExprKind::Call {
+            args, lifted_shape, ..
+        },
+    }) = typed
+    else {
+        return Ok(None);
+    };
+    Ok(Some(TypedExpr {
+        ty,
+        kind: TypedExprKind::Call {
+            callee: Callee::Builtin(callee),
+            args,
+            lifted_shape,
+        },
+    }))
+}
+
+fn infer_named_family_builtin_signature(
+    family: &str,
+    arg_count: usize,
+) -> Option<(BuiltinFamilyCallee, Type)> {
+    let string_ty = Type::Named("string".to_string(), Vec::new());
+    match (family, arg_count) {
+        ("concat", 2) => Some((
+            BuiltinFamilyCallee::ConcatString,
+            Type::Fun(
+                vec![string_ty.clone(), string_ty.clone()],
+                Box::new(string_ty),
+            ),
+        )),
+        ("len", 1) => Some((
+            BuiltinFamilyCallee::LenString,
+            Type::Fun(vec![string_ty.clone()], Box::new(Type::Scalar(Prim::I64))),
+        )),
+        ("slice", 3) => Some((
+            BuiltinFamilyCallee::SliceString,
+            Type::Fun(
+                vec![
+                    string_ty.clone(),
+                    Type::Scalar(Prim::I64),
+                    Type::Scalar(Prim::I64),
+                ],
+                Box::new(string_ty),
+            ),
+        )),
+        ("contains", 2) => Some((
+            BuiltinFamilyCallee::ContainsString,
+            Type::Fun(
+                vec![string_ty.clone(), string_ty.clone()],
+                Box::new(Type::Scalar(Prim::I64)),
+            ),
+        )),
+        _ => None,
+    }
 }
 
 fn infer_direct_named_call(
@@ -3323,6 +4019,17 @@ fn infer_direct_named_call(
 }
 
 fn resolve_ref_name(reference: &RefExpr, context: &TypeContext<'_>) -> Option<String> {
+    if reference.alias.is_none() && !reference.type_args.is_empty() {
+        let segments = reference
+            .type_args
+            .iter()
+            .map(type_arg_segment)
+            .collect::<Vec<_>>();
+        let specialized = encode_family_instance_name(&reference.name, &segments);
+        if context.signatures.contains_key(&specialized) {
+            return Some(specialized);
+        }
+    }
     if reference.alias.is_none() && context.signatures.contains_key(&reference.name) {
         return Some(reference.name.clone());
     }
@@ -3336,6 +4043,18 @@ fn resolve_ref_name(reference: &RefExpr, context: &TypeContext<'_>) -> Option<St
         return Some(reference.name.clone());
     }
     None
+}
+
+fn type_arg_segment(type_arg: &TypeArg) -> String {
+    match type_arg {
+        TypeArg::Prim(prim) => match prim {
+            Prim::I32 => "i32".to_string(),
+            Prim::I64 => "i64".to_string(),
+            Prim::F32 => "f32".to_string(),
+            Prim::F64 => "f64".to_string(),
+        },
+        TypeArg::Name(name) => name.clone(),
+    }
 }
 
 fn render_ref_resolution_suffix(reference: &RefExpr, context: &TypeContext<'_>) -> String {
@@ -3441,7 +4160,11 @@ fn infer_primitive_call(
     if let Some(instance_call) = infer_operator_instance_call(op, lhs, rhs, context, expected)? {
         return Ok(instance_call);
     }
-    let mut left = infer_expr(lhs, context, expected)?;
+    let operand_expected = match op {
+        PrimOp::Eq | PrimOp::Lt | PrimOp::Gt | PrimOp::Le | PrimOp::Ge => None,
+        _ => expected,
+    };
+    let mut left = infer_expr(lhs, context, operand_expected)?;
     let mut right =
         infer_expr(rhs, context, Some(&left.ty)).or_else(|_| infer_expr(rhs, context, None))?;
 
@@ -3469,6 +4192,9 @@ fn infer_primitive_call(
             }
         }
     }
+    if let Some(builtin_call) = infer_builtin_operator_call(op, &left, &right) {
+        return Ok(builtin_call);
+    }
     let (left_mode, right_mode, result_ty) = infer_primitive_signature(op, &left.ty, &right.ty)?;
     let call_shape = match (&left_mode, &right_mode) {
         (AccessKind::Lane, _) => left.ty.bulk_shape(),
@@ -3490,6 +4216,37 @@ fn infer_primitive_call(
                 },
             ],
             lifted_shape: call_shape,
+        },
+    })
+}
+
+fn infer_builtin_operator_call(
+    op: PrimOp,
+    left: &TypedExpr,
+    right: &TypedExpr,
+) -> Option<TypedExpr> {
+    if op != PrimOp::Eq {
+        return None;
+    }
+    let string_ty = Type::Named("string".to_string(), Vec::new());
+    if left.ty != string_ty || right.ty != string_ty {
+        return None;
+    }
+    Some(TypedExpr {
+        ty: Type::Scalar(Prim::I64),
+        kind: TypedExprKind::Call {
+            callee: Callee::Builtin(BuiltinFamilyCallee::EqString),
+            args: vec![
+                TypedArg {
+                    mode: AccessKind::Same,
+                    expr: Box::new(left.clone()),
+                },
+                TypedArg {
+                    mode: AccessKind::Same,
+                    expr: Box::new(right.clone()),
+                },
+            ],
+            lifted_shape: None,
         },
     })
 }
@@ -3746,6 +4503,14 @@ fn unify_param_type(
         (Type::Var(_), _) => Ok(()),
         (Type::Infer(_), _) => Ok(()),
         (Type::TypeToken(left), Type::TypeToken(right)) => unify_param_type(left, right, dim_subst),
+        (Type::Named(left_name, left_args), Type::Named(right_name, right_args))
+            if left_name == right_name && left_args.len() == right_args.len() =>
+        {
+            for (left_arg, right_arg) in left_args.iter().zip(right_args) {
+                unify_param_type(left_arg, right_arg, dim_subst)?;
+            }
+            Ok(())
+        }
         (Type::Scalar(left), Type::Scalar(right)) if left == right => Ok(()),
         (Type::Bulk(left_prim, left_shape), Type::Bulk(right_prim, right_shape))
             if left_prim == right_prim && left_shape.0.len() == right_shape.0.len() =>
@@ -3872,6 +4637,7 @@ fn visit_tail_calls(
         | TypedExprKind::FunctionRef { .. }
         | TypedExprKind::Int(_, _)
         | TypedExprKind::Float(_, _)
+        | TypedExprKind::String(_)
         | TypedExprKind::TypeToken(_) => {}
         TypedExprKind::Lambda { body, .. } => {
             visit_tail_calls(body, self_name, false, recursive, valid);
@@ -3997,7 +4763,8 @@ fn typed_expr_uses_type_witness(expr: &TypedExpr) -> bool {
         TypedExprKind::Local(_)
         | TypedExprKind::FunctionRef { .. }
         | TypedExprKind::Int(_, _)
-        | TypedExprKind::Float(_, _) => false,
+        | TypedExprKind::Float(_, _)
+        | TypedExprKind::String(_) => false,
         TypedExprKind::Lambda { body, .. } => typed_expr_uses_type_witness(body),
         TypedExprKind::Let { bindings, body } => {
             bindings
@@ -4117,6 +4884,7 @@ fn normalize_function_leaf(
         name: leaf_name.clone(),
         ty: Type::Fun(param_types, Box::new(result_leaf.ty.clone())),
         operator_instance: None,
+        family_instance: None,
     };
     let tailrec = analyze_tailrec(&leaf_name, &clauses);
     Ok(NormalizedFunction {
@@ -4176,6 +4944,17 @@ fn normalize_expr_to_leaf(
             Ok(TypedExpr {
                 ty: leaf_ty,
                 kind: TypedExprKind::Float(*value, *prim),
+            })
+        }
+        TypedExprKind::String(value) => {
+            if !requested.is_root() {
+                return Err(SimdError::new(
+                    "string literal cannot be projected into a record leaf",
+                ));
+            }
+            Ok(TypedExpr {
+                ty: leaf_ty,
+                kind: TypedExprKind::String(value.clone()),
             })
         }
         TypedExprKind::TypeToken(_) => Err(SimdError::new(
@@ -4326,6 +5105,40 @@ fn normalize_expr_to_leaf(
                 },
             })
         }
+        TypedExprKind::Call {
+            callee: Callee::Builtin(kind),
+            args,
+            lifted_shape,
+        } => {
+            if !requested.is_root() {
+                return Err(SimdError::new(format!(
+                    "builtin {:?} cannot normalize to nested record leaf {:?}",
+                    kind, requested
+                )));
+            }
+            let args = args
+                .iter()
+                .map(|arg| {
+                    Ok(TypedArg {
+                        mode: arg.mode,
+                        expr: Box::new(normalize_expr_to_leaf(
+                            &arg.expr,
+                            &LeafPath::root(),
+                            locals,
+                            entries,
+                        )?),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(TypedExpr {
+                ty: leaf_ty,
+                kind: TypedExprKind::Call {
+                    callee: Callee::Builtin(kind.clone()),
+                    args,
+                    lifted_shape: lifted_shape.clone(),
+                },
+            })
+        }
     }
 }
 
@@ -4333,6 +5146,7 @@ fn lookup_leaf_type(ty: &Type, path: &LeafPath) -> Result<Type> {
     if path.is_root() {
         return match ty {
             Type::Scalar(_) | Type::Bulk(_, _) => Ok(ty.clone()),
+            Type::Named(name, args) if name == "string" && args.is_empty() => Ok(ty.clone()),
             Type::TypeToken(_) => Err(SimdError::new(
                 "type witness values cannot appear as normalized leaf results",
             )),
@@ -4382,6 +5196,7 @@ fn collect_typed_local_names(expr: &TypedExpr, names: &mut BTreeSet<String>) {
         TypedExprKind::FunctionRef { .. }
         | TypedExprKind::Int(_, _)
         | TypedExprKind::Float(_, _)
+        | TypedExprKind::String(_)
         | TypedExprKind::TypeToken(_) => {}
         TypedExprKind::Lambda { body, .. } => collect_typed_local_names(body, names),
         TypedExprKind::Let { bindings, body } => {
@@ -4937,7 +5752,7 @@ fn count_primitive_ops(expr: &IrExpr) -> usize {
             args,
         } => 1 + args.iter().map(count_primitive_ops).sum::<usize>(),
         IrExprKind::Call {
-            callee: Callee::Function(_),
+            callee: Callee::Function(_) | Callee::Builtin(_),
             args,
         } => args.iter().map(count_primitive_ops).sum(),
         IrExprKind::Let { bindings, body } => {
@@ -5142,6 +5957,9 @@ fn lower_expr_to_ir(
             ty: Type::Scalar(*prim),
             kind: IrExprKind::Float(*value, *prim),
         }),
+        TypedExprKind::String(_) => Err(SimdError::new(
+            "string expressions are currently evaluator-only and are not supported by loop lowering",
+        )),
         TypedExprKind::TypeToken(_) => Err(SimdError::new(
             "type witness expressions are not supported by loop lowering",
         )),
@@ -5439,6 +6257,7 @@ impl<'a> Evaluator<'a> {
             TypedExprKind::Float(value, prim) => Ok(EvalValue::Host(Value::Scalar(
                 make_float_value(*value, *prim),
             ))),
+            TypedExprKind::String(value) => Ok(EvalValue::Host(Value::String(value.clone()))),
             TypedExprKind::TypeToken(prim) => Ok(EvalValue::Host(Value::TypeToken(*prim))),
             TypedExprKind::Lambda { param, body } => Ok(EvalValue::Closure(Closure::Lambda {
                 param: param.clone(),
@@ -5578,6 +6397,13 @@ impl<'a> Evaluator<'a> {
                     *op, &values[0], &values[1],
                 )?)))
             }
+            Callee::Builtin(kind) => {
+                let mut values = Vec::new();
+                for arg in args {
+                    values.push(self.expect_host_value(self.eval_expr(&arg.expr, env)?)?);
+                }
+                Ok(EvalValue::Host(eval_builtin_family_scalar(kind, &values)?))
+            }
             Callee::Function(name) => {
                 let function = self
                     .functions
@@ -5649,6 +6475,7 @@ impl<'a> Evaluator<'a> {
                 let (_, ret) = function.signature.ty.fun_parts();
                 ret
             }
+            Callee::Builtin(kind) => builtin_family_result_type(kind),
         };
 
         let len = shape.iter().product::<usize>();
@@ -5692,6 +6519,18 @@ impl<'a> Evaluator<'a> {
                             SimdError::new(format!("unknown function '{}'", name))
                         })?;
                     self.expect_host_value(self.call_function(function, scalar_args)?)?
+                }
+                Callee::Builtin(kind) => {
+                    let values = scalar_args
+                        .into_iter()
+                        .map(|binding| match binding {
+                            Binding::Ready(EvalValue::Host(value)) => Ok(value),
+                            _ => Err(SimdError::new(
+                                "builtin lifted call received non-host lane value",
+                            )),
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    eval_builtin_family_scalar(kind, &values)?
                 }
             };
             lane_results.push(value);
@@ -5791,6 +6630,90 @@ fn primitive_result_prim(op: PrimOp, prim: Prim) -> Prim {
     match op {
         PrimOp::Eq | PrimOp::Lt | PrimOp::Gt | PrimOp::Le | PrimOp::Ge => Prim::I64,
         _ => prim,
+    }
+}
+
+fn builtin_family_result_type(kind: &BuiltinFamilyCallee) -> Type {
+    match kind {
+        BuiltinFamilyCallee::ConcatString | BuiltinFamilyCallee::SliceString => {
+            Type::Named("string".to_string(), Vec::new())
+        }
+        BuiltinFamilyCallee::LenString
+        | BuiltinFamilyCallee::ContainsString
+        | BuiltinFamilyCallee::EqString => Type::Scalar(Prim::I64),
+    }
+}
+
+fn eval_builtin_family_scalar(kind: &BuiltinFamilyCallee, args: &[Value]) -> Result<Value> {
+    match kind {
+        BuiltinFamilyCallee::ConcatString => {
+            if args.len() != 2 {
+                return Err(SimdError::new("concat\\string expects 2 arguments"));
+            }
+            let a = expect_string_value(&args[0], "concat\\string argument 1")?;
+            let b = expect_string_value(&args[1], "concat\\string argument 2")?;
+            Ok(Value::String(format!("{}{}", a, b)))
+        }
+        BuiltinFamilyCallee::LenString => {
+            if args.len() != 1 {
+                return Err(SimdError::new("len\\string expects 1 argument"));
+            }
+            let value = expect_string_value(&args[0], "len\\string argument 1")?;
+            Ok(Value::Scalar(
+                ScalarValue::I64(value.chars().count() as i64),
+            ))
+        }
+        BuiltinFamilyCallee::SliceString => {
+            if args.len() != 3 {
+                return Err(SimdError::new("slice\\string expects 3 arguments"));
+            }
+            let source = expect_string_value(&args[0], "slice\\string argument 1")?;
+            let start = expect_i64_scalar_value(&args[1], "slice\\string argument 2")?;
+            let len = expect_i64_scalar_value(&args[2], "slice\\string argument 3")?;
+            let start = usize::try_from(start.max(0)).unwrap_or(usize::MAX);
+            let len = usize::try_from(len.max(0)).unwrap_or(usize::MAX);
+            let sliced = source.chars().skip(start).take(len).collect::<String>();
+            Ok(Value::String(sliced))
+        }
+        BuiltinFamilyCallee::ContainsString => {
+            if args.len() != 2 {
+                return Err(SimdError::new("contains\\string expects 2 arguments"));
+            }
+            let haystack = expect_string_value(&args[0], "contains\\string argument 1")?;
+            let needle = expect_string_value(&args[1], "contains\\string argument 2")?;
+            Ok(Value::Scalar(ScalarValue::I64(
+                if haystack.contains(needle) { 1 } else { 0 },
+            )))
+        }
+        BuiltinFamilyCallee::EqString => {
+            if args.len() != 2 {
+                return Err(SimdError::new("(==)\\string expects 2 arguments"));
+            }
+            let a = expect_string_value(&args[0], "(==)\\string argument 1")?;
+            let b = expect_string_value(&args[1], "(==)\\string argument 2")?;
+            Ok(Value::Scalar(ScalarValue::I64(if a == b { 1 } else { 0 })))
+        }
+    }
+}
+
+fn expect_string_value<'a>(value: &'a Value, label: &str) -> Result<&'a str> {
+    match value {
+        Value::String(value) => Ok(value.as_str()),
+        other => Err(SimdError::new(format!(
+            "{} must be a string, found {:?}",
+            label, other
+        ))),
+    }
+}
+
+fn expect_i64_scalar_value(value: &Value, label: &str) -> Result<i64> {
+    match value {
+        Value::Scalar(ScalarValue::I64(value)) => Ok(*value),
+        Value::Scalar(ScalarValue::I32(value)) => Ok(i64::from(*value)),
+        other => Err(SimdError::new(format!(
+            "{} must be an integer scalar, found {:?}",
+            label, other
+        ))),
     }
 }
 
@@ -5957,6 +6880,10 @@ impl<'a> LoweredEvaluator<'a> {
                             "scalar lowered function '{}' received type witness input",
                             name
                         ))),
+                        Value::String(_) => Err(SimdError::new(format!(
+                            "scalar lowered function '{}' received string input",
+                            name
+                        ))),
                         Value::Record(_) => Err(SimdError::new(format!(
                             "scalar lowered function '{}' received record input",
                             name
@@ -6051,6 +6978,11 @@ impl<'a> LoweredEvaluator<'a> {
                             "kernel lowering does not support type witness runtime values",
                         ));
                     }
+                    (Value::String(_), _) => {
+                        return Err(SimdError::new(
+                            "kernel lowering does not support string runtime values",
+                        ));
+                    }
                     (Value::Scalar(_), AccessKind::Lane) => {
                         return Err(SimdError::new(
                             "kernel lane parameter received scalar input",
@@ -6136,6 +7068,9 @@ impl<'a> LoweredEvaluator<'a> {
                             values.into_iter().map(Value::Scalar).collect::<Vec<_>>(),
                         )?
                         .expect_scalar(),
+                    Callee::Builtin(_) => Err(SimdError::new(
+                        "lowered evaluator does not support builtin family calls",
+                    )),
                 }
             }
         }
@@ -6153,6 +7088,7 @@ impl ValueExt for Value {
             Value::Bulk(_) => Err(SimdError::new("expected scalar value, found bulk")),
             Value::TypeToken(_) => Err(SimdError::new("expected scalar value, found type witness")),
             Value::Record(_) => Err(SimdError::new("expected scalar value, found record")),
+            Value::String(_) => Err(SimdError::new("expected scalar value, found string")),
         }
     }
 }
@@ -6446,6 +7382,12 @@ fn value_from_json(
             }
             Ok(Value::Record(record))
         }
+        Type::Named(name, args) if name == "string" && args.is_empty() => match json {
+            JsonValue::String(value) => Ok(Value::String(value.clone())),
+            _ => Err(SimdError::new(
+                "string runtime argument must be a JSON string",
+            )),
+        },
         Type::Named(_, _) | Type::Var(_) | Type::Infer(_) => Err(SimdError::new(
             "host JSON cannot provide values for unresolved polymorphic types",
         )),
@@ -6956,6 +7898,42 @@ mod tests {
     }
 
     #[test]
+    fn parses_family_declarations_and_string_literals() {
+        let program = parse_source(
+            "family concat : t -> t -> t\nfamily (==) : t -> t -> i64\nmain : string -> string\nmain s = concat s \"!\"\n",
+        )
+        .unwrap();
+        assert_eq!(program.decls.len(), 4);
+        assert!(matches!(program.decls[0], Decl::Family(_)));
+        assert!(matches!(program.decls[1], Decl::Family(_)));
+    }
+
+    #[test]
+    fn parses_backtick_function_infix_call() {
+        let program =
+            parse_source("main : string -> string -> string\nmain a b = a `concat` b\n").unwrap();
+        assert_eq!(program.decls.len(), 2);
+    }
+
+    #[test]
+    fn allows_redeclaring_builtin_family_with_same_signature() {
+        let program = compile_source(
+            "family concat : t -> t -> t\nconcat\\string : string -> string -> string\nconcat\\string a b = a\nmain : string\nmain = concat\\string \"a\" \"b\"\n",
+        )
+        .expect("builtin family redeclaration with same signature should be accepted");
+        assert!(!program.checked.functions.is_empty());
+    }
+
+    #[test]
+    fn allows_redeclaring_builtin_family_without_duplicate_error() {
+        let program = compile_source(
+            "family concat : t -> t -> i64\nconcat\\string : string -> string -> i64\nconcat\\string a b = 0\nmain : i64\nmain = concat\\string \"a\" \"b\"\n",
+        )
+        .expect("redeclaring injected builtin family should not hard-fail");
+        assert!(!program.checked.functions.is_empty());
+    }
+
+    #[test]
     fn rejects_import_after_function_declaration() {
         let error = parse_source("main : i64 -> i64\nmain x = x\nimport math/scalar as scalar\n")
             .unwrap_err();
@@ -7134,6 +8112,32 @@ mod tests {
     }
 
     #[test]
+    fn rejects_family_instance_without_family_declaration() {
+        let error = compile_source(
+            "foo\\string : string -> string -> string\nfoo\\string a b = a\nmain : string -> string -> string\nmain a b = foo a b\n",
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("targets undeclared family 'foo'")
+        );
+    }
+
+    #[test]
+    fn rejects_unresolved_family_call_without_matching_instance() {
+        let error = compile_source(
+            "family foo : t -> t\nfoo\\string : string -> string\nfoo\\string s = s\nmain : i64 -> i64\nmain x = foo x\n",
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unknown function reference 'foo'")
+        );
+    }
+
+    #[test]
     fn rejects_type_alias_cycles() {
         let error =
             compile_source("type a = b\ntype b = a\nmain : i64 -> i64\nmain x = x\n").unwrap_err();
@@ -7156,6 +8160,47 @@ mod tests {
     fn evaluates_explicit_specialization_in_value_position() {
         let src = "id : t -> t\nid x = x\nmain : i64 -> i64\nmain x = let f = id\\i64 in f x\n";
         assert_eq!(run(src, "main", "[7]"), "7");
+    }
+
+    #[test]
+    fn evaluates_builtin_string_families() {
+        let concat_src = "main : string -> string -> string\nmain a b = concat a b\n";
+        assert_eq!(
+            run(concat_src, "main", "[\"hello \",\"world\"]"),
+            "\"hello world\""
+        );
+
+        let len_src = "main : string -> i64\nmain s = len s\n";
+        assert_eq!(run(len_src, "main", "[\"shader\"]"), "6");
+
+        let slice_src = "main : string -> i64 -> i64 -> string\nmain s start n = slice s start n\n";
+        assert_eq!(run(slice_src, "main", "[\"abcdef\",2,3]"), "\"cde\"");
+
+        let contains_src = "main : string -> string -> i64\nmain s needle = contains s needle\n";
+        assert_eq!(run(contains_src, "main", "[\"abcdef\",\"cd\"]"), "1");
+        assert_eq!(run(contains_src, "main", "[\"abcdef\",\"zz\"]"), "0");
+    }
+
+    #[test]
+    fn evaluates_string_families_without_explicit_family_declarations() {
+        let src = "concat\\string : string -> string -> string\nconcat\\string a b = a\nmain : i64\nmain = concat\\string \"a\" \"b\" == \"a\"\n";
+        assert_eq!(run(src, "main", "[]"), "1");
+    }
+
+    #[test]
+    fn evaluates_string_equality_with_infix_operator() {
+        let src = "main : string -> string -> i64\nmain a b = a == b\n";
+        assert_eq!(run(src, "main", "[\"simd\",\"simd\"]"), "1");
+        assert_eq!(run(src, "main", "[\"simd\",\"rust\"]"), "0");
+    }
+
+    #[test]
+    fn evaluates_backtick_function_infix_call() {
+        let src = "main : string -> string -> string\nmain a b = a `concat` b\n";
+        assert_eq!(
+            run(src, "main", "[\"hello \",\"world\"]"),
+            "\"hello world\""
+        );
     }
 
     #[test]
