@@ -1,0 +1,13 @@
+/home/mewhhaha/src/simd/tools/tree-sitter-simd/test/query/type_alias_operator.simd
+    pattern:  2, capture: 4 - keyword, start: (0, 0), end: (0, 4), text: `type`
+    pattern:  2, capture: 1 - type, start: (0, 5), end: (0, 7), text: `v3`
+    pattern:  2, capture: 5 - type.parameter, start: (0, 8), end: (0, 9), text: `a`
+    pattern: 22, capture: 11 - punctuation.bracket, start: (0, 12), end: (0, 13), text: `{`
+    pattern:  8, capture: 9 - property, start: (0, 13), end: (0, 14), text: `x`
+    pattern:  8, capture: 9 - property, start: (0, 17), end: (0, 18), text: `y`
+    pattern:  8, capture: 9 - property, start: (0, 21), end: (0, 22), text: `z`
+    pattern: 22, capture: 11 - punctuation.bracket, start: (0, 24), end: (0, 25), text: `}`
+    pattern: 22, capture: 11 - punctuation.bracket, start: (2, 0), end: (2, 1), text: `(`
+    pattern: 22, capture: 11 - punctuation.bracket, start: (2, 2), end: (2, 3), text: `)`
+    pattern: 22, capture: 11 - punctuation.bracket, start: (3, 0), end: (3, 1), text: `(`
+    pattern: 22, capture: 11 - punctuation.bracket, start: (3, 2), end: (3, 3), text: `)`

@@ -1,0 +1,4 @@
+type v3 a = {x:a,y:a,z:a}
+
+(*)\v3\a : v3 a -> v3 a -> v3 a
+(*)\v3\a lhs rhs = lhs

@@ -210,6 +210,31 @@ fn hover_for_position(source: &str, position: Position) -> Option<Hover> {
     }
     let (_surface, module, checked) = compile_frontend(source).ok()?;
 
+    if let Some(alias) = module
+        .type_aliases
+        .iter()
+        .find(|alias| alias.name == ident.name)
+    {
+        let params = if alias.params.is_empty() {
+            String::new()
+        } else {
+            format!(" {}", alias.params.join(" "))
+        };
+        let rendered = format!(
+            "```simd\ntype {}{} = {}\n```",
+            alias.name,
+            params,
+            format_type_for_display(&alias.body)
+        );
+        return Some(Hover {
+            contents: HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: rendered,
+            }),
+            range: Some(ident.range),
+        });
+    }
+
     if let Some(function) = module
         .functions
         .iter()

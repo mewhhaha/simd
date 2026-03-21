@@ -1,13 +1,32 @@
 (signature
-  name: (identifier) @function
+  head: (decl_head
+    (identifier) @function)
   type: (type) @type)
 
 (clause
-  name: (identifier) @function
+  head: (decl_head
+    (identifier) @function)
   [
     pattern: (pattern (identifier)) @variable.parameter
     pattern: (pattern (prim_type)) @type.builtin
   ])
+
+(type_alias
+  "type" @keyword
+  name: (identifier) @type
+  param: (identifier) @type.parameter)
+
+(signature
+  head: (decl_head
+    (operator_head
+      operator: (_) @operator
+      segment: (identifier) @type)))
+
+(clause
+  head: (decl_head
+    (operator_head
+      operator: (_) @operator
+      segment: (identifier) @type)))
 
 (qualified_ref
   head: (identifier) @function

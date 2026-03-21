@@ -50,6 +50,7 @@ pub struct SurfaceProgram {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Decl {
     Import(ImportDecl),
+    TypeAlias(TypeAliasDecl),
     Signature(Signature),
     Clause(Clause),
 }
@@ -61,9 +62,23 @@ pub struct ImportDecl {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct TypeAliasDecl {
+    pub name: String,
+    pub params: Vec<String>,
+    pub body: Type,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperatorInstanceSpec {
+    pub op: PrimOp,
+    pub segments: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct Signature {
     pub name: String,
     pub ty: Type,
+    pub operator_instance: Option<OperatorInstanceSpec>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -71,6 +86,7 @@ pub struct Clause {
     pub name: String,
     pub patterns: Vec<Pattern>,
     pub body: Expr,
+    pub operator_instance: Option<OperatorInstanceSpec>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -128,7 +144,7 @@ pub enum Expr {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PrimOp {
     Add,
     Sub,
@@ -166,6 +182,7 @@ pub enum Type {
     Bulk(Prim, Shape),
     TypeToken(Box<Type>),
     Record(BTreeMap<String, Type>),
+    Named(String, Vec<Type>),
     Var(String),
     Infer(u32),
     Fun(Vec<Type>, Box<Type>),
@@ -191,7 +208,15 @@ pub enum Dim {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Module {
     pub imports: Vec<ImportDecl>,
+    pub type_aliases: Vec<TypeAliasDecl>,
+    pub operator_instances: Vec<OperatorInstanceDecl>,
     pub functions: Vec<FunctionDef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperatorInstanceDecl {
+    pub function_name: String,
+    pub spec: OperatorInstanceSpec,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -531,6 +556,7 @@ impl Type {
             Self::Scalar(prim) | Self::Bulk(prim, _) => Some(*prim),
             Self::TypeToken(_)
             | Self::Record(_)
+            | Self::Named(_, _)
             | Self::Var(_)
             | Self::Infer(_)
             | Self::Fun(_, _) => None,
@@ -816,7 +842,7 @@ fn collect_lifted_value(values: &[Value], scalar_ty: &Type, shape: &[usize]) -> 
         Type::TypeToken(_) => Err(SimdError::new(
             "lifted result type unexpectedly contained type witnesses",
         )),
-        Type::Var(_) | Type::Infer(_) => Err(SimdError::new(
+        Type::Named(_, _) | Type::Var(_) | Type::Infer(_) => Err(SimdError::new(
             "lifted result type unexpectedly contained an unresolved type variable",
         )),
         Type::Fun(_, _) => Err(SimdError::new(
@@ -843,7 +869,7 @@ fn collect_type_leaves(ty: &Type, prefix: &LeafPath, leaves: &mut Vec<TypeLeaf>)
                 collect_type_leaves(field_ty, &prefix.child(name), leaves);
             }
         }
-        Type::Var(_) | Type::Infer(_) | Type::Fun(_, _) => {}
+        Type::Named(_, _) | Type::Var(_) | Type::Infer(_) | Type::Fun(_, _) => {}
     }
 }
 
@@ -902,7 +928,7 @@ pub fn rebuild_value_from_leaves(ty: &Type, leaves: &BTreeMap<LeafPath, Value>) 
             }
             Ok(Value::Record(record))
         }
-        Type::Var(_) | Type::Infer(_) => {
+        Type::Named(_, _) | Type::Var(_) | Type::Infer(_) => {
             Err(SimdError::new("cannot rebuild values for unresolved types"))
         }
         Type::Fun(_, _) => Err(SimdError::new(
@@ -938,6 +964,7 @@ enum TokenKind {
     Ident,
     Import,
     As,
+    TypeDecl,
     Let,
     In,
     Int,
@@ -1016,6 +1043,7 @@ fn lex(source: &str) -> Result<Vec<Token>> {
             let kind = match text.as_str() {
                 "import" => TokenKind::Import,
                 "as" => TokenKind::As,
+                "type" => TokenKind::TypeDecl,
                 "let" => TokenKind::Let,
                 "in" => TokenKind::In,
                 _ => TokenKind::Ident,
@@ -1138,6 +1166,12 @@ struct Parser {
     saw_non_import_decl: bool,
 }
 
+#[derive(Debug, Clone)]
+struct DeclHead {
+    name: String,
+    operator_instance: Option<OperatorInstanceSpec>,
+}
+
 impl Parser {
     fn new(tokens: Vec<Token>) -> Self {
         Self {
@@ -1167,11 +1201,19 @@ impl Parser {
             }
             return self.parse_import_decl();
         }
+        if self.peek_is(TokenKind::TypeDecl) {
+            self.saw_non_import_decl = true;
+            return self.parse_type_alias_decl();
+        }
         self.saw_non_import_decl = true;
-        let name = self.expect_ident()?;
+        let head = self.parse_decl_head()?;
         if self.eat(TokenKind::Colon) {
             let ty = self.parse_type()?;
-            return Ok(Decl::Signature(Signature { name, ty }));
+            return Ok(Decl::Signature(Signature {
+                name: head.name,
+                ty,
+                operator_instance: head.operator_instance,
+            }));
         }
         let mut patterns = Vec::new();
         while !self.eat(TokenKind::Eq) {
@@ -1179,9 +1221,10 @@ impl Parser {
         }
         let body = self.parse_expr(0)?;
         Ok(Decl::Clause(Clause {
-            name,
+            name: head.name,
             patterns,
             body,
+            operator_instance: head.operator_instance,
         }))
     }
 
@@ -1212,6 +1255,71 @@ impl Parser {
         }
         self.import_aliases.insert(alias.clone(), path.clone());
         Ok(Decl::Import(ImportDecl { path, alias }))
+    }
+
+    fn parse_type_alias_decl(&mut self) -> Result<Decl> {
+        self.expect(TokenKind::TypeDecl)?;
+        let name = self.expect_ident()?;
+        let mut params = Vec::new();
+        while self.peek_is(TokenKind::Ident) && !self.peek_is(TokenKind::Eq) {
+            params.push(self.expect_ident()?);
+        }
+        self.expect(TokenKind::Eq)?;
+        let body = self.parse_type()?;
+        Ok(Decl::TypeAlias(TypeAliasDecl { name, params, body }))
+    }
+
+    fn parse_decl_head(&mut self) -> Result<DeclHead> {
+        if self.peek_is(TokenKind::LParen) {
+            let (op, segments) = self.parse_operator_decl_head()?;
+            let name = encode_operator_instance_name(op, &segments);
+            return Ok(DeclHead {
+                name,
+                operator_instance: Some(OperatorInstanceSpec { op, segments }),
+            });
+        }
+        let name = self.expect_ident()?;
+        Ok(DeclHead {
+            name,
+            operator_instance: None,
+        })
+    }
+
+    fn parse_operator_decl_head(&mut self) -> Result<(PrimOp, Vec<String>)> {
+        self.expect(TokenKind::LParen)?;
+        let op = match self
+            .peek()
+            .ok_or_else(|| SimdError::new("expected operator token in declaration head"))?
+            .kind
+        {
+            TokenKind::Plus => PrimOp::Add,
+            TokenKind::Minus => PrimOp::Sub,
+            TokenKind::Star => PrimOp::Mul,
+            TokenKind::Slash => PrimOp::Div,
+            TokenKind::Percent => PrimOp::Mod,
+            TokenKind::EqEq => PrimOp::Eq,
+            TokenKind::Lt => PrimOp::Lt,
+            TokenKind::Gt => PrimOp::Gt,
+            TokenKind::Le => PrimOp::Le,
+            TokenKind::Ge => PrimOp::Ge,
+            _ => {
+                return Err(SimdError::new(
+                    "expected primitive operator token inside '(...)' declaration head",
+                ));
+            }
+        };
+        self.pos += 1;
+        self.expect(TokenKind::RParen)?;
+        let mut segments = Vec::new();
+        while self.eat(TokenKind::Backslash) {
+            segments.push(self.expect_ident()?);
+        }
+        if segments.is_empty() {
+            return Err(SimdError::new(
+                "operator declaration head requires at least one specialization segment",
+            ));
+        }
+        Ok((op, segments))
     }
 
     fn parse_pattern(&mut self) -> Result<Pattern> {
@@ -1258,6 +1366,27 @@ impl Parser {
     }
 
     fn parse_nonfun_type(&mut self) -> Result<Type> {
+        let mut head = self.parse_type_atom()?;
+        while self.next_starts_type_atom() {
+            let arg = self.parse_type_atom()?;
+            head = match head {
+                Type::Named(name, mut args) => {
+                    args.push(arg);
+                    Type::Named(name, args)
+                }
+                Type::Var(name) => Type::Named(name, vec![arg]),
+                other => {
+                    return Err(SimdError::new(format!(
+                        "type application is only valid for named type constructors, found {:?}",
+                        other
+                    )));
+                }
+            };
+        }
+        Ok(head)
+    }
+
+    fn parse_type_atom(&mut self) -> Result<Type> {
         let mut head = if self.eat(TokenKind::LParen) {
             let ty = self.parse_type()?;
             self.expect(TokenKind::RParen)?;
@@ -1301,10 +1430,7 @@ impl Parser {
             } else {
                 match Prim::parse(&name) {
                     Some(prim) => Type::Scalar(prim),
-                    None if is_implicit_type_var_name(&name) => Type::Var(name),
-                    None => {
-                        return Err(SimdError::new(format!("unknown primitive type '{name}'")));
-                    }
+                    None => Type::Named(name, Vec::new()),
                 }
             }
         };
@@ -1343,6 +1469,13 @@ impl Parser {
                 token.text
             ))),
         }
+    }
+
+    fn next_starts_type_atom(&self) -> bool {
+        matches!(
+            self.peek().map(|token| &token.kind),
+            Some(TokenKind::Ident | TokenKind::LParen | TokenKind::LBrace)
+        )
     }
 
     fn parse_expr(&mut self, min_bp: u8) -> Result<Expr> {
@@ -1642,6 +1775,82 @@ impl Parser {
     }
 }
 
+fn operator_token(op: PrimOp) -> &'static str {
+    match op {
+        PrimOp::Add => "+",
+        PrimOp::Sub => "-",
+        PrimOp::Mul => "*",
+        PrimOp::Div => "/",
+        PrimOp::Mod => "%",
+        PrimOp::Eq => "==",
+        PrimOp::Lt => "<",
+        PrimOp::Gt => ">",
+        PrimOp::Le => "<=",
+        PrimOp::Ge => ">=",
+    }
+}
+
+fn operator_key(op: PrimOp) -> &'static str {
+    match op {
+        PrimOp::Add => "add",
+        PrimOp::Sub => "sub",
+        PrimOp::Mul => "mul",
+        PrimOp::Div => "div",
+        PrimOp::Mod => "mod",
+        PrimOp::Eq => "eq",
+        PrimOp::Lt => "lt",
+        PrimOp::Gt => "gt",
+        PrimOp::Le => "le",
+        PrimOp::Ge => "ge",
+    }
+}
+
+fn parse_operator_key(name: &str) -> Option<PrimOp> {
+    match name {
+        "add" => Some(PrimOp::Add),
+        "sub" => Some(PrimOp::Sub),
+        "mul" => Some(PrimOp::Mul),
+        "div" => Some(PrimOp::Div),
+        "mod" => Some(PrimOp::Mod),
+        "eq" => Some(PrimOp::Eq),
+        "lt" => Some(PrimOp::Lt),
+        "gt" => Some(PrimOp::Gt),
+        "le" => Some(PrimOp::Le),
+        "ge" => Some(PrimOp::Ge),
+        _ => None,
+    }
+}
+
+fn encode_operator_instance_name(op: PrimOp, segments: &[String]) -> String {
+    let mut parts = Vec::with_capacity(segments.len() + 2);
+    parts.push("__op".to_string());
+    parts.push(operator_key(op).to_string());
+    parts.extend(segments.iter().cloned());
+    parts.join("$")
+}
+
+fn decode_operator_instance_name(name: &str) -> Option<OperatorInstanceSpec> {
+    let mut parts = name.split('$');
+    if parts.next()? != "__op" {
+        return None;
+    }
+    let op = parse_operator_key(parts.next()?)?;
+    let segments = parts.map(|segment| segment.to_string()).collect::<Vec<_>>();
+    if segments.is_empty() {
+        return None;
+    }
+    Some(OperatorInstanceSpec { op, segments })
+}
+
+fn render_operator_instance_spec(spec: &OperatorInstanceSpec) -> String {
+    let mut out = format!("({})", operator_token(spec.op));
+    for segment in &spec.segments {
+        out.push('\\');
+        out.push_str(segment);
+    }
+    out
+}
+
 fn infix_binding_power(op: PrimOp) -> (u8, u8) {
     match op {
         PrimOp::Mul | PrimOp::Div | PrimOp::Mod => (50, 51),
@@ -1722,6 +1931,8 @@ fn group_program(surface: &SurfaceProgram) -> Result<Module> {
     let mut imports = Vec::<ImportDecl>::new();
     let mut import_aliases = BTreeSet::<String>::new();
     let mut order = Vec::<String>::new();
+    let mut type_alias_order = Vec::<String>::new();
+    let mut type_aliases = BTreeMap::<String, TypeAliasDecl>::new();
     let mut signatures = BTreeMap::<String, Signature>::new();
     let mut clauses = BTreeMap::<String, Vec<Clause>>::new();
 
@@ -1735,6 +1946,35 @@ fn group_program(surface: &SurfaceProgram) -> Result<Module> {
                     )));
                 }
                 imports.push(import_decl.clone());
+            }
+            Decl::TypeAlias(alias) => {
+                if !type_alias_order.contains(&alias.name) {
+                    type_alias_order.push(alias.name.clone());
+                }
+                if alias.params.iter().any(|param| param == "_") {
+                    return Err(SimdError::new(format!(
+                        "type alias '{}' cannot use '_' as a type parameter",
+                        alias.name
+                    )));
+                }
+                let mut seen = BTreeSet::new();
+                for param in &alias.params {
+                    if !seen.insert(param.clone()) {
+                        return Err(SimdError::new(format!(
+                            "type alias '{}' repeats type parameter '{}'",
+                            alias.name, param
+                        )));
+                    }
+                }
+                if type_aliases
+                    .insert(alias.name.clone(), alias.clone())
+                    .is_some()
+                {
+                    return Err(SimdError::new(format!(
+                        "type alias '{}' is declared more than once",
+                        alias.name
+                    )));
+                }
             }
             Decl::Signature(signature) => {
                 if !order.contains(&signature.name) {
@@ -1762,14 +2002,44 @@ fn group_program(surface: &SurfaceProgram) -> Result<Module> {
         }
     }
 
+    let mut resolved_aliases = Vec::new();
+    for name in type_alias_order {
+        let alias = type_aliases
+            .get(&name)
+            .ok_or_else(|| SimdError::new(format!("missing type alias '{}'", name)))?;
+        let params = alias.params.iter().cloned().collect::<BTreeSet<_>>();
+        let mut stack = Vec::new();
+        let body = resolve_type_aliases_in_type(&alias.body, &type_aliases, &params, &mut stack)?;
+        resolved_aliases.push(TypeAliasDecl {
+            name: alias.name.clone(),
+            params: alias.params.clone(),
+            body,
+        });
+    }
+
     let mut functions = Vec::new();
     for name in order {
-        let signature = signatures
+        let mut signature = signatures
             .remove(&name)
             .ok_or_else(|| SimdError::new(format!("function '{name}' is missing a signature")))?;
+        let mut stack = Vec::new();
+        signature.ty = resolve_type_aliases_in_type(
+            &signature.ty,
+            &type_aliases,
+            &BTreeSet::new(),
+            &mut stack,
+        )?;
         let mut function_clauses = clauses.remove(&name).unwrap_or_default();
         if function_clauses.is_empty() {
             return Err(SimdError::new(format!("function '{name}' has no clauses")));
+        }
+        for clause in &function_clauses {
+            if clause.operator_instance != signature.operator_instance {
+                return Err(SimdError::new(format!(
+                    "function '{}' mixes incompatible declaration heads between signature and clause",
+                    name
+                )));
+            }
         }
         let arity = signature.ty.arity();
         for clause in &function_clauses {
@@ -1797,7 +2067,181 @@ fn group_program(surface: &SurfaceProgram) -> Result<Module> {
         )));
     }
 
-    Ok(Module { imports, functions })
+    let alias_names = type_aliases.keys().cloned().collect::<BTreeSet<_>>();
+    let operator_instances = collect_operator_instances(&functions)?;
+    validate_operator_coherence(&operator_instances, &alias_names)?;
+
+    Ok(Module {
+        imports,
+        type_aliases: resolved_aliases,
+        operator_instances,
+        functions,
+    })
+}
+
+fn collect_operator_instances(functions: &[FunctionDef]) -> Result<Vec<OperatorInstanceDecl>> {
+    let mut instances = Vec::new();
+    for function in functions {
+        let Some(spec) = function.signature.operator_instance.clone() else {
+            continue;
+        };
+        let decoded = decode_operator_instance_name(&function.name).ok_or_else(|| {
+            SimdError::new(format!(
+                "operator instance '{}' has an invalid internal name",
+                function.name
+            ))
+        })?;
+        if decoded != spec {
+            return Err(SimdError::new(format!(
+                "operator instance '{}' internal name does not match its declaration head",
+                function.name
+            )));
+        }
+        if let Some(first) = spec.segments.first()
+            && Prim::parse(first).is_some()
+        {
+            return Err(SimdError::new(format!(
+                "primitive operator override is not allowed: {}",
+                render_operator_instance_spec(&spec)
+            )));
+        }
+        instances.push(OperatorInstanceDecl {
+            function_name: function.name.clone(),
+            spec,
+        });
+    }
+    Ok(instances)
+}
+
+fn validate_operator_coherence(
+    instances: &[OperatorInstanceDecl],
+    alias_names: &BTreeSet<String>,
+) -> Result<()> {
+    for (index, left) in instances.iter().enumerate() {
+        for right in instances.iter().skip(index + 1) {
+            if left.spec.op != right.spec.op {
+                continue;
+            }
+            if operator_specs_overlap(&left.spec, &right.spec, alias_names) {
+                return Err(SimdError::new(format!(
+                    "overlapping operator instances for '{}': '{}' and '{}'",
+                    operator_token(left.spec.op),
+                    render_operator_instance_spec(&left.spec),
+                    render_operator_instance_spec(&right.spec)
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn operator_specs_overlap(
+    left: &OperatorInstanceSpec,
+    right: &OperatorInstanceSpec,
+    alias_names: &BTreeSet<String>,
+) -> bool {
+    if left.segments.len() != right.segments.len() {
+        return false;
+    }
+    left.segments
+        .iter()
+        .zip(&right.segments)
+        .all(|(a, b)| operator_segment_compatible(a, b, alias_names))
+}
+
+fn operator_segment_compatible(a: &str, b: &str, alias_names: &BTreeSet<String>) -> bool {
+    if a == b {
+        return true;
+    }
+    let a_concrete = Prim::parse(a).is_some() || alias_names.contains(a);
+    let b_concrete = Prim::parse(b).is_some() || alias_names.contains(b);
+    !a_concrete || !b_concrete
+}
+
+fn resolve_type_aliases_in_type(
+    ty: &Type,
+    aliases: &BTreeMap<String, TypeAliasDecl>,
+    bound_vars: &BTreeSet<String>,
+    stack: &mut Vec<String>,
+) -> Result<Type> {
+    match ty {
+        Type::Scalar(_) | Type::Bulk(_, _) | Type::Infer(_) | Type::Var(_) => Ok(ty.clone()),
+        Type::TypeToken(inner) => Ok(Type::TypeToken(Box::new(resolve_type_aliases_in_type(
+            inner, aliases, bound_vars, stack,
+        )?))),
+        Type::Record(fields) => Ok(Type::Record(
+            fields
+                .iter()
+                .map(|(name, field_ty)| {
+                    Ok((
+                        name.clone(),
+                        resolve_type_aliases_in_type(field_ty, aliases, bound_vars, stack)?,
+                    ))
+                })
+                .collect::<Result<BTreeMap<_, _>>>()?,
+        )),
+        Type::Fun(args, ret) => Ok(Type::Fun(
+            args.iter()
+                .map(|arg| resolve_type_aliases_in_type(arg, aliases, bound_vars, stack))
+                .collect::<Result<Vec<_>>>()?,
+            Box::new(resolve_type_aliases_in_type(
+                ret, aliases, bound_vars, stack,
+            )?),
+        )),
+        Type::Named(name, args) => {
+            let resolved_args = args
+                .iter()
+                .map(|arg| resolve_type_aliases_in_type(arg, aliases, bound_vars, stack))
+                .collect::<Result<Vec<_>>>()?;
+            if bound_vars.contains(name) {
+                if !resolved_args.is_empty() {
+                    return Err(SimdError::new(format!(
+                        "type variable '{}' cannot be applied to type arguments",
+                        name
+                    )));
+                }
+                return Ok(Type::Var(name.clone()));
+            }
+            if let Some(alias) = aliases.get(name) {
+                if resolved_args.len() != alias.params.len() {
+                    return Err(SimdError::new(format!(
+                        "type alias '{}' expects {} type arguments, found {}",
+                        name,
+                        alias.params.len(),
+                        resolved_args.len()
+                    )));
+                }
+                if stack.contains(name) {
+                    let mut cycle = stack.clone();
+                    cycle.push(name.clone());
+                    return Err(SimdError::new(format!(
+                        "cyclic type alias expansion detected: {}",
+                        cycle.join(" -> ")
+                    )));
+                }
+                stack.push(name.clone());
+                let alias_scope = alias.params.iter().cloned().collect::<BTreeSet<_>>();
+                let alias_body =
+                    resolve_type_aliases_in_type(&alias.body, aliases, &alias_scope, stack)?;
+                stack.pop();
+                let subst = alias
+                    .params
+                    .iter()
+                    .cloned()
+                    .zip(resolved_args)
+                    .collect::<BTreeMap<_, _>>();
+                Ok(apply_type_subst(&alias_body, &subst))
+            } else if resolved_args.is_empty() {
+                Ok(Type::Var(name.clone()))
+            } else {
+                Err(SimdError::new(format!(
+                    "unknown type constructor '{}' with {} arguments",
+                    name,
+                    resolved_args.len()
+                )))
+            }
+        }
+    }
 }
 
 fn validate_signature_shape_contract(signature: &Signature) -> Result<()> {
@@ -1815,6 +2259,7 @@ fn type_contains_type_witness(ty: &Type) -> bool {
     match ty {
         Type::TypeToken(_) => true,
         Type::Scalar(_) | Type::Bulk(_, _) | Type::Var(_) | Type::Infer(_) => false,
+        Type::Named(_, args) => args.iter().any(type_contains_type_witness),
         Type::Record(fields) => fields.values().any(type_contains_type_witness),
         Type::Fun(args, ret) => {
             args.iter().any(type_contains_type_witness) || type_contains_type_witness(ret)
@@ -1903,6 +2348,7 @@ fn check_program(module: &Module, pointwise: &BTreeMap<String, bool>) -> Result<
         .iter()
         .map(|import| (import.alias.clone(), import.path.clone()))
         .collect::<BTreeMap<_, _>>();
+    let operator_index = build_operator_index(&module.operator_instances);
 
     let mut checked_functions = Vec::new();
     for function in &module.functions {
@@ -1923,6 +2369,7 @@ fn check_program(module: &Module, pointwise: &BTreeMap<String, bool>) -> Result<
                 signatures: &signatures,
                 imports: &import_aliases,
                 pointwise,
+                operator_instances: &operator_index,
             };
             let body = infer_expr(&clause.body, &context, Some(&ret_type))?;
             if body.ty != ret_type {
@@ -2005,6 +2452,18 @@ struct TypeContext<'a> {
     signatures: &'a BTreeMap<String, Signature>,
     imports: &'a BTreeMap<String, String>,
     pointwise: &'a BTreeMap<String, bool>,
+    operator_instances: &'a BTreeMap<PrimOp, Vec<String>>,
+}
+
+fn build_operator_index(instances: &[OperatorInstanceDecl]) -> BTreeMap<PrimOp, Vec<String>> {
+    let mut index = BTreeMap::<PrimOp, Vec<String>>::new();
+    for instance in instances {
+        index
+            .entry(instance.spec.op)
+            .or_default()
+            .push(instance.function_name.clone());
+    }
+    index
 }
 
 fn infer_expr(
@@ -2166,6 +2625,7 @@ fn infer_lambda_expr(
         signatures: context.signatures,
         imports: context.imports,
         pointwise: context.pointwise,
+        operator_instances: context.operator_instances,
     };
     let typed_body = infer_expr(body, &body_context, Some(&ret_ty))?;
     if typed_body.ty != ret_ty {
@@ -2201,6 +2661,7 @@ fn infer_let_expr(
             signatures: context.signatures,
             imports: context.imports,
             pointwise: context.pointwise,
+            operator_instances: context.operator_instances,
         };
         let typed = infer_expr(&binding.expr, &binding_context, None)?;
         if binding.name != "_" {
@@ -2218,6 +2679,7 @@ fn infer_let_expr(
         signatures: context.signatures,
         imports: context.imports,
         pointwise: context.pointwise,
+        operator_instances: context.operator_instances,
     };
     let typed_body = infer_expr(body, &body_context, expected)?;
     Ok(TypedExpr {
@@ -2368,6 +2830,7 @@ fn type_contains_var(ty: &Type) -> bool {
     match ty {
         Type::Var(_) | Type::Infer(_) => true,
         Type::Scalar(_) | Type::Bulk(_, _) => false,
+        Type::Named(_, args) => args.iter().any(type_contains_var),
         Type::TypeToken(inner) => type_contains_var(inner),
         Type::Record(fields) => fields.values().any(type_contains_var),
         Type::Fun(args, ret) => args.iter().any(type_contains_var) || type_contains_var(ret),
@@ -2389,6 +2852,11 @@ fn collect_type_vars_in_order_into(ty: &Type, seen: &mut BTreeSet<String>, vars:
             }
         }
         Type::Scalar(_) | Type::Bulk(_, _) | Type::Infer(_) => {}
+        Type::Named(_, args) => {
+            for arg in args {
+                collect_type_vars_in_order_into(arg, seen, vars);
+            }
+        }
         Type::TypeToken(inner) => collect_type_vars_in_order_into(inner, seen, vars),
         Type::Record(fields) => {
             for field_ty in fields.values() {
@@ -2408,6 +2876,12 @@ fn apply_type_subst(ty: &Type, subst: &BTreeMap<String, Type>) -> Type {
     match ty {
         Type::Var(name) => subst.get(name).cloned().unwrap_or_else(|| ty.clone()),
         Type::Scalar(_) | Type::Bulk(_, _) | Type::Infer(_) => ty.clone(),
+        Type::Named(name, args) => Type::Named(
+            name.clone(),
+            args.iter()
+                .map(|arg| apply_type_subst(arg, subst))
+                .collect(),
+        ),
         Type::TypeToken(inner) => Type::TypeToken(Box::new(apply_type_subst(inner, subst))),
         Type::Record(fields) => Type::Record(
             fields
@@ -2475,6 +2949,20 @@ fn unify_type_template(
             }
             _ => Err(SimdError::new(format!(
                 "expected bulk {:?}, found {:?}",
+                template, actual
+            ))),
+        },
+        Type::Named(left_name, left_args) => match actual {
+            Type::Named(right_name, right_args)
+                if left_name == right_name && left_args.len() == right_args.len() =>
+            {
+                for (left_arg, right_arg) in left_args.iter().zip(right_args) {
+                    unify_type_template(left_arg, right_arg, subst)?;
+                }
+                Ok(())
+            }
+            _ => Err(SimdError::new(format!(
+                "expected type constructor {:?}, found {:?}",
                 template, actual
             ))),
         },
@@ -2707,23 +3195,46 @@ fn infer_direct_function_call(
         .signatures
         .get(&name)
         .ok_or_else(|| SimdError::new(format!("unknown function '{}'", name)))?;
-    let (param_types, ret_type) = instantiate_call_signature(
+    infer_direct_named_call(
+        &name,
         signature,
         &reference.type_args,
         args_exprs,
         context,
         expected,
-    )?;
+    )
+}
+
+fn infer_direct_named_call(
+    name: &str,
+    signature: &Signature,
+    explicit_type_args: &[TypeArg],
+    args_exprs: &[&Expr],
+    context: &TypeContext<'_>,
+    expected: Option<&Type>,
+) -> Result<Option<TypedExpr>> {
+    let (param_types, ret_type) =
+        instantiate_call_signature(signature, explicit_type_args, args_exprs, context, expected)?;
     if args_exprs.len() > param_types.len() {
         return Err(SimdError::new(format!(
             "function '{}' expects {} arguments, found {}",
-            render_ref_expr(reference),
+            name,
             param_types.len(),
             args_exprs.len()
         )));
     }
     if args_exprs.len() < param_types.len() {
-        let mut typed = infer_ref_expr(reference, context, None)?;
+        let initial_ty = if explicit_type_args.is_empty() {
+            signature.ty.clone()
+        } else {
+            instantiate_ref_type(&signature.ty, explicit_type_args)?
+        };
+        let mut typed = TypedExpr {
+            ty: initial_ty,
+            kind: TypedExprKind::FunctionRef {
+                name: name.to_string(),
+            },
+        };
         for (expr_arg, param_ty) in args_exprs.iter().zip(param_types.iter()) {
             let typed_arg = infer_expr(expr_arg, context, Some(param_ty))?;
             typed = TypedExpr {
@@ -2767,7 +3278,7 @@ fn infer_direct_function_call(
             AccessKind::Same
         } else {
             let mut trial_shape = lifted_shape.clone();
-            if *context.pointwise.get(&name).unwrap_or(&false) {
+            if *context.pointwise.get(name).unwrap_or(&false) {
                 match unify_lifted_type(&mut trial_shape, param_ty, &typed_arg.ty) {
                     Ok(()) => {
                         lifted_shape = trial_shape;
@@ -2804,7 +3315,7 @@ fn infer_direct_function_call(
     Ok(Some(TypedExpr {
         ty,
         kind: TypedExprKind::Call {
-            callee: Callee::Function(name),
+            callee: Callee::Function(name.to_string()),
             args,
             lifted_shape,
         },
@@ -2927,6 +3438,9 @@ fn infer_primitive_call(
     context: &TypeContext<'_>,
     expected: Option<&Type>,
 ) -> Result<TypedExpr> {
+    if let Some(instance_call) = infer_operator_instance_call(op, lhs, rhs, context, expected)? {
+        return Ok(instance_call);
+    }
     let mut left = infer_expr(lhs, context, expected)?;
     let mut right =
         infer_expr(rhs, context, Some(&left.ty)).or_else(|_| infer_expr(rhs, context, None))?;
@@ -2978,6 +3492,59 @@ fn infer_primitive_call(
             lifted_shape: call_shape,
         },
     })
+}
+
+fn infer_operator_instance_call(
+    op: PrimOp,
+    lhs: &Expr,
+    rhs: &Expr,
+    context: &TypeContext<'_>,
+    expected: Option<&Type>,
+) -> Result<Option<TypedExpr>> {
+    let Some(candidates) = context.operator_instances.get(&op) else {
+        return Ok(None);
+    };
+    let mut matches = Vec::<TypedExpr>::new();
+    let mut match_names = Vec::<String>::new();
+    for name in candidates {
+        let signature = context
+            .signatures
+            .get(name)
+            .ok_or_else(|| SimdError::new(format!("unknown operator instance '{}'", name)))?;
+        if signature.ty.arity() != 2 {
+            return Err(SimdError::new(format!(
+                "operator instance '{}' must have arity 2 for infix dispatch",
+                name
+            )));
+        }
+        match infer_direct_named_call(name, signature, &[], &[lhs, rhs], context, expected) {
+            Ok(Some(typed)) => {
+                matches.push(typed);
+                match_names.push(name.clone());
+            }
+            Ok(None) => {}
+            Err(_) => {}
+        }
+    }
+    match matches.len() {
+        0 => Ok(None),
+        1 => Ok(matches.into_iter().next()),
+        _ => {
+            let rendered = match_names
+                .iter()
+                .map(|name| {
+                    decode_operator_instance_name(name)
+                        .map(|spec| render_operator_instance_spec(&spec))
+                        .unwrap_or_else(|| name.clone())
+                })
+                .collect::<Vec<_>>();
+            Err(SimdError::new(format!(
+                "ambiguous operator instance resolution for '{}': {}",
+                operator_token(op),
+                rendered.join(", ")
+            )))
+        }
+    }
 }
 
 trait TypeExt {
@@ -3121,6 +3688,9 @@ fn lift_type_over_shape(ty: &Type, shape: &Shape) -> Result<Type> {
         Type::Scalar(prim) => Ok(Type::Bulk(*prim, shape.clone())),
         Type::Var(name) => Ok(Type::Var(name.clone())),
         Type::Infer(index) => Ok(Type::Infer(*index)),
+        Type::Named(_, _) => Err(SimdError::new(
+            "bulk postfix cannot be applied to unresolved type constructors",
+        )),
         Type::TypeToken(_) => Err(SimdError::new(
             "bulk postfix cannot be applied to type witness parameters",
         )),
@@ -3233,6 +3803,10 @@ fn unify_param_type(
 fn apply_dim_subst(ty: &Type, subst: &BTreeMap<String, Dim>) -> Type {
     match ty {
         Type::Scalar(_) | Type::Var(_) | Type::Infer(_) => ty.clone(),
+        Type::Named(name, args) => Type::Named(
+            name.clone(),
+            args.iter().map(|arg| apply_dim_subst(arg, subst)).collect(),
+        ),
         Type::TypeToken(inner) => Type::TypeToken(Box::new(apply_dim_subst(inner, subst))),
         Type::Bulk(prim, shape) => Type::Bulk(
             *prim,
@@ -3542,6 +4116,7 @@ fn normalize_function_leaf(
     let signature = Signature {
         name: leaf_name.clone(),
         ty: Type::Fun(param_types, Box::new(result_leaf.ty.clone())),
+        operator_instance: None,
     };
     let tailrec = analyze_tailrec(&leaf_name, &clauses);
     Ok(NormalizedFunction {
@@ -3765,7 +4340,7 @@ fn lookup_leaf_type(ty: &Type, path: &LeafPath) -> Result<Type> {
                 "record type {:?} requires a concrete leaf path",
                 ty
             ))),
-            Type::Var(_) | Type::Infer(_) => Err(SimdError::new(
+            Type::Named(_, _) | Type::Var(_) | Type::Infer(_) => Err(SimdError::new(
                 "unresolved type variables cannot appear as normalized leaves",
             )),
             Type::Fun(_, _) => Err(SimdError::new(
@@ -4385,7 +4960,7 @@ fn lower_function(function: &NormalizedFunction) -> Result<LoweredFunction> {
             Type::Bulk(_, _) => AccessKind::Lane,
             Type::TypeToken(_) => AccessKind::Same,
             Type::Record(_) => AccessKind::Same,
-            Type::Var(_) | Type::Infer(_) => AccessKind::Same,
+            Type::Named(_, _) | Type::Var(_) | Type::Infer(_) => AccessKind::Same,
             Type::Fun(_, _) => AccessKind::Same,
         })
         .collect();
@@ -4422,7 +4997,7 @@ fn lower_function(function: &NormalizedFunction) -> Result<LoweredFunction> {
                 "normalized lowering encountered an unexpected type witness result",
             ));
         }
-        Type::Var(_) | Type::Infer(_) => {
+        Type::Named(_, _) | Type::Var(_) | Type::Infer(_) => {
             return Err(SimdError::new(format!(
                 "function '{}' still contains unresolved polymorphic types during lowering",
                 function.name
@@ -5810,7 +6385,7 @@ fn value_from_json(
         Type::TypeToken(inner) => {
             let expected_prim = match inner.as_ref() {
                 Type::Scalar(prim) => Some(*prim),
-                Type::Var(_) | Type::Infer(_) => None,
+                Type::Named(_, _) | Type::Var(_) | Type::Infer(_) => None,
                 other => {
                     return Err(SimdError::new(format!(
                         "host JSON type witnesses must target scalar primitives, found {:?}",
@@ -5871,7 +6446,7 @@ fn value_from_json(
             }
             Ok(Value::Record(record))
         }
-        Type::Var(_) | Type::Infer(_) => Err(SimdError::new(
+        Type::Named(_, _) | Type::Var(_) | Type::Infer(_) => Err(SimdError::new(
             "host JSON cannot provide values for unresolved polymorphic types",
         )),
         Type::Fun(_, _) => Err(SimdError::new("host JSON cannot provide function values")),
@@ -6066,6 +6641,13 @@ fn bundled_examples_inspector_html() -> Result<String> {
             "examples/lambda_capture_i64.simd",
             "main",
             include_str!("../examples/lambda_capture_i64.simd"),
+        ),
+        (
+            "type-alias-op-v3",
+            "type-alias-op-v3",
+            "examples/type_alias_operator_v3.simd",
+            "main",
+            include_str!("../examples/type_alias_operator_v3.simd"),
         ),
     ];
 
@@ -6362,6 +6944,18 @@ mod tests {
     }
 
     #[test]
+    fn parses_type_alias_and_operator_instance_heads() {
+        let program = parse_source(
+            "type v3 a = {x:a,y:a,z:a}\n(*)\\v3\\a : v3 a -> v3 a -> v3 a\n(*)\\v3\\a lhs rhs = lhs\n",
+        )
+        .unwrap();
+        assert_eq!(program.decls.len(), 3);
+        assert!(matches!(program.decls[0], Decl::TypeAlias(_)));
+        assert!(matches!(program.decls[1], Decl::Signature(_)));
+        assert!(matches!(program.decls[2], Decl::Clause(_)));
+    }
+
+    #[test]
     fn rejects_import_after_function_declaration() {
         let error = parse_source("main : i64 -> i64\nmain x = x\nimport math/scalar as scalar\n")
             .unwrap_err();
@@ -6506,6 +7100,56 @@ mod tests {
     fn evaluates_inferred_top_level_polymorphism() {
         let src = "square : t -> t\nsquare x = x * x\nmain : i64 -> i64\nmain x = square x\n";
         assert_eq!(run(src, "main", "[7]"), "49");
+    }
+
+    #[test]
+    fn evaluates_user_operator_instance_resolution() {
+        let src = "type v3 a = {x:a,y:a,z:a}\n(*)\\v3\\a : v3 a -> v3 a -> v3 a\n(*)\\v3\\a lhs rhs = { x = lhs.x * rhs.x, y = lhs.y * rhs.y, z = lhs.z * rhs.z }\nsquare : v3 i64 -> v3 i64\nsquare x = x * x\nmain : v3 i64 -> v3 i64\nmain x = square x\n";
+        assert_eq!(
+            run(src, "main", "[{\"x\":2,\"y\":3,\"z\":4}]"),
+            "{\"x\":4,\"y\":9,\"z\":16}"
+        );
+    }
+
+    #[test]
+    fn rejects_primitive_operator_override_instances() {
+        let error = compile_source(
+            "(*)\\i64 : i64 -> i64 -> i64\n(*)\\i64 a b = a + b\nmain : i64 -> i64 -> i64\nmain a b = a * b\n",
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("primitive operator override is not allowed")
+        );
+    }
+
+    #[test]
+    fn rejects_overlapping_operator_instances() {
+        let error = compile_source(
+            "type v3 a = {x:a,y:a,z:a}\n(*)\\v3\\a : v3 a -> v3 a -> v3 a\n(*)\\v3\\a lhs rhs = lhs\n(*)\\v3\\i64 : v3 i64 -> v3 i64 -> v3 i64\n(*)\\v3\\i64 lhs rhs = rhs\nmain : v3 i64 -> v3 i64 -> v3 i64\nmain a b = a * b\n",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("overlapping operator instances"));
+    }
+
+    #[test]
+    fn rejects_type_alias_cycles() {
+        let error =
+            compile_source("type a = b\ntype b = a\nmain : i64 -> i64\nmain x = x\n").unwrap_err();
+        assert!(error.to_string().contains("cyclic type alias expansion"));
+    }
+
+    #[test]
+    fn rejects_type_alias_arity_mismatch() {
+        let error =
+            compile_source("type v3 a = {x:a,y:a,z:a}\nmain : v3 i64 f32 -> i64\nmain x = x.x\n")
+                .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("expects 1 type arguments, found 2")
+        );
     }
 
     #[test]
@@ -6797,6 +7441,21 @@ mod tests {
                 .expect("polymorphic square example should run")
                 .to_json_string(),
             "81"
+        );
+    }
+
+    #[test]
+    fn type_alias_operator_example_runs() {
+        let source = include_str!("../examples/type_alias_operator_v3.simd");
+        assert_eq!(
+            run_main(
+                source,
+                "main",
+                "[{\"x\":1,\"y\":2,\"z\":3},{\"x\":4,\"y\":5,\"z\":6}]"
+            )
+            .expect("type alias operator example should run")
+            .to_json_string(),
+            "{\"dot\":32,\"hadamard\":{\"x\":4,\"y\":10,\"z\":18},\"sum\":{\"x\":5,\"y\":7,\"z\":9}}"
         );
     }
 }

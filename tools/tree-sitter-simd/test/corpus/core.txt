@@ -9,15 +9,18 @@ f : i64 -> i64
 (source_file
   (declaration
     (signature
-      name: (identifier)
+      head: (decl_head
+        (identifier))
       type: (type
-        arg: (type_atom
-          (type_base
-            (prim_type)))
-        result: (type
+        arg: (type_nonfun
           (type_atom
             (type_base
-              (prim_type))))))))
+              (prim_type))))
+        result: (type
+          (type_nonfun
+            (type_atom
+              (type_base
+                (prim_type)))))))))
 
 ==================
 clause
@@ -30,7 +33,8 @@ f x = x + 1
 (source_file
   (declaration
     (clause
-      name: (identifier)
+      head: (decl_head
+        (identifier))
       pattern: (pattern
         (identifier))
       body: (expr
@@ -59,7 +63,8 @@ main p = let q = p { x = 3 }; r = q.x in r
 (source_file
   (declaration
     (clause
-      name: (identifier)
+      head: (decl_head
+        (identifier))
       pattern: (pattern
         (identifier))
       body: (expr
@@ -118,7 +123,8 @@ axpy a x y = a * x + y
 (source_file
   (declaration
     (clause
-      name: (identifier)
+      head: (decl_head
+        (identifier))
       pattern: (pattern
         (identifier))
       pattern: (pattern
@@ -156,21 +162,24 @@ wrap : Type t -> t -> t
 (source_file
   (declaration
     (signature
-      name: (identifier)
+      head: (decl_head
+        (identifier))
       type: (type
-        arg: (type_atom
-          constructor: (type_constructor)
-          argument: (type_atom
+        arg: (type_nonfun
+          (type_atom
             (type_base
-              (identifier))))
+              (type_witness
+                witness: (identifier)))))
         result: (type
-          arg: (type_atom
-            (type_base
-              (identifier)))
-          result: (type
+          arg: (type_nonfun
             (type_atom
               (type_base
-                (identifier)))))))))
+                (identifier))))
+          result: (type
+            (type_nonfun
+              (type_atom
+                (type_base
+                  (identifier))))))))))
 
 ==================
 primitive witness pattern
@@ -183,7 +192,8 @@ wrap i64 x = x
 (source_file
   (declaration
     (clause
-      name: (identifier)
+      head: (decl_head
+        (identifier))
       pattern: (pattern
         (prim_type))
       pattern: (pattern
@@ -191,11 +201,11 @@ wrap i64 x = x
       body: (expr
         (comparison_expr
           (add_expr
-              (mul_expr
-                (application_expr
-                  (postfix_expr
-                    (atom
-                      (identifier)))))))))))
+            (mul_expr
+              (application_expr
+                (postfix_expr
+                  (atom
+                    (identifier)))))))))))
 
 ==================
 specialization chain signature
@@ -208,15 +218,18 @@ main : i64 -> i64
 (source_file
   (declaration
     (signature
-      name: (identifier)
+      head: (decl_head
+        (identifier))
       type: (type
-        arg: (type_atom
-          (type_base
-            (prim_type)))
-        result: (type
+        arg: (type_nonfun
           (type_atom
             (type_base
-              (prim_type))))))))
+              (prim_type))))
+        result: (type
+          (type_nonfun
+            (type_atom
+              (type_base
+                (prim_type)))))))))
 
 ==================
 specialization chain with primitive segments
@@ -229,7 +242,8 @@ main x = scalar\axpy\i64 x
 (source_file
   (declaration
     (clause
-      name: (identifier)
+      head: (decl_head
+        (identifier))
       pattern: (pattern
         (identifier))
       body: (expr
@@ -244,6 +258,105 @@ main x = scalar\axpy\i64 x
                         head: (identifier)
                         segment: (identifier)
                         segment: (prim_type)))))
-                argument: (postfix_expr
+                    argument: (postfix_expr
+                      (atom
+                        (identifier)))))))))))
+
+==================
+type alias declaration
+==================
+
+type v3 a = {x:a,y:a,z:a}
+
+---
+
+(source_file
+  (declaration
+    (type_alias
+      name: (identifier)
+      param: (identifier)
+      body: (type
+        (type_nonfun
+          (type_atom
+            (type_base
+              (record_type
+                (type_field
+                  name: (identifier)
+                  type: (type
+                    (type_nonfun
+                      (type_atom
+                        (type_base
+                          (identifier))))))
+                (type_field
+                  name: (identifier)
+                  type: (type
+                    (type_nonfun
+                      (type_atom
+                        (type_base
+                          (identifier))))))
+                (type_field
+                  name: (identifier)
+                  type: (type
+                    (type_nonfun
+                      (type_atom
+                        (type_base
+                          (identifier))))))))))))))
+
+==================
+operator instance declarations
+==================
+
+(*)\v3\a : v3 a -> v3 a -> v3 a
+(*)\v3\a lhs rhs = lhs
+
+---
+
+(source_file
+  (declaration
+    (signature
+      head: (decl_head
+        (operator_head
+          segment: (identifier)
+          segment: (identifier)))
+      type: (type
+        arg: (type_nonfun
+          constructor: (type_atom
+            (type_base
+              (identifier)))
+          argument: (type_atom
+            (type_base
+              (identifier))))
+        result: (type
+          arg: (type_nonfun
+            constructor: (type_atom
+              (type_base
+                (identifier)))
+            argument: (type_atom
+              (type_base
+                (identifier))))
+          result: (type
+            (type_nonfun
+              constructor: (type_atom
+                (type_base
+                  (identifier)))
+              argument: (type_atom
+                (type_base
+                  (identifier)))))))))
+  (declaration
+    (clause
+      head: (decl_head
+        (operator_head
+          segment: (identifier)
+          segment: (identifier)))
+      pattern: (pattern
+        (identifier))
+      pattern: (pattern
+        (identifier))
+      body: (expr
+        (comparison_expr
+          (add_expr
+            (mul_expr
+              (application_expr
+                (postfix_expr
                   (atom
                     (identifier)))))))))))

@@ -1,23 +1,23 @@
 /home/mewhhaha/src/simd/tools/tree-sitter-simd/test/query/projection_update.simd
     pattern:  0, capture: 0 - function, start: (0, 0), end: (0, 4), text: `bump`
     pattern:  0, capture: 1 - type, start: (0, 7), end: (0, 37), text: `{x:i64,y:i64} -> {x:i64,y:i64}`
-    pattern: 19, capture: 10 - punctuation.bracket, start: (0, 7), end: (0, 8), text: `{`
-    pattern:  5, capture: 7 - property, start: (0, 8), end: (0, 9), text: `x`
-    pattern:  5, capture: 7 - property, start: (0, 14), end: (0, 15), text: `y`
-    pattern: 19, capture: 10 - punctuation.bracket, start: (0, 19), end: (0, 20), text: `}`
-    pattern: 19, capture: 10 - punctuation.bracket, start: (0, 24), end: (0, 25), text: `{`
-    pattern:  5, capture: 7 - property, start: (0, 25), end: (0, 26), text: `x`
-    pattern:  5, capture: 7 - property, start: (0, 31), end: (0, 32), text: `y`
-    pattern: 19, capture: 10 - punctuation.bracket, start: (0, 36), end: (0, 37), text: `}`
+    pattern: 22, capture: 11 - punctuation.bracket, start: (0, 7), end: (0, 8), text: `{`
+    pattern:  8, capture: 9 - property, start: (0, 8), end: (0, 9), text: `x`
+    pattern:  8, capture: 9 - property, start: (0, 14), end: (0, 15), text: `y`
+    pattern: 22, capture: 11 - punctuation.bracket, start: (0, 19), end: (0, 20), text: `}`
+    pattern: 22, capture: 11 - punctuation.bracket, start: (0, 24), end: (0, 25), text: `{`
+    pattern:  8, capture: 9 - property, start: (0, 25), end: (0, 26), text: `x`
+    pattern:  8, capture: 9 - property, start: (0, 31), end: (0, 32), text: `y`
+    pattern: 22, capture: 11 - punctuation.bracket, start: (0, 36), end: (0, 37), text: `}`
     pattern:  1, capture: 0 - function, start: (1, 0), end: (1, 4), text: `bump`
     pattern:  1, capture: 2 - variable.parameter, start: (1, 5), end: (1, 6), text: `p`
-    pattern: 19, capture: 10 - punctuation.bracket, start: (1, 11), end: (1, 12), text: `{`
-    pattern:  6, capture: 7 - property, start: (1, 13), end: (1, 14), text: `x`
-    pattern:  6, capture: 6 - expression, start: (1, 17), end: (1, 24), text: `p.x + 1`
-    pattern:  7, capture: 7 - property, start: (1, 19), end: (1, 20), text: `x`
-    pattern: 14, capture: 9 - operator, start: (1, 21), end: (1, 22), text: `+`
-    pattern:  6, capture: 7 - property, start: (1, 26), end: (1, 27), text: `y`
-    pattern:  6, capture: 6 - expression, start: (1, 30), end: (1, 37), text: `p.y + 2`
-    pattern:  7, capture: 7 - property, start: (1, 32), end: (1, 33), text: `y`
-    pattern: 14, capture: 9 - operator, start: (1, 34), end: (1, 35), text: `+`
-    pattern: 19, capture: 10 - punctuation.bracket, start: (1, 38), end: (1, 39), text: `}`
+    pattern: 22, capture: 11 - punctuation.bracket, start: (1, 11), end: (1, 12), text: `{`
+    pattern:  9, capture: 9 - property, start: (1, 13), end: (1, 14), text: `x`
+    pattern:  9, capture: 8 - expression, start: (1, 17), end: (1, 24), text: `p.x + 1`
+    pattern: 10, capture: 9 - property, start: (1, 19), end: (1, 20), text: `x`
+    pattern: 17, capture: 6 - operator, start: (1, 21), end: (1, 22), text: `+`
+    pattern:  9, capture: 9 - property, start: (1, 26), end: (1, 27), text: `y`
+    pattern:  9, capture: 8 - expression, start: (1, 30), end: (1, 37), text: `p.y + 2`
+    pattern: 10, capture: 9 - property, start: (1, 32), end: (1, 33), text: `y`
+    pattern: 17, capture: 6 - operator, start: (1, 34), end: (1, 35), text: `+`
+    pattern: 22, capture: 11 - punctuation.bracket, start: (1, 38), end: (1, 39), text: `}`

@@ -1744,6 +1744,7 @@ fn specialize_function_instance(
     let specialized_signature = Signature {
         name: pending.output_name.clone(),
         ty: Type::Fun(kept_param_types, Box::new(applied_result_ty)),
+        operator_instance: None,
     };
     if type_contains_unresolved_vars(&specialized_signature.ty) {
         return Err(SimdError::new(format!(
@@ -2600,6 +2601,7 @@ fn lift_lambda_for_specialization(
             signature: Signature {
                 name: lift_name.clone(),
                 ty: Type::Fun(signature_params, ret.clone()),
+                operator_instance: None,
             },
             clauses: vec![TypedClause {
                 patterns,
@@ -2639,7 +2641,7 @@ fn estimate_closure_env_bytes(ty: &Type) -> Result<usize> {
             .map(estimate_closure_env_bytes)
             .collect::<Result<Vec<_>>>()
             .map(|items| items.into_iter().sum()),
-        Type::Var(_) | Type::Infer(_) => Err(SimdError::new(
+        Type::Named(_, _) | Type::Var(_) | Type::Infer(_) => Err(SimdError::new(
             "closure env size cannot be computed for unresolved polymorphic capture",
         )),
         Type::Fun(_, _) => Err(SimdError::new(
@@ -2929,6 +2931,11 @@ fn mangle_type(ty: &Type) -> String {
                 .collect::<Vec<_>>()
                 .join("")
         ),
+        Type::Named(name, args) => format!(
+            "n{}{}",
+            name,
+            args.iter().map(mangle_type).collect::<Vec<_>>().join("_")
+        ),
         Type::Var(name) => format!("v{}", name),
         Type::Infer(index) => format!("u{}", index),
         Type::Fun(args, ret) => format!(
@@ -2950,6 +2957,7 @@ fn type_contains_unresolved_vars(ty: &Type) -> bool {
     match ty {
         Type::Var(_) | Type::Infer(_) => true,
         Type::Scalar(_) | Type::Bulk(_, _) => false,
+        Type::Named(_, args) => args.iter().any(type_contains_unresolved_vars),
         Type::TypeToken(inner) => type_contains_unresolved_vars(inner),
         Type::Record(fields) => fields.values().any(type_contains_unresolved_vars),
         Type::Fun(args, ret) => {
@@ -3718,6 +3726,12 @@ fn apply_type_subst(ty: &Type, subst: &BTreeMap<String, Type>) -> Type {
     match ty {
         Type::Var(name) => subst.get(name).cloned().unwrap_or_else(|| ty.clone()),
         Type::Scalar(_) | Type::Bulk(_, _) | Type::Infer(_) => ty.clone(),
+        Type::Named(name, args) => Type::Named(
+            name.clone(),
+            args.iter()
+                .map(|arg| apply_type_subst(arg, subst))
+                .collect(),
+        ),
         Type::TypeToken(inner) => Type::TypeToken(Box::new(apply_type_subst(inner, subst))),
         Type::Record(fields) => Type::Record(
             fields
@@ -3766,6 +3780,20 @@ fn collect_type_var_bindings(
             }
             _ => Err(SimdError::new(format!(
                 "specialization expected bulk {:?}, found {:?}",
+                template, actual
+            ))),
+        },
+        Type::Named(left_name, left_args) => match actual {
+            Type::Named(right_name, right_args)
+                if left_name == right_name && left_args.len() == right_args.len() =>
+            {
+                for (left_arg, right_arg) in left_args.iter().zip(right_args) {
+                    collect_type_var_bindings(left_arg, right_arg, subst)?;
+                }
+                Ok(())
+            }
+            _ => Err(SimdError::new(format!(
+                "specialization expected type constructor {:?}, found {:?}",
                 template, actual
             ))),
         },
@@ -3829,7 +3857,7 @@ fn lane_scalar_type(ty: &Type) -> Result<Type> {
         Type::TypeToken(_) => Err(SimdError::new(
             "lane argument expected bulk-compatible type, found type witness",
         )),
-        Type::Scalar(_) | Type::Var(_) | Type::Infer(_) | Type::Fun(_, _) => {
+        Type::Scalar(_) | Type::Named(_, _) | Type::Var(_) | Type::Infer(_) | Type::Fun(_, _) => {
             Err(SimdError::new(format!(
                 "lane argument expected bulk-compatible type, found {:?}",
                 ty
@@ -5578,7 +5606,7 @@ fn entry_signature(function: &CheckedFunction) -> Result<(Vec<ValType>, Option<V
                     "Wasm backend does not yet support record entry parameters",
                 ));
             }
-            Type::Var(_) | Type::Infer(_) => {
+            Type::Named(_, _) | Type::Var(_) | Type::Infer(_) => {
                 return Err(SimdError::new(
                     "Wasm backend does not support unresolved polymorphic entry parameters",
                 ));
@@ -5612,7 +5640,7 @@ fn entry_signature(function: &CheckedFunction) -> Result<(Vec<ValType>, Option<V
                 "Wasm backend does not yet support record entry results",
             ));
         }
-        Type::Var(_) | Type::Infer(_) => {
+        Type::Named(_, _) | Type::Var(_) | Type::Infer(_) => {
             return Err(SimdError::new(
                 "Wasm backend does not support unresolved polymorphic entry results",
             ));
@@ -5848,7 +5876,7 @@ fn compile_kernel_entry(
                     "Wasm backend does not yet support record kernel parameters",
                 ));
             }
-            Type::Var(_) | Type::Infer(_) => {
+            Type::Named(_, _) | Type::Var(_) | Type::Infer(_) => {
                 return Err(SimdError::new(
                     "Wasm backend does not support unresolved polymorphic kernel parameters",
                 ));
@@ -8037,6 +8065,7 @@ fn build_leaf_function(
         signature: Signature {
             name: leaf_export_name(&function.name, leaf_path),
             ty: Type::Fun(leaf_param_types, Box::new(leaf_result_ty)),
+            operator_instance: None,
         },
         clauses,
         pointwise: function.pointwise,
@@ -8104,7 +8133,7 @@ fn flatten_clause_patterns(
                     "function parameters are not supported in Wasm record lowering",
                 ));
             }
-            Type::Var(_) | Type::Infer(_) => {
+            Type::Named(_, _) | Type::Var(_) | Type::Infer(_) => {
                 return Err(SimdError::new(
                     "unresolved polymorphic parameters are not supported in Wasm record lowering",
                 ));
@@ -8374,7 +8403,7 @@ fn wasm_param_abi_from_single_type(ty: &Type) -> Result<WasmParamAbi> {
         Type::Fun(_, _) => Err(SimdError::new(
             "Wasm backend does not support higher-order entry parameters",
         )),
-        Type::Var(_) | Type::Infer(_) => Err(SimdError::new(
+        Type::Named(_, _) | Type::Var(_) | Type::Infer(_) => Err(SimdError::new(
             "Wasm backend does not support unresolved polymorphic entry parameters",
         )),
     }
@@ -8411,7 +8440,7 @@ fn wasm_result_abi_from_type(ty: &Type, param_types: &[Type]) -> Result<WasmResu
         Type::Fun(_, _) => Err(SimdError::new(
             "Wasm backend does not support higher-order entry results",
         )),
-        Type::Var(_) | Type::Infer(_) => Err(SimdError::new(
+        Type::Named(_, _) | Type::Var(_) | Type::Infer(_) => Err(SimdError::new(
             "Wasm backend does not support unresolved polymorphic entry results",
         )),
     }
@@ -8424,7 +8453,9 @@ fn type_contains_bulk_leaf(ty: &Type) -> bool {
             .iter()
             .any(|(_, field_ty)| type_contains_bulk_leaf(field_ty)),
         Type::TypeToken(_) => false,
-        Type::Scalar(_) | Type::Var(_) | Type::Infer(_) | Type::Fun(_, _) => false,
+        Type::Scalar(_) | Type::Named(_, _) | Type::Var(_) | Type::Infer(_) | Type::Fun(_, _) => {
+            false
+        }
     }
 }
 
@@ -8437,7 +8468,7 @@ fn wasm_leaf_result_abi_from_type(ty: &Type) -> Result<WasmLeafResultAbi> {
         )),
         Type::Record(_) => Err(SimdError::new("leaf result ABI cannot contain records")),
         Type::Fun(_, _) => Err(SimdError::new("leaf result ABI cannot contain functions")),
-        Type::Var(_) | Type::Infer(_) => Err(SimdError::new(
+        Type::Named(_, _) | Type::Var(_) | Type::Infer(_) => Err(SimdError::new(
             "leaf result ABI cannot contain unresolved polymorphic types",
         )),
     }
@@ -8476,7 +8507,7 @@ fn type_at_leaf_path(ty: &Type, leaf_path: &LeafPath) -> Result<Type> {
             Type::Fun(_, _) => Err(SimdError::new(
                 "function types cannot be used as leaf values",
             )),
-            Type::Var(_) | Type::Infer(_) => Err(SimdError::new(
+            Type::Named(_, _) | Type::Var(_) | Type::Infer(_) => Err(SimdError::new(
                 "unresolved polymorphic types cannot be used as leaf values",
             )),
         };

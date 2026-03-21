@@ -9,7 +9,7 @@
     pattern:  0, capture: 1 - type, start: (3, 7), end: (3, 17), text: `i64 -> i64`
     pattern:  1, capture: 0 - function, start: (4, 0), end: (4, 4), text: `main`
     pattern:  1, capture: 2 - variable.parameter, start: (4, 5), end: (4, 6), text: `x`
-    pattern:  8, capture: 8 - function.call, start: (4, 9), end: (4, 24), text: `scalar\axpy\i64`
-    pattern:  2, capture: 0 - function, start: (4, 9), end: (4, 15), text: `scalar`
-    pattern:  2, capture: 0 - function, start: (4, 16), end: (4, 20), text: `axpy`
-    pattern:  8, capture: 6 - expression, start: (4, 25), end: (4, 26), text: `x`
+    pattern: 11, capture: 10 - function.call, start: (4, 9), end: (4, 24), text: `scalar\axpy\i64`
+    pattern:  5, capture: 0 - function, start: (4, 9), end: (4, 15), text: `scalar`
+    pattern:  5, capture: 0 - function, start: (4, 16), end: (4, 20), text: `axpy`
+    pattern: 11, capture: 8 - expression, start: (4, 25), end: (4, 26), text: `x`

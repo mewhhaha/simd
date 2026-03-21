@@ -26,7 +26,7 @@ module.exports = grammar({
         ),
       ),
 
-    declaration: ($) => choice($.import_decl, $.signature, $.clause),
+    declaration: ($) => choice($.import_decl, $.type_alias, $.signature, $.clause),
 
     import_decl: ($) =>
       seq("import", field("path", $.module_path), "as", field("alias", $.identifier)),
@@ -37,38 +37,62 @@ module.exports = grammar({
 
     comment: (_) => token(seq("--", /[^\n]*/)),
 
+    type_alias: ($) =>
+      seq(
+        "type",
+        field("name", $.identifier),
+        repeat(field("param", $.identifier)),
+        "=",
+        field("body", $.type),
+      ),
+
     signature: ($) =>
-      seq(field("name", $.identifier), ":", field("type", $.type)),
+      seq(field("head", $.decl_head), ":", field("type", $.type)),
 
     clause: ($) =>
       seq(
-        field("name", $.identifier),
+        field("head", $.decl_head),
         repeat(field("pattern", $.pattern)),
         "=",
         field("body", $.expr),
+      ),
+
+    decl_head: ($) => choice($.identifier, $.operator_head),
+
+    operator_head: ($) =>
+      seq(
+        "(",
+        field("operator", choice("+", "-", "*", "/", "%", "==", "<", ">", "<=", ">=")),
+        ")",
+        repeat1(seq("\\", field("segment", choice($.identifier, $.prim_type)))),
       ),
 
     pattern: ($) => choice($.wildcard, $.prim_type, $.identifier, $.int, $.float),
 
     type: ($) =>
       choice(
-        prec.right(seq(field("arg", $.type_atom), "->", field("result", $.type))),
+        prec.right(seq(field("arg", $.type_nonfun), "->", field("result", $.type))),
+        $.type_nonfun,
+      ),
+
+    type_nonfun: ($) =>
+      choice(
+        prec.left(seq(field("constructor", $.type_atom), repeat1(field("argument", $.type_atom)))),
         $.type_atom,
       ),
 
     type_atom: ($) =>
       choice(
         prec.left(seq(field("base", $.type_base), repeat1($.shape_suffix))),
-        prec.left(seq(field("constructor", $.type_constructor), repeat1(field("argument", $.type_atom)))),
         $.type_base,
       ),
 
     type_base: ($) =>
-      choice($.prim_type, $.identifier, $.record_type, seq("(", $.type, ")")),
+      choice($.prim_type, $.type_witness, $.identifier, $.record_type, seq("(", $.type, ")")),
 
     prim_type: (_) => choice("i32", "i64", "f32", "f64"),
 
-    type_constructor: (_) => /[A-Z][a-zA-Z0-9_]*/,
+    type_witness: ($) => seq("Type", field("witness", choice($.prim_type, $.identifier))),
 
     record_type: ($) =>
       seq("{", optional(seq($.type_field, repeat(seq(",", $.type_field)))), "}"),

@@ -4,23 +4,40 @@
 ] @constant.numeric
 
 (prim_type) @type.builtin
-(type_constructor) @type
 
-(type_atom
-  constructor: (type_constructor) @keyword
-  (#eq? @keyword "Type"))
+(type_witness
+  "Type" @keyword)
 
 (qualified_ref
   head: (identifier) @function
   segment: (identifier) @function)
 
+(type_alias
+  "type" @keyword
+  name: (identifier) @type
+  param: (identifier) @type.parameter)
+
 (signature
-  name: (identifier) @function
+  head: (decl_head
+    (identifier) @function)
   type: (type) @type)
 
+(signature
+  head: (decl_head
+    (operator_head
+      operator: (_) @operator
+      segment: (identifier) @type)))
+
 (clause
-  name: (identifier) @function
+  head: (decl_head
+    (identifier) @function)
   pattern: (pattern (identifier) @variable.parameter))
+
+(clause
+  head: (decl_head
+    (operator_head
+      operator: (_) @operator
+      segment: (identifier) @type)))
 
 (let_expr
   "let" @keyword

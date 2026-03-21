@@ -138,12 +138,12 @@
           }
         ]
       },
-      "name": {
+      "head": {
         "multiple": false,
         "required": true,
         "types": [
           {
-            "type": "identifier",
+            "type": "decl_head",
             "named": true
           }
         ]
@@ -223,6 +223,25 @@
     }
   },
   {
+    "type": "decl_head",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": false,
+      "required": true,
+      "types": [
+        {
+          "type": "identifier",
+          "named": true
+        },
+        {
+          "type": "operator_head",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
     "type": "declaration",
     "named": true,
     "fields": {},
@@ -240,6 +259,10 @@
         },
         {
           "type": "signature",
+          "named": true
+        },
+        {
+          "type": "type_alias",
           "named": true
         }
       ]
@@ -453,6 +476,72 @@
     "fields": {}
   },
   {
+    "type": "operator_head",
+    "named": true,
+    "fields": {
+      "operator": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "%",
+            "named": false
+          },
+          {
+            "type": "*",
+            "named": false
+          },
+          {
+            "type": "+",
+            "named": false
+          },
+          {
+            "type": "-",
+            "named": false
+          },
+          {
+            "type": "/",
+            "named": false
+          },
+          {
+            "type": "<",
+            "named": false
+          },
+          {
+            "type": "<=",
+            "named": false
+          },
+          {
+            "type": "==",
+            "named": false
+          },
+          {
+            "type": ">",
+            "named": false
+          },
+          {
+            "type": ">=",
+            "named": false
+          }
+        ]
+      },
+      "segment": {
+        "multiple": true,
+        "required": true,
+        "types": [
+          {
+            "type": "identifier",
+            "named": true
+          },
+          {
+            "type": "prim_type",
+            "named": true
+          }
+        ]
+      }
+    }
+  },
+  {
     "type": "pattern",
     "named": true,
     "fields": {},
@@ -654,12 +743,12 @@
     "type": "signature",
     "named": true,
     "fields": {
-      "name": {
+      "head": {
         "multiple": false,
         "required": true,
         "types": [
           {
-            "type": "identifier",
+            "type": "decl_head",
             "named": true
           }
         ]
@@ -701,7 +790,7 @@
         "required": false,
         "types": [
           {
-            "type": "type_atom",
+            "type": "type_nonfun",
             "named": true
           }
         ]
@@ -722,26 +811,52 @@
       "required": false,
       "types": [
         {
-          "type": "type_atom",
+          "type": "type_nonfun",
           "named": true
         }
       ]
     }
   },
   {
-    "type": "type_atom",
+    "type": "type_alias",
     "named": true,
     "fields": {
-      "argument": {
-        "multiple": true,
-        "required": false,
+      "body": {
+        "multiple": false,
+        "required": true,
         "types": [
           {
-            "type": "type_atom",
+            "type": "type",
             "named": true
           }
         ]
       },
+      "name": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "identifier",
+            "named": true
+          }
+        ]
+      },
+      "param": {
+        "multiple": true,
+        "required": false,
+        "types": [
+          {
+            "type": "identifier",
+            "named": true
+          }
+        ]
+      }
+    }
+  },
+  {
+    "type": "type_atom",
+    "named": true,
+    "fields": {
       "base": {
         "multiple": false,
         "required": false,
@@ -751,21 +866,11 @@
             "named": true
           }
         ]
-      },
-      "constructor": {
-        "multiple": false,
-        "required": false,
-        "types": [
-          {
-            "type": "type_constructor",
-            "named": true
-          }
-        ]
       }
     },
     "children": {
       "multiple": true,
-      "required": false,
+      "required": true,
       "types": [
         {
           "type": "shape_suffix",
@@ -801,6 +906,10 @@
         {
           "type": "type",
           "named": true
+        },
+        {
+          "type": "type_witness",
+          "named": true
         }
       ]
     }
@@ -825,6 +934,62 @@
         "types": [
           {
             "type": "type",
+            "named": true
+          }
+        ]
+      }
+    }
+  },
+  {
+    "type": "type_nonfun",
+    "named": true,
+    "fields": {
+      "argument": {
+        "multiple": true,
+        "required": false,
+        "types": [
+          {
+            "type": "type_atom",
+            "named": true
+          }
+        ]
+      },
+      "constructor": {
+        "multiple": false,
+        "required": false,
+        "types": [
+          {
+            "type": "type_atom",
+            "named": true
+          }
+        ]
+      }
+    },
+    "children": {
+      "multiple": false,
+      "required": false,
+      "types": [
+        {
+          "type": "type_atom",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "type_witness",
+    "named": true,
+    "fields": {
+      "witness": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "identifier",
+            "named": true
+          },
+          {
+            "type": "prim_type",
             "named": true
           }
         ]
@@ -904,6 +1069,10 @@
     "named": false
   },
   {
+    "type": "Type",
+    "named": false
+  },
+  {
     "type": "[",
     "named": false
   },
@@ -965,8 +1134,8 @@
     "named": true
   },
   {
-    "type": "type_constructor",
-    "named": true
+    "type": "type",
+    "named": false
   },
   {
     "type": "wildcard",

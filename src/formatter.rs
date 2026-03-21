@@ -1,8 +1,9 @@
 use std::fs;
 
 use crate::{
-    Clause, Decl, Expr, ImportDecl, LetBinding, Pattern, Prim, PrimOp, RefExpr, Result, Shape,
-    SimdError, SurfaceProgram, Type, parse_source, read_source_file,
+    Clause, Decl, Expr, ImportDecl, LetBinding, OperatorInstanceSpec, Pattern, Prim, PrimOp,
+    RefExpr, Result, Shape, Signature, SimdError, SurfaceProgram, Type, TypeAliasDecl,
+    parse_source, read_source_file,
 };
 
 const PREC_LET: u8 = 0;
@@ -46,6 +47,9 @@ pub fn format_program(program: &SurfaceProgram) -> String {
                 (Decl::Import(_), Decl::Import(_)) => "\n",
                 (Decl::Import(_), _) => "\n\n",
                 (_, Decl::Import(_)) => "\n\n",
+                (Decl::TypeAlias(_), Decl::TypeAlias(_)) => "\n",
+                (Decl::TypeAlias(_), _) => "\n\n",
+                (_, Decl::TypeAlias(_)) => "\n\n",
                 (Decl::Signature(left), Decl::Clause(right)) if left.name == right.name => "\n",
                 (Decl::Clause(left), Decl::Clause(right)) if left.name == right.name => "\n",
                 _ => "\n\n",
@@ -69,9 +73,8 @@ fn normalize_for_compare(source: &str) -> String {
 fn format_decl(decl: &Decl) -> String {
     match decl {
         Decl::Import(import_decl) => format_import(import_decl),
-        Decl::Signature(signature) => {
-            format!("{} : {}", signature.name, format_type(&signature.ty))
-        }
+        Decl::TypeAlias(alias) => format_type_alias(alias),
+        Decl::Signature(signature) => format_signature(signature),
         Decl::Clause(clause) => format_clause(clause),
     }
 }
@@ -80,8 +83,36 @@ fn format_import(import_decl: &ImportDecl) -> String {
     format!("import {} as {}", import_decl.path, import_decl.alias)
 }
 
+fn format_type_alias(alias: &TypeAliasDecl) -> String {
+    if alias.params.is_empty() {
+        format!("type {} = {}", alias.name, format_type(&alias.body))
+    } else {
+        format!(
+            "type {} {} = {}",
+            alias.name,
+            alias.params.join(" "),
+            format_type(&alias.body)
+        )
+    }
+}
+
+fn format_signature(signature: &Signature) -> String {
+    format!(
+        "{} : {}",
+        format_decl_head(&signature.name, &signature.operator_instance),
+        format_type(&signature.ty)
+    )
+}
+
+fn format_decl_head(name: &str, operator: &Option<OperatorInstanceSpec>) -> String {
+    match operator {
+        Some(spec) => format_operator_instance_spec(spec),
+        None => name.to_string(),
+    }
+}
+
 fn format_clause(clause: &Clause) -> String {
-    let mut out = clause.name.clone();
+    let mut out = format_decl_head(&clause.name, &clause.operator_instance);
     for pattern in &clause.patterns {
         out.push(' ');
         out.push_str(&format_pattern(pattern));
@@ -120,6 +151,16 @@ fn format_type_atom(ty: &Type) -> String {
                 parts.push(format!("{}:{}", name, format_type(field_ty)));
             }
             format!("{{{}}}", parts.join(","))
+        }
+        Type::Named(name, args) => {
+            if args.is_empty() {
+                name.clone()
+            } else {
+                let mut parts = Vec::with_capacity(args.len() + 1);
+                parts.push(name.clone());
+                parts.extend(args.iter().map(format_type_atom));
+                parts.join(" ")
+            }
         }
         Type::Var(name) => name.clone(),
         Type::Infer(index) => format!("?{}", index),
@@ -307,6 +348,15 @@ fn format_prim_op(op: PrimOp) -> &'static str {
     }
 }
 
+fn format_operator_instance_spec(spec: &OperatorInstanceSpec) -> String {
+    let mut out = format!("({})", format_prim_op(spec.op));
+    for segment in &spec.segments {
+        out.push('\\');
+        out.push_str(segment);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -337,6 +387,17 @@ mod tests {
         let source = "main : i64 -> i64\nmain x = let\n  y = x + 1\n  z = y * 2\nin z\n";
         let program = parse_source(source).expect("multiline let should parse");
         assert_eq!(program.decls.len(), 2);
+    }
+
+    #[test]
+    fn formats_type_aliases_and_operator_instance_heads() {
+        let source =
+            "type v3 a={x:a,y:a,z:a}\n(*)\\v3\\a:v3 a->v3 a->v3 a\n(*)\\v3\\a lhs rhs=lhs\n";
+        let formatted = format_source_text(source).expect("format should succeed");
+        assert_eq!(
+            formatted,
+            "type v3 a = {x:a,y:a,z:a}\n\n(*)\\v3\\a : v3 a -> v3 a -> v3 a\n(*)\\v3\\a lhs rhs = lhs\n"
+        );
     }
 
     #[test]

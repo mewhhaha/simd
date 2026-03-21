@@ -1,0 +1,13 @@
+type v3 a = {x:a,y:a,z:a}
+
+(*)\v3\a : v3 a -> v3 a -> v3 a
+(*)\v3\a lhs rhs = { x = lhs.x * rhs.x, y = lhs.y * rhs.y, z = lhs.z * rhs.z }
+
+(+)\v3\a : v3 a -> v3 a -> v3 a
+(+)\v3\a lhs rhs = { x = lhs.x + rhs.x, y = lhs.y + rhs.y, z = lhs.z + rhs.z }
+
+dot_i64 : v3 i64 -> v3 i64 -> i64
+dot_i64 a b = let p = a * b in p.x + p.y + p.z
+
+main : v3 i64 -> v3 i64 -> {sum:v3 i64,hadamard:v3 i64,dot:i64}
+main a b = { sum = a + b, hadamard = a * b, dot = dot_i64 a b }
