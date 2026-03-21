@@ -4,6 +4,8 @@
 ] @constant.numeric
 
 (prim_type) @type.builtin
+(bool_type) @type.builtin
+(bool_literal) @constant.builtin
 
 (type_witness
   "Type" @keyword)
@@ -36,6 +38,12 @@
       operator: (_) @operator
       segment: (identifier) @type)))
 
+(signature
+  head: (decl_head
+    (family_instance_head
+      name: (identifier) @function
+      segment: (identifier) @type)))
+
 (family_decl
   "family" @keyword)
 
@@ -49,7 +57,9 @@
 
 (clause
   head: (decl_head
-    (identifier) @function)
+    (identifier) @function))
+
+(clause
   pattern: (pattern (identifier) @variable.parameter))
 
 (clause

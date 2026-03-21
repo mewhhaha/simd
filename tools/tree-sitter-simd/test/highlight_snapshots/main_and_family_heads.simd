@@ -1,0 +1,8 @@
+concat\string : string -> string -> string
+concat\string x y = y
+
+main : i64[n] -> i64[n]
+main xs = inc xs
+
+main0 : i64
+main0 = 1

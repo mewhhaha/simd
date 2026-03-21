@@ -1104,6 +1104,11 @@ fn load_prepared_args(bound: &mut BoundPreparedRun, args: &[Value]) -> Result<()
                     "prepared flattened input should not contain record values",
                 ));
             }
+            Value::Bool(_) => {
+                return Err(SimdError::new(
+                    "prepared execution does not support bool arguments",
+                ));
+            }
             Value::String(_) => {
                 return Err(SimdError::new(
                     "prepared execution does not support string arguments",
@@ -1800,7 +1805,10 @@ fn specialize_function_instance(
                             );
                         }
                         Pattern::Wildcard => {}
-                        Pattern::Int(_) | Pattern::Float(_) | Pattern::Type(_) => {
+                        Pattern::Int(_)
+                        | Pattern::Float(_)
+                        | Pattern::Bool(_)
+                        | Pattern::Type(_) => {
                             return Err(SimdError::new(format!(
                                 "function-typed parameter {} in '{}' used a literal pattern",
                                 index, pending.base_name
@@ -1816,7 +1824,7 @@ fn specialize_function_instance(
                             }
                         }
                         Pattern::Wildcard | Pattern::Name(_) => {}
-                        Pattern::Int(_) | Pattern::Float(_) => {
+                        Pattern::Int(_) | Pattern::Float(_) | Pattern::Bool(_) => {
                             return Err(SimdError::new(format!(
                                 "type witness parameter {} in '{}' used a non-Type literal pattern",
                                 index, pending.base_name
@@ -1918,6 +1926,7 @@ fn specialize_expr(
             }
             _ => TypedExprKind::Float(*value, *prim),
         },
+        TypedExprKind::Bool(value) => TypedExprKind::Bool(*value),
         TypedExprKind::TypeToken(prim) => TypedExprKind::TypeToken(*prim),
         TypedExprKind::String(value) => TypedExprKind::String(value.clone()),
         TypedExprKind::Lambda { param, body } => TypedExprKind::Lambda {
@@ -2189,6 +2198,7 @@ fn extract_known_function_binding(expr: &TypedExpr) -> Option<KnownFunctionBindi
         | TypedExprKind::Call { .. }
         | TypedExprKind::Int(_, _)
         | TypedExprKind::Float(_, _)
+        | TypedExprKind::Bool(_)
         | TypedExprKind::String(_)
         | TypedExprKind::TypeToken(_) => None,
     }
@@ -2343,7 +2353,9 @@ fn try_inline_lambda_result_call(
                     });
                 }
             }
-            Pattern::Int(_) | Pattern::Float(_) | Pattern::Type(_) => return Ok(None),
+            Pattern::Int(_) | Pattern::Float(_) | Pattern::Bool(_) | Pattern::Type(_) => {
+                return Ok(None);
+            }
         }
     }
     let rewritten_body = specialize_expr(
@@ -3028,6 +3040,7 @@ fn eliminate_non_escaping_lambdas_expr(
         TypedExprKind::FunctionRef { name } => TypedExprKind::FunctionRef { name: name.clone() },
         TypedExprKind::Int(value, prim) => TypedExprKind::Int(*value, *prim),
         TypedExprKind::Float(value, prim) => TypedExprKind::Float(*value, *prim),
+        TypedExprKind::Bool(value) => TypedExprKind::Bool(*value),
         TypedExprKind::String(value) => TypedExprKind::String(value.clone()),
         TypedExprKind::TypeToken(prim) => TypedExprKind::TypeToken(*prim),
         TypedExprKind::Lambda { param, body } => TypedExprKind::Lambda {
@@ -3242,6 +3255,7 @@ fn collect_free_locals(
         TypedExprKind::FunctionRef { .. }
         | TypedExprKind::Int(_, _)
         | TypedExprKind::Float(_, _)
+        | TypedExprKind::Bool(_)
         | TypedExprKind::String(_)
         | TypedExprKind::TypeToken(_) => {}
         TypedExprKind::Lambda { param, body } => {
@@ -3304,6 +3318,7 @@ fn rename_free_locals(
         TypedExprKind::FunctionRef { name } => TypedExprKind::FunctionRef { name: name.clone() },
         TypedExprKind::Int(value, prim) => TypedExprKind::Int(*value, *prim),
         TypedExprKind::Float(value, prim) => TypedExprKind::Float(*value, *prim),
+        TypedExprKind::Bool(value) => TypedExprKind::Bool(*value),
         TypedExprKind::String(value) => TypedExprKind::String(value.clone()),
         TypedExprKind::TypeToken(prim) => TypedExprKind::TypeToken(*prim),
         TypedExprKind::Lambda { param, body } => {
@@ -3398,6 +3413,7 @@ fn collect_used_locals(expr: &TypedExpr, names: &mut BTreeSet<String>) {
         TypedExprKind::FunctionRef { .. }
         | TypedExprKind::Int(_, _)
         | TypedExprKind::Float(_, _)
+        | TypedExprKind::Bool(_)
         | TypedExprKind::String(_)
         | TypedExprKind::TypeToken(_) => {}
         TypedExprKind::Lambda { body, .. } => collect_used_locals(body, names),
@@ -3482,6 +3498,7 @@ fn canonicalize_backend_higher_order_expr(
         TypedExprKind::FunctionRef { name } => TypedExprKind::FunctionRef { name: name.clone() },
         TypedExprKind::Int(value, prim) => TypedExprKind::Int(*value, *prim),
         TypedExprKind::Float(value, prim) => TypedExprKind::Float(*value, *prim),
+        TypedExprKind::Bool(value) => TypedExprKind::Bool(*value),
         TypedExprKind::String(value) => TypedExprKind::String(value.clone()),
         TypedExprKind::TypeToken(prim) => TypedExprKind::TypeToken(*prim),
         TypedExprKind::Lambda { param, body } => TypedExprKind::Lambda {
@@ -3628,6 +3645,7 @@ fn classify_function_value_expr_for_backend(expr: &TypedExpr) -> FunctionValueCl
         | TypedExprKind::Call { .. } => FunctionValueClass::EscapingUnknown,
         TypedExprKind::Int(_, _)
         | TypedExprKind::Float(_, _)
+        | TypedExprKind::Bool(_)
         | TypedExprKind::String(_)
         | TypedExprKind::TypeToken(_)
         | TypedExprKind::Record(_)
@@ -4062,6 +4080,7 @@ fn collect_higher_order_expr_counts(
         TypedExprKind::Local(_)
         | TypedExprKind::Int(_, _)
         | TypedExprKind::Float(_, _)
+        | TypedExprKind::Bool(_)
         | TypedExprKind::String(_)
         | TypedExprKind::TypeToken(_) => {}
     }
@@ -4089,6 +4108,7 @@ fn typed_expr_contains_lambda_or_apply(expr: &TypedExpr) -> bool {
         | TypedExprKind::FunctionRef { .. }
         | TypedExprKind::Int(_, _)
         | TypedExprKind::Float(_, _)
+        | TypedExprKind::Bool(_)
         | TypedExprKind::String(_)
         | TypedExprKind::TypeToken(_) => false,
     }
@@ -4120,6 +4140,7 @@ fn typed_expr_contains_fun_local(expr: &TypedExpr) -> bool {
         | TypedExprKind::FunctionRef { .. }
         | TypedExprKind::Int(_, _)
         | TypedExprKind::Float(_, _)
+        | TypedExprKind::Bool(_)
         | TypedExprKind::String(_)
         | TypedExprKind::TypeToken(_) => false,
     }
@@ -6697,9 +6718,12 @@ fn emit_scalar_hoists(
 }
 
 fn clause_has_condition(patterns: &[TypedPattern]) -> bool {
-    patterns
-        .iter()
-        .any(|pattern| matches!(pattern.pattern, Pattern::Int(_) | Pattern::Float(_)))
+    patterns.iter().any(|pattern| {
+        matches!(
+            pattern.pattern,
+            Pattern::Int(_) | Pattern::Float(_) | Pattern::Bool(_)
+        )
+    })
 }
 
 fn pattern_local_map(patterns: &[TypedPattern]) -> BTreeMap<String, u32> {
@@ -6708,7 +6732,11 @@ fn pattern_local_map(patterns: &[TypedPattern]) -> BTreeMap<String, u32> {
         .enumerate()
         .filter_map(|(index, pattern)| match &pattern.pattern {
             Pattern::Name(name) => Some((name.clone(), index as u32)),
-            Pattern::Wildcard | Pattern::Int(_) | Pattern::Float(_) | Pattern::Type(_) => None,
+            Pattern::Wildcard
+            | Pattern::Int(_)
+            | Pattern::Float(_)
+            | Pattern::Bool(_)
+            | Pattern::Type(_) => None,
         })
         .collect()
 }
@@ -6754,6 +6782,11 @@ fn emit_clause_condition(
                     function.instruction(&Instruction::I32And);
                 }
             }
+            Pattern::Bool(_) => {
+                return Err(SimdError::new(
+                    "Wasm backend does not support bool clause patterns",
+                ));
+            }
             Pattern::Type(_) => {
                 return Err(SimdError::new(
                     "Wasm backend does not support type witness clause patterns",
@@ -6781,7 +6814,7 @@ fn emit_pattern_value(
                 .unwrap_or(fallback_local);
             function.instruction(&Instruction::LocalGet(local));
         }
-        Pattern::Wildcard | Pattern::Int(_) | Pattern::Float(_) => {
+        Pattern::Wildcard | Pattern::Int(_) | Pattern::Float(_) | Pattern::Bool(_) => {
             function.instruction(&Instruction::LocalGet(fallback_local));
         }
         Pattern::Type(_) => {
@@ -7324,6 +7357,7 @@ fn patterns_are_vectorizable(
                     return false;
                 }
             }
+            Pattern::Bool(_) => return false,
             Pattern::Type(_) => return false,
             Pattern::Name(_) | Pattern::Wildcard => {}
         }
@@ -7403,6 +7437,11 @@ fn emit_vector_clause_mask(
                     function.instruction(&Instruction::V128And);
                 }
                 terms += 1;
+            }
+            Pattern::Bool(_) => {
+                return Err(SimdError::new(
+                    "Wasm backend does not support bool clause patterns",
+                ));
             }
             Pattern::Type(_) => {
                 return Err(SimdError::new(
@@ -8158,7 +8197,10 @@ fn flatten_clause_patterns(
                     let leaf_pattern = match &pattern.pattern {
                         Pattern::Name(name) => Pattern::Name(leaf_symbol_name(name, &leaf.path)),
                         Pattern::Wildcard => Pattern::Wildcard,
-                        Pattern::Int(_) | Pattern::Float(_) | Pattern::Type(_) => {
+                        Pattern::Int(_)
+                        | Pattern::Float(_)
+                        | Pattern::Bool(_)
+                        | Pattern::Type(_) => {
                             return Err(SimdError::new(
                                 "record parameters cannot use literal patterns",
                             ));
@@ -8232,6 +8274,9 @@ fn normalize_expr_for_leaf(
                 kind: TypedExprKind::Float(*value, *prim),
             })
         }
+        TypedExprKind::Bool(_) => Err(SimdError::new(
+            "Wasm record normalization does not support bool expressions",
+        )),
         TypedExprKind::String(value) => {
             if !leaf_path.is_root() {
                 return Err(SimdError::new(
@@ -9312,6 +9357,23 @@ fn flatten_wasm_value(
                 "Wasm record argument expected a record value, found string",
             ));
         }
+        (Value::Bool(_), WasmParamAbi::Scalar { prim }) => {
+            return Err(SimdError::new(format!(
+                "Wasm scalar argument expected {:?}, found bool",
+                prim
+            )));
+        }
+        (Value::Bool(_), WasmParamAbi::Bulk { prim }) => {
+            return Err(SimdError::new(format!(
+                "Wasm bulk argument expected {:?}, found bool",
+                prim
+            )));
+        }
+        (Value::Bool(_), WasmParamAbi::Record { .. }) => {
+            return Err(SimdError::new(
+                "Wasm record argument expected a record value, found bool",
+            ));
+        }
         (Value::TypeToken(_), WasmParamAbi::Scalar { .. })
         | (Value::TypeToken(_), WasmParamAbi::Bulk { .. }) => {
             return Err(SimdError::new(
@@ -9738,6 +9800,7 @@ mod tests {
             | TypedExprKind::FunctionRef { .. }
             | TypedExprKind::Int(_, _)
             | TypedExprKind::Float(_, _)
+            | TypedExprKind::Bool(_)
             | TypedExprKind::String(_)
             | TypedExprKind::TypeToken(_) => false,
         }

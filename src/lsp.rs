@@ -581,6 +581,7 @@ fn collect_expr_local_types(expr: &TypedExpr, map: &mut BTreeMap<String, Vec<Typ
         TypedExprKind::FunctionRef { .. }
         | TypedExprKind::Int(_, _)
         | TypedExprKind::Float(_, _)
+        | TypedExprKind::Bool(_)
         | TypedExprKind::String(_)
         | TypedExprKind::TypeToken(_) => {}
         TypedExprKind::Lambda { body, .. } => collect_expr_local_types(body, map),
@@ -828,6 +829,14 @@ mod tests {
     fn diagnostics_empty_for_type_alias_operator_instance_program() {
         let diagnostics = diagnostics_for_source(
             "type v3 a = {x:a,y:a,z:a}\n(*)\\v3\\a : v3 a -> v3 a -> v3 a\n(*)\\v3\\a lhs rhs = lhs\nmain : v3 i64 -> v3 i64\nmain x = x * x\n",
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn diagnostics_empty_for_family_and_string_program() {
+        let diagnostics = diagnostics_for_source(
+            "concat\\string : string -> string -> string\nconcat\\string x y = y\n(==)\\string : string -> string -> bool\n(==)\\string a b = contains a b\nmain : bool\nmain = \"a\" `concat` \"b\" == \"ab\"\n",
         );
         assert!(diagnostics.is_empty());
     }

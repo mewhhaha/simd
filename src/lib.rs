@@ -129,6 +129,7 @@ pub enum TypeArg {
 pub enum Pattern {
     Int(i64),
     Float(f64),
+    Bool(bool),
     Type(Prim),
     Name(String),
     Wildcard,
@@ -139,6 +140,7 @@ pub enum Expr {
     Ref(RefExpr),
     Int(i64),
     Float(f64),
+    Bool(bool),
     String(String),
     App(Box<Expr>, Box<Expr>),
     Lambda {
@@ -334,6 +336,7 @@ pub enum TypedExprKind {
     },
     Int(i64, Prim),
     Float(f64, Prim),
+    Bool(bool),
     String(String),
     TypeToken(Prim),
     Lambda {
@@ -384,6 +387,7 @@ pub enum BuiltinFamilyCallee {
     SliceString,
     ContainsString,
     EqString,
+    EqBool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -554,6 +558,7 @@ pub struct CompiledProgram {
 pub enum Value {
     Scalar(ScalarValue),
     Bulk(BulkValue),
+    Bool(bool),
     String(String),
     TypeToken(Prim),
     Record(BTreeMap<String, Value>),
@@ -645,6 +650,18 @@ fn format_prim(prim: Prim) -> &'static str {
     }
 }
 
+fn is_builtin_bool_type(ty: &Type) -> bool {
+    matches!(ty, Type::Named(name, args) if name == "bool" && args.is_empty())
+}
+
+fn builtin_string_type() -> Type {
+    Type::Named("string".to_string(), Vec::new())
+}
+
+fn builtin_bool_type() -> Type {
+    Type::Named("bool".to_string(), Vec::new())
+}
+
 impl BulkValue {
     fn scalar_at(&self, index: usize) -> ScalarValue {
         self.elements[index].clone()
@@ -692,7 +709,8 @@ impl Value {
                 value.prim,
                 Shape(value.shape.iter().copied().map(Dim::Const).collect()),
             ),
-            Self::String(_) => Type::Named("string".to_string(), Vec::new()),
+            Self::Bool(_) => builtin_bool_type(),
+            Self::String(_) => builtin_string_type(),
             Self::TypeToken(prim) => Type::TypeToken(Box::new(Type::Scalar(*prim))),
             Self::Record(fields) => Type::Record(
                 fields
@@ -707,6 +725,7 @@ impl Value {
         match self {
             Self::Scalar(value) => value.to_json_string(),
             Self::Bulk(value) => render_bulk_json(&value.elements, &value.shape, 0),
+            Self::Bool(value) => value.to_string(),
             Self::String(value) => json_string(value),
             Self::TypeToken(prim) => format!("\"{}\"", format_prim(*prim)),
             Self::Record(fields) => render_record_json(fields),
@@ -793,7 +812,7 @@ fn render_lifted_value_json(value: &Value, shape: &[usize], offset: usize) -> St
 
 fn value_lift_shape(value: &Value) -> Option<Vec<usize>> {
     match value {
-        Value::Scalar(_) | Value::String(_) | Value::TypeToken(_) => None,
+        Value::Scalar(_) | Value::Bool(_) | Value::String(_) | Value::TypeToken(_) => None,
         Value::Bulk(bulk) => Some(bulk.shape.clone()),
         Value::Record(fields) => {
             let mut shape = None::<Vec<usize>>;
@@ -816,7 +835,7 @@ fn value_leaf_prim(value: &Value) -> Option<Prim> {
     match value {
         Value::Scalar(value) => Some(value.prim()),
         Value::Bulk(value) => Some(value.prim),
-        Value::String(_) | Value::TypeToken(_) => None,
+        Value::Bool(_) | Value::String(_) | Value::TypeToken(_) => None,
         Value::Record(fields) => fields.values().find_map(value_leaf_prim),
     }
 }
@@ -833,7 +852,7 @@ fn extract_lifted_lane(value: &Value, index: usize) -> Result<Value> {
         Value::TypeToken(_) => Err(SimdError::new(
             "cannot extract a lifted lane from a type witness value",
         )),
-        Value::Scalar(_) | Value::String(_) => Err(SimdError::new(
+        Value::Scalar(_) | Value::Bool(_) | Value::String(_) => Err(SimdError::new(
             "cannot extract a lifted lane from a scalar value",
         )),
     }
@@ -882,6 +901,9 @@ fn collect_lifted_value(values: &[Value], scalar_ty: &Type, shape: &[usize]) -> 
         Type::TypeToken(_) => Err(SimdError::new(
             "lifted result type unexpectedly contained type witnesses",
         )),
+        Type::Named(name, args) if name == "bool" && args.is_empty() => Err(SimdError::new(
+            "lifted bool results are not supported yet; use evaluator-only scalar bools",
+        )),
         Type::Named(_, _) | Type::Var(_) | Type::Infer(_) => Err(SimdError::new(
             "lifted result type unexpectedly contained an unresolved type variable",
         )),
@@ -921,6 +943,9 @@ pub fn flatten_value_leaves(value: &Value, ty: &Type) -> Result<Vec<(LeafPath, V
         (Value::String(_), Type::Named(name, args)) if name == "string" && args.is_empty() => {
             Ok(vec![(LeafPath::root(), value.clone())])
         }
+        (Value::Bool(_), Type::Named(name, args)) if name == "bool" && args.is_empty() => {
+            Ok(vec![(LeafPath::root(), value.clone())])
+        }
         (Value::TypeToken(_), Type::TypeToken(_)) => Ok(Vec::new()),
         (Value::Record(fields), Type::Record(field_types)) => {
             let mut leaves = Vec::new();
@@ -951,6 +976,10 @@ pub fn rebuild_value_from_leaves(ty: &Type, leaves: &BTreeMap<LeafPath, Value>) 
             .cloned()
             .ok_or_else(|| SimdError::new(format!("missing root leaf for type {:?}", ty))),
         Type::Named(name, args) if name == "string" && args.is_empty() => leaves
+            .get(&LeafPath::root())
+            .cloned()
+            .ok_or_else(|| SimdError::new(format!("missing root leaf for type {:?}", ty))),
+        Type::Named(name, args) if name == "bool" && args.is_empty() => leaves
             .get(&LeafPath::root())
             .cloned()
             .ok_or_else(|| SimdError::new(format!("missing root leaf for type {:?}", ty))),
@@ -1463,6 +1492,10 @@ impl Parser {
                 self.pos += 1;
                 if token.text == "_" {
                     Ok(Pattern::Wildcard)
+                } else if token.text == "true" {
+                    Ok(Pattern::Bool(true))
+                } else if token.text == "false" {
+                    Ok(Pattern::Bool(false))
                 } else if let Some(prim) = Prim::parse(&token.text) {
                     Ok(Pattern::Type(prim))
                 } else {
@@ -1686,7 +1719,13 @@ impl Parser {
             TokenKind::Backslash => self.parse_lambda_expr(),
             TokenKind::Ident => {
                 self.pos += 1;
-                Ok(Expr::Ref(self.parse_ref_expr(token.text)?))
+                if token.text == "true" {
+                    Ok(Expr::Bool(true))
+                } else if token.text == "false" {
+                    Ok(Expr::Bool(false))
+                } else {
+                    Ok(Expr::Ref(self.parse_ref_expr(token.text)?))
+                }
             }
             TokenKind::Int => {
                 self.pos += 1;
@@ -2409,9 +2448,14 @@ fn group_program(surface: &SurfaceProgram) -> Result<Module> {
 
     let mut functions = Vec::new();
     for name in order {
-        let mut signature = signatures
-            .remove(&name)
-            .ok_or_else(|| SimdError::new(format!("function '{name}' is missing a signature")))?;
+        let mut function_clauses = clauses.remove(&name).unwrap_or_default();
+        if function_clauses.is_empty() {
+            return Err(SimdError::new(format!("function '{name}' has no clauses")));
+        }
+        let mut signature = match signatures.remove(&name) {
+            Some(signature) => signature,
+            None => synthesize_missing_signature(&name, &function_clauses, &families)?,
+        };
         let mut stack = Vec::new();
         signature.ty = resolve_type_aliases_in_type(
             &signature.ty,
@@ -2419,12 +2463,10 @@ fn group_program(surface: &SurfaceProgram) -> Result<Module> {
             &BTreeSet::new(),
             &mut stack,
         )?;
-        let mut function_clauses = clauses.remove(&name).unwrap_or_default();
-        if function_clauses.is_empty() {
-            return Err(SimdError::new(format!("function '{name}' has no clauses")));
-        }
         for clause in &function_clauses {
-            if clause.operator_instance != signature.operator_instance {
+            if clause.operator_instance != signature.operator_instance
+                || clause.family_instance != signature.family_instance
+            {
                 return Err(SimdError::new(format!(
                     "function '{}' mixes incompatible declaration heads between signature and clause",
                     name
@@ -2452,7 +2494,7 @@ fn group_program(surface: &SurfaceProgram) -> Result<Module> {
 
     if let Some((name, _)) = clauses.into_iter().next() {
         return Err(SimdError::new(format!(
-            "function '{}' has clauses but no signature",
+            "function '{}' has no clauses",
             name
         )));
     }
@@ -2485,6 +2527,132 @@ fn group_program(surface: &SurfaceProgram) -> Result<Module> {
         family_instances,
         functions,
     })
+}
+
+fn synthesize_missing_signature(
+    name: &str,
+    clauses: &[Clause],
+    families: &BTreeMap<String, FamilyDecl>,
+) -> Result<Signature> {
+    let first = clauses
+        .first()
+        .ok_or_else(|| SimdError::new(format!("function '{}' has no clauses", name)))?;
+    let operator_instance = first.operator_instance.clone();
+    let family_instance = first.family_instance.clone();
+    for clause in clauses.iter().skip(1) {
+        if clause.operator_instance != operator_instance
+            || clause.family_instance != family_instance
+        {
+            return Err(SimdError::new(format!(
+                "function '{}' mixes incompatible declaration heads and needs an explicit signature",
+                name
+            )));
+        }
+    }
+    let ty = if let Some(spec) = &operator_instance {
+        synthesize_family_instance_type(name, &spec.family, &spec.segments, families)?
+    } else if let Some(spec) = &family_instance {
+        synthesize_family_instance_type(name, &spec.family, &spec.segments, families)?
+    } else {
+        synthesize_plain_function_type(name, clauses)?
+    };
+    Ok(Signature {
+        name: name.to_string(),
+        ty,
+        operator_instance,
+        family_instance,
+    })
+}
+
+fn synthesize_family_instance_type(
+    name: &str,
+    family: &str,
+    segments: &[String],
+    families: &BTreeMap<String, FamilyDecl>,
+) -> Result<Type> {
+    let family_decl = families.get(family).ok_or_else(|| {
+        SimdError::new(format!(
+            "cannot infer signature for '{}' because family '{}' is not declared",
+            name, family
+        ))
+    })?;
+    let family_vars = collect_type_vars_in_order(&family_decl.ty);
+    if family_vars.len() != segments.len() {
+        return Err(SimdError::new(format!(
+            "cannot infer signature for '{}' from '{}': expected {} specialization segments, found {} (add an explicit signature)",
+            name,
+            family,
+            family_vars.len(),
+            segments.len()
+        )));
+    }
+    let mut subst = BTreeMap::<String, Type>::new();
+    for (var, segment) in family_vars.into_iter().zip(segments.iter()) {
+        let ty = if let Some(prim) = Prim::parse(segment) {
+            Type::Scalar(prim)
+        } else if segment == "bool" || segment == "string" {
+            Type::Named(segment.clone(), Vec::new())
+        } else if is_implicit_type_var_name(segment) {
+            Type::Var(segment.clone())
+        } else {
+            Type::Named(segment.clone(), Vec::new())
+        };
+        subst.insert(var, ty);
+    }
+    Ok(apply_type_subst(&family_decl.ty, &subst))
+}
+
+fn synthesize_plain_function_type(name: &str, clauses: &[Clause]) -> Result<Type> {
+    let arity = clauses
+        .first()
+        .map(|clause| clause.patterns.len())
+        .ok_or_else(|| SimdError::new(format!("function '{}' has no clauses", name)))?;
+    for clause in clauses {
+        if clause.patterns.len() != arity {
+            return Err(SimdError::new(format!(
+                "function '{}' clause arity {} does not match inferred arity {}",
+                name,
+                clause.patterns.len(),
+                arity
+            )));
+        }
+    }
+    let mut next_infer = 0u32;
+    let mut params = Vec::with_capacity(arity);
+    for index in 0..arity {
+        let mut concrete = None::<Type>;
+        for clause in clauses {
+            if let Some(ty) = inferred_pattern_type(&clause.patterns[index])? {
+                match &concrete {
+                    Some(existing) if existing != &ty => {
+                        return Err(SimdError::new(format!(
+                            "cannot infer parameter {} of '{}' from conflicting literal patterns; add an explicit signature",
+                            index + 1,
+                            name
+                        )));
+                    }
+                    _ => concrete = Some(ty),
+                }
+            }
+        }
+        params.push(concrete.unwrap_or_else(|| {
+            let ty = Type::Infer(next_infer);
+            next_infer += 1;
+            ty
+        }));
+    }
+    let ret = Type::Infer(next_infer);
+    Ok(Type::Fun(params, Box::new(ret)))
+}
+
+fn inferred_pattern_type(pattern: &Pattern) -> Result<Option<Type>> {
+    match pattern {
+        Pattern::Int(_) => Ok(Some(Type::Scalar(Prim::I64))),
+        Pattern::Float(_) => Ok(Some(Type::Scalar(Prim::F64))),
+        Pattern::Bool(_) => Ok(Some(builtin_bool_type())),
+        Pattern::Type(prim) => Ok(Some(Type::TypeToken(Box::new(Type::Scalar(*prim))))),
+        Pattern::Name(_) | Pattern::Wildcard => Ok(None),
+    }
 }
 
 fn collect_operator_instances(functions: &[FunctionDef]) -> Result<Vec<OperatorInstanceDecl>> {
@@ -2723,7 +2891,7 @@ fn resolve_type_aliases_in_type(
                     .collect::<BTreeMap<_, _>>();
                 Ok(apply_type_subst(&alias_body, &subst))
             } else if resolved_args.is_empty() {
-                if name == "string" {
+                if name == "string" || name == "bool" {
                     Ok(Type::Named(name.clone(), Vec::new()))
                 } else {
                     Ok(Type::Var(name.clone()))
@@ -2784,7 +2952,7 @@ fn analyze_pointwise(module: &Module) -> Result<BTreeMap<String, bool>> {
 
 fn validate_pointwise_expr(expr: &Expr, known: &BTreeMap<String, usize>) -> Result<()> {
     match expr {
-        Expr::Ref(_) | Expr::Int(_) | Expr::Float(_) | Expr::String(_) => Ok(()),
+        Expr::Ref(_) | Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::String(_) => Ok(()),
         Expr::Lambda { body, .. } => validate_pointwise_expr(body, known),
         Expr::Let { bindings, body } => {
             for binding in bindings {
@@ -2833,7 +3001,7 @@ fn validate_pointwise_expr(expr: &Expr, known: &BTreeMap<String, usize>) -> Resu
 }
 
 fn check_program(module: &Module, pointwise: &BTreeMap<String, bool>) -> Result<CheckedProgram> {
-    let signatures: BTreeMap<String, Signature> = module
+    let mut signatures: BTreeMap<String, Signature> = module
         .functions
         .iter()
         .map(|function| (function.name.clone(), function.signature.clone()))
@@ -2853,7 +3021,8 @@ fn check_program(module: &Module, pointwise: &BTreeMap<String, bool>) -> Result<
 
     let mut checked_functions = Vec::new();
     for function in &module.functions {
-        let (arg_types, ret_type) = function.signature.ty.fun_parts();
+        let (mut arg_types, mut ret_type) = function.signature.ty.fun_parts();
+        let mut infer_return = matches!(ret_type, Type::Infer(_));
         let mut clauses = Vec::new();
         for clause in &function.clauses {
             let mut locals = BTreeMap::<String, Type>::new();
@@ -2874,8 +3043,15 @@ fn check_program(module: &Module, pointwise: &BTreeMap<String, bool>) -> Result<
                 family_instances: &family_index,
                 families: &family_types,
             };
-            let body = infer_expr(&clause.body, &context, Some(&ret_type))?;
-            if body.ty != ret_type {
+            let body = infer_expr(
+                &clause.body,
+                &context,
+                if infer_return { None } else { Some(&ret_type) },
+            )?;
+            if infer_return {
+                ret_type = body.ty.clone();
+                infer_return = false;
+            } else if body.ty != ret_type {
                 return Err(SimdError::new(format!(
                     "function '{}' clause body has type {:?}, expected {:?}",
                     function.name, body.ty, ret_type
@@ -2883,10 +3059,16 @@ fn check_program(module: &Module, pointwise: &BTreeMap<String, bool>) -> Result<
             }
             clauses.push(TypedClause { patterns, body });
         }
+        resolve_function_infer_types(&function.name, &mut arg_types, &mut ret_type, &mut clauses)?;
         let tailrec = analyze_tailrec(&function.name, &clauses);
+        let mut signature = function.signature.clone();
+        if type_contains_infer(&signature.ty) {
+            signature.ty = Type::Fun(arg_types.clone(), Box::new(ret_type.clone()));
+        }
+        signatures.insert(function.name.clone(), signature.clone());
         checked_functions.push(CheckedFunction {
             name: function.name.clone(),
-            signature: function.signature.clone(),
+            signature,
             clauses,
             pointwise: *pointwise.get(&function.name).unwrap_or(&false),
             tailrec,
@@ -2895,6 +3077,197 @@ fn check_program(module: &Module, pointwise: &BTreeMap<String, bool>) -> Result<
     Ok(CheckedProgram {
         functions: checked_functions,
     })
+}
+
+fn resolve_function_infer_types(
+    function_name: &str,
+    arg_types: &mut [Type],
+    ret_type: &mut Type,
+    clauses: &mut [TypedClause],
+) -> Result<()> {
+    let mut infer_bindings = BTreeMap::<u32, Type>::new();
+    for (index, arg_ty) in arg_types.iter().enumerate() {
+        let Type::Infer(infer_id) = arg_ty else {
+            continue;
+        };
+        for clause in clauses.iter() {
+            let Some(local_name) = clause.patterns.get(index).and_then(typed_pattern_name) else {
+                continue;
+            };
+            let mut seen = Vec::new();
+            collect_local_usage_types(&clause.body, local_name, &mut seen);
+            for seen_ty in seen {
+                bind_infer_type(&mut infer_bindings, *infer_id, seen_ty, function_name)?;
+            }
+        }
+    }
+    if let Type::Infer(ret_id) = ret_type {
+        for clause in clauses.iter() {
+            bind_infer_type(&mut infer_bindings, *ret_id, &clause.body.ty, function_name)?;
+        }
+    }
+    for ty in arg_types {
+        *ty = apply_infer_bindings(ty, &infer_bindings);
+    }
+    *ret_type = apply_infer_bindings(ret_type, &infer_bindings);
+    for clause in clauses.iter_mut() {
+        apply_infer_bindings_clause(clause, &infer_bindings);
+    }
+    Ok(())
+}
+
+fn apply_infer_bindings_clause(clause: &mut TypedClause, infer_bindings: &BTreeMap<u32, Type>) {
+    for pattern in &mut clause.patterns {
+        pattern.ty = apply_infer_bindings(&pattern.ty, infer_bindings);
+    }
+    apply_infer_bindings_expr(&mut clause.body, infer_bindings);
+}
+
+fn apply_infer_bindings_expr(expr: &mut TypedExpr, infer_bindings: &BTreeMap<u32, Type>) {
+    expr.ty = apply_infer_bindings(&expr.ty, infer_bindings);
+    match &mut expr.kind {
+        TypedExprKind::Call { args, .. } => {
+            for arg in args {
+                apply_infer_bindings_expr(&mut arg.expr, infer_bindings);
+            }
+        }
+        TypedExprKind::Apply { callee, arg } => {
+            apply_infer_bindings_expr(callee, infer_bindings);
+            apply_infer_bindings_expr(arg, infer_bindings);
+        }
+        TypedExprKind::Lambda { body, .. } => apply_infer_bindings_expr(body, infer_bindings),
+        TypedExprKind::Let { bindings, body } => {
+            for binding in bindings {
+                apply_infer_bindings_expr(&mut binding.expr, infer_bindings);
+            }
+            apply_infer_bindings_expr(body, infer_bindings);
+        }
+        TypedExprKind::Record(fields) => {
+            for expr in fields.values_mut() {
+                apply_infer_bindings_expr(expr, infer_bindings);
+            }
+        }
+        TypedExprKind::Project { base, .. } => apply_infer_bindings_expr(base, infer_bindings),
+        TypedExprKind::RecordUpdate { base, fields } => {
+            apply_infer_bindings_expr(base, infer_bindings);
+            for expr in fields.values_mut() {
+                apply_infer_bindings_expr(expr, infer_bindings);
+            }
+        }
+        TypedExprKind::FunctionRef { .. }
+        | TypedExprKind::Local(_)
+        | TypedExprKind::Int(_, _)
+        | TypedExprKind::Float(_, _)
+        | TypedExprKind::Bool(_)
+        | TypedExprKind::String(_)
+        | TypedExprKind::TypeToken(_) => {}
+    }
+}
+
+fn typed_pattern_name(pattern: &TypedPattern) -> Option<&str> {
+    match &pattern.pattern {
+        Pattern::Name(name) if name != "_" => Some(name),
+        _ => None,
+    }
+}
+
+fn collect_local_usage_types<'a>(expr: &'a TypedExpr, name: &str, out: &mut Vec<&'a Type>) {
+    match &expr.kind {
+        TypedExprKind::Local(local) => {
+            if local == name {
+                out.push(&expr.ty);
+            }
+        }
+        TypedExprKind::Call { args, .. } => {
+            for arg in args {
+                collect_local_usage_types(&arg.expr, name, out);
+            }
+        }
+        TypedExprKind::Apply { callee, arg } => {
+            collect_local_usage_types(callee, name, out);
+            collect_local_usage_types(arg, name, out);
+        }
+        TypedExprKind::Lambda { body, .. } => collect_local_usage_types(body, name, out),
+        TypedExprKind::Let { bindings, body } => {
+            for binding in bindings {
+                collect_local_usage_types(&binding.expr, name, out);
+            }
+            collect_local_usage_types(body, name, out);
+        }
+        TypedExprKind::Record(fields) => {
+            for field in fields.values() {
+                collect_local_usage_types(field, name, out);
+            }
+        }
+        TypedExprKind::Project { base, .. } => collect_local_usage_types(base, name, out),
+        TypedExprKind::RecordUpdate { base, fields } => {
+            collect_local_usage_types(base, name, out);
+            for field in fields.values() {
+                collect_local_usage_types(field, name, out);
+            }
+        }
+        TypedExprKind::FunctionRef { .. }
+        | TypedExprKind::Int(_, _)
+        | TypedExprKind::Float(_, _)
+        | TypedExprKind::Bool(_)
+        | TypedExprKind::String(_)
+        | TypedExprKind::TypeToken(_) => {}
+    }
+}
+
+fn bind_infer_type(
+    infer_bindings: &mut BTreeMap<u32, Type>,
+    infer_id: u32,
+    seen_ty: &Type,
+    function_name: &str,
+) -> Result<()> {
+    if type_contains_var(seen_ty) || type_contains_infer(seen_ty) {
+        return Ok(());
+    }
+    match infer_bindings.get(&infer_id) {
+        Some(existing) if existing != seen_ty => Err(SimdError::new(format!(
+            "cannot infer a stable type for '{}' (conflicting uses: {:?} vs {:?})",
+            function_name, existing, seen_ty
+        ))),
+        Some(_) => Ok(()),
+        None => {
+            infer_bindings.insert(infer_id, seen_ty.clone());
+            Ok(())
+        }
+    }
+}
+
+fn apply_infer_bindings(ty: &Type, infer_bindings: &BTreeMap<u32, Type>) -> Type {
+    match ty {
+        Type::Infer(id) => infer_bindings
+            .get(id)
+            .cloned()
+            .unwrap_or_else(|| Type::Scalar(Prim::I64)),
+        Type::Scalar(_) | Type::Bulk(_, _) | Type::Var(_) => ty.clone(),
+        Type::Named(name, args) => Type::Named(
+            name.clone(),
+            args.iter()
+                .map(|arg| apply_infer_bindings(arg, infer_bindings))
+                .collect(),
+        ),
+        Type::TypeToken(inner) => {
+            Type::TypeToken(Box::new(apply_infer_bindings(inner, infer_bindings)))
+        }
+        Type::Record(fields) => Type::Record(
+            fields
+                .iter()
+                .map(|(name, field_ty)| {
+                    (name.clone(), apply_infer_bindings(field_ty, infer_bindings))
+                })
+                .collect(),
+        ),
+        Type::Fun(args, ret) => Type::Fun(
+            args.iter()
+                .map(|arg| apply_infer_bindings(arg, infer_bindings))
+                .collect(),
+            Box::new(apply_infer_bindings(ret, infer_bindings)),
+        ),
+    }
 }
 
 fn check_pattern(pattern: &Pattern, ty: &Type, locals: &mut BTreeMap<String, Type>) -> Result<()> {
@@ -2931,6 +3304,16 @@ fn check_pattern(pattern: &Pattern, ty: &Type, locals: &mut BTreeMap<String, Typ
                 ty
             ))),
         },
+        Pattern::Bool(_) => {
+            if is_builtin_bool_type(ty) {
+                Ok(())
+            } else {
+                Err(SimdError::new(format!(
+                    "bool pattern is only valid against bool types, found {:?}",
+                    ty
+                )))
+            }
+        }
         Pattern::Type(prim) => match ty {
             Type::TypeToken(inner) => match inner.as_ref() {
                 Type::Scalar(actual) if actual == prim => Ok(()),
@@ -3033,8 +3416,24 @@ fn infer_expr(
                 kind: TypedExprKind::Float(*value, prim),
             })
         }
+        Expr::Bool(value) => {
+            let ty = builtin_bool_type();
+            if let Some(expected_ty) = expected
+                && expected_ty != &ty
+                && !matches!(expected_ty, Type::Var(_) | Type::Infer(_))
+            {
+                return Err(SimdError::new(format!(
+                    "bool literal '{}' has type {:?}, expected {:?}",
+                    value, ty, expected_ty
+                )));
+            }
+            Ok(TypedExpr {
+                ty,
+                kind: TypedExprKind::Bool(*value),
+            })
+        }
         Expr::String(value) => {
-            let ty = Type::Named("string".to_string(), Vec::new());
+            let ty = builtin_string_type();
             if let Some(expected_ty) = expected
                 && expected_ty != &ty
                 && !matches!(expected_ty, Type::Var(_) | Type::Infer(_))
@@ -3066,8 +3465,16 @@ fn infer_ref_expr(
 ) -> Result<TypedExpr> {
     if reference.alias.is_none() && reference.type_args.is_empty() {
         if let Some(ty) = context.locals.get(&reference.name) {
+            let resolved_ty = match (ty, expected) {
+                (Type::Infer(_) | Type::Var(_), Some(expected_ty))
+                    if !matches!(expected_ty, Type::Infer(_) | Type::Var(_)) =>
+                {
+                    expected_ty.clone()
+                }
+                _ => ty.clone(),
+            };
             return Ok(TypedExpr {
-                ty: ty.clone(),
+                ty: resolved_ty,
                 kind: TypedExprKind::Local(reference.name.clone()),
             });
         }
@@ -3320,7 +3727,7 @@ fn collect_expr_local_names_into(expr: &Expr, names: &mut BTreeSet<String>) {
                 names.insert(reference.name.clone());
             }
         }
-        Expr::Int(_) | Expr::Float(_) | Expr::String(_) => {}
+        Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::String(_) => {}
         Expr::Lambda { body, .. } => {
             collect_expr_local_names_into(body, names);
         }
@@ -3372,6 +3779,17 @@ fn type_contains_var(ty: &Type) -> bool {
         Type::TypeToken(inner) => type_contains_var(inner),
         Type::Record(fields) => fields.values().any(type_contains_var),
         Type::Fun(args, ret) => args.iter().any(type_contains_var) || type_contains_var(ret),
+    }
+}
+
+fn type_contains_infer(ty: &Type) -> bool {
+    match ty {
+        Type::Infer(_) => true,
+        Type::Scalar(_) | Type::Bulk(_, _) | Type::Var(_) => false,
+        Type::Named(_, args) => args.iter().any(type_contains_infer),
+        Type::TypeToken(inner) => type_contains_infer(inner),
+        Type::Record(fields) => fields.values().any(type_contains_infer),
+        Type::Fun(args, ret) => args.iter().any(type_contains_infer) || type_contains_infer(ret),
     }
 }
 
@@ -3866,7 +4284,7 @@ fn infer_named_family_builtin_signature(
     family: &str,
     arg_count: usize,
 ) -> Option<(BuiltinFamilyCallee, Type)> {
-    let string_ty = Type::Named("string".to_string(), Vec::new());
+    let string_ty = builtin_string_type();
     match (family, arg_count) {
         ("concat", 2) => Some((
             BuiltinFamilyCallee::ConcatString,
@@ -3894,7 +4312,7 @@ fn infer_named_family_builtin_signature(
             BuiltinFamilyCallee::ContainsString,
             Type::Fun(
                 vec![string_ty.clone(), string_ty.clone()],
-                Box::new(Type::Scalar(Prim::I64)),
+                Box::new(builtin_bool_type()),
             ),
         )),
         _ => None,
@@ -4228,14 +4646,34 @@ fn infer_builtin_operator_call(
     if op != PrimOp::Eq {
         return None;
     }
-    let string_ty = Type::Named("string".to_string(), Vec::new());
-    if left.ty != string_ty || right.ty != string_ty {
+    let string_ty = builtin_string_type();
+    let bool_ty = builtin_bool_type();
+    if left.ty == string_ty && right.ty == string_ty {
+        return Some(TypedExpr {
+            ty: builtin_bool_type(),
+            kind: TypedExprKind::Call {
+                callee: Callee::Builtin(BuiltinFamilyCallee::EqString),
+                args: vec![
+                    TypedArg {
+                        mode: AccessKind::Same,
+                        expr: Box::new(left.clone()),
+                    },
+                    TypedArg {
+                        mode: AccessKind::Same,
+                        expr: Box::new(right.clone()),
+                    },
+                ],
+                lifted_shape: None,
+            },
+        });
+    }
+    if left.ty != bool_ty || right.ty != bool_ty {
         return None;
     }
     Some(TypedExpr {
-        ty: Type::Scalar(Prim::I64),
+        ty: builtin_bool_type(),
         kind: TypedExprKind::Call {
-            callee: Callee::Builtin(BuiltinFamilyCallee::EqString),
+            callee: Callee::Builtin(BuiltinFamilyCallee::EqBool),
             args: vec![
                 TypedArg {
                     mode: AccessKind::Same,
@@ -4327,6 +4765,31 @@ fn infer_primitive_signature(
     right: &Type,
 ) -> Result<(AccessKind, AccessKind, Type)> {
     match (left, right) {
+        (Type::Infer(_left_id), Type::Infer(_right_id)) => Ok((
+            AccessKind::Same,
+            AccessKind::Same,
+            match op {
+                PrimOp::Eq | PrimOp::Lt | PrimOp::Gt | PrimOp::Le | PrimOp::Ge => {
+                    Type::Scalar(Prim::I64)
+                }
+                _ => Type::Scalar(Prim::I64),
+            },
+        )),
+        (Type::Infer(_), Type::Scalar(prim)) | (Type::Scalar(prim), Type::Infer(_)) => {
+            ensure_valid_primitive_prim(op, *prim)?;
+            let result = primitive_result_type(op, *prim);
+            Ok((AccessKind::Same, AccessKind::Same, result))
+        }
+        (Type::Infer(_), Type::Bulk(prim, shape)) => {
+            ensure_valid_primitive_prim(op, *prim)?;
+            let result = lift_result_type(op, *prim, shape.clone());
+            Ok((AccessKind::Same, AccessKind::Lane, result))
+        }
+        (Type::Bulk(prim, shape), Type::Infer(_)) => {
+            ensure_valid_primitive_prim(op, *prim)?;
+            let result = lift_result_type(op, *prim, shape.clone());
+            Ok((AccessKind::Lane, AccessKind::Same, result))
+        }
         (Type::Var(left_name), Type::Var(right_name)) if left_name == right_name => Ok((
             AccessKind::Same,
             AccessKind::Same,
@@ -4637,6 +5100,7 @@ fn visit_tail_calls(
         | TypedExprKind::FunctionRef { .. }
         | TypedExprKind::Int(_, _)
         | TypedExprKind::Float(_, _)
+        | TypedExprKind::Bool(_)
         | TypedExprKind::String(_)
         | TypedExprKind::TypeToken(_) => {}
         TypedExprKind::Lambda { body, .. } => {
@@ -4764,6 +5228,7 @@ fn typed_expr_uses_type_witness(expr: &TypedExpr) -> bool {
         | TypedExprKind::FunctionRef { .. }
         | TypedExprKind::Int(_, _)
         | TypedExprKind::Float(_, _)
+        | TypedExprKind::Bool(_)
         | TypedExprKind::String(_) => false,
         TypedExprKind::Lambda { body, .. } => typed_expr_uses_type_witness(body),
         TypedExprKind::Let { bindings, body } => {
@@ -4851,6 +5316,18 @@ fn normalize_function_leaf(
                     }
                     patterns.push(TypedPattern {
                         pattern: Pattern::Float(*value),
+                        ty: leaves[0].ty.clone(),
+                    });
+                }
+                Pattern::Bool(value) => {
+                    if leaves.len() != 1 {
+                        return Err(SimdError::new(format!(
+                            "record parameter in '{}' cannot use literal bool pattern {}",
+                            function.name, value
+                        )));
+                    }
+                    patterns.push(TypedPattern {
+                        pattern: Pattern::Bool(*value),
                         ty: leaves[0].ty.clone(),
                     });
                 }
@@ -4944,6 +5421,17 @@ fn normalize_expr_to_leaf(
             Ok(TypedExpr {
                 ty: leaf_ty,
                 kind: TypedExprKind::Float(*value, *prim),
+            })
+        }
+        TypedExprKind::Bool(value) => {
+            if !requested.is_root() {
+                return Err(SimdError::new(
+                    "bool literal cannot be projected into a record leaf",
+                ));
+            }
+            Ok(TypedExpr {
+                ty: leaf_ty,
+                kind: TypedExprKind::Bool(*value),
             })
         }
         TypedExprKind::String(value) => {
@@ -5146,7 +5634,9 @@ fn lookup_leaf_type(ty: &Type, path: &LeafPath) -> Result<Type> {
     if path.is_root() {
         return match ty {
             Type::Scalar(_) | Type::Bulk(_, _) => Ok(ty.clone()),
-            Type::Named(name, args) if name == "string" && args.is_empty() => Ok(ty.clone()),
+            Type::Named(name, args) if (name == "string" || name == "bool") && args.is_empty() => {
+                Ok(ty.clone())
+            }
             Type::TypeToken(_) => Err(SimdError::new(
                 "type witness values cannot appear as normalized leaf results",
             )),
@@ -5196,6 +5686,7 @@ fn collect_typed_local_names(expr: &TypedExpr, names: &mut BTreeSet<String>) {
         TypedExprKind::FunctionRef { .. }
         | TypedExprKind::Int(_, _)
         | TypedExprKind::Float(_, _)
+        | TypedExprKind::Bool(_)
         | TypedExprKind::String(_)
         | TypedExprKind::TypeToken(_) => {}
         TypedExprKind::Lambda { body, .. } => collect_typed_local_names(body, names),
@@ -5957,6 +6448,9 @@ fn lower_expr_to_ir(
             ty: Type::Scalar(*prim),
             kind: IrExprKind::Float(*value, *prim),
         }),
+        TypedExprKind::Bool(_) => Err(SimdError::new(
+            "bool expressions are currently evaluator-only and are not supported by loop lowering",
+        )),
         TypedExprKind::String(_) => Err(SimdError::new(
             "string expressions are currently evaluator-only and are not supported by loop lowering",
         )),
@@ -6220,6 +6714,13 @@ impl<'a> Evaluator<'a> {
                 };
                 Ok(matches_float_pattern(*expected, &value))
             }
+            Pattern::Bool(expected) => {
+                let Value::Bool(actual) = self.expect_host_value(self.force_binding(binding)?)?
+                else {
+                    return Err(SimdError::new("bool pattern can only match bool inputs"));
+                };
+                Ok(*expected == actual)
+            }
         }
     }
 
@@ -6257,6 +6758,7 @@ impl<'a> Evaluator<'a> {
             TypedExprKind::Float(value, prim) => Ok(EvalValue::Host(Value::Scalar(
                 make_float_value(*value, *prim),
             ))),
+            TypedExprKind::Bool(value) => Ok(EvalValue::Host(Value::Bool(*value))),
             TypedExprKind::String(value) => Ok(EvalValue::Host(Value::String(value.clone()))),
             TypedExprKind::TypeToken(prim) => Ok(EvalValue::Host(Value::TypeToken(*prim))),
             TypedExprKind::Lambda { param, body } => Ok(EvalValue::Closure(Closure::Lambda {
@@ -6636,11 +7138,12 @@ fn primitive_result_prim(op: PrimOp, prim: Prim) -> Prim {
 fn builtin_family_result_type(kind: &BuiltinFamilyCallee) -> Type {
     match kind {
         BuiltinFamilyCallee::ConcatString | BuiltinFamilyCallee::SliceString => {
-            Type::Named("string".to_string(), Vec::new())
+            builtin_string_type()
         }
-        BuiltinFamilyCallee::LenString
-        | BuiltinFamilyCallee::ContainsString
-        | BuiltinFamilyCallee::EqString => Type::Scalar(Prim::I64),
+        BuiltinFamilyCallee::LenString => Type::Scalar(Prim::I64),
+        BuiltinFamilyCallee::ContainsString
+        | BuiltinFamilyCallee::EqString
+        | BuiltinFamilyCallee::EqBool => builtin_bool_type(),
     }
 }
 
@@ -6681,9 +7184,7 @@ fn eval_builtin_family_scalar(kind: &BuiltinFamilyCallee, args: &[Value]) -> Res
             }
             let haystack = expect_string_value(&args[0], "contains\\string argument 1")?;
             let needle = expect_string_value(&args[1], "contains\\string argument 2")?;
-            Ok(Value::Scalar(ScalarValue::I64(
-                if haystack.contains(needle) { 1 } else { 0 },
-            )))
+            Ok(Value::Bool(haystack.contains(needle)))
         }
         BuiltinFamilyCallee::EqString => {
             if args.len() != 2 {
@@ -6691,7 +7192,15 @@ fn eval_builtin_family_scalar(kind: &BuiltinFamilyCallee, args: &[Value]) -> Res
             }
             let a = expect_string_value(&args[0], "(==)\\string argument 1")?;
             let b = expect_string_value(&args[1], "(==)\\string argument 2")?;
-            Ok(Value::Scalar(ScalarValue::I64(if a == b { 1 } else { 0 })))
+            Ok(Value::Bool(a == b))
+        }
+        BuiltinFamilyCallee::EqBool => {
+            if args.len() != 2 {
+                return Err(SimdError::new("(==)\\bool expects 2 arguments"));
+            }
+            let a = expect_bool_value(&args[0], "(==)\\bool argument 1")?;
+            let b = expect_bool_value(&args[1], "(==)\\bool argument 2")?;
+            Ok(Value::Bool(a == b))
         }
     }
 }
@@ -6712,6 +7221,16 @@ fn expect_i64_scalar_value(value: &Value, label: &str) -> Result<i64> {
         Value::Scalar(ScalarValue::I32(value)) => Ok(i64::from(*value)),
         other => Err(SimdError::new(format!(
             "{} must be an integer scalar, found {:?}",
+            label, other
+        ))),
+    }
+}
+
+fn expect_bool_value(value: &Value, label: &str) -> Result<bool> {
+    match value {
+        Value::Bool(value) => Ok(*value),
+        other => Err(SimdError::new(format!(
+            "{} must be a bool, found {:?}",
             label, other
         ))),
     }
@@ -6880,6 +7399,10 @@ impl<'a> LoweredEvaluator<'a> {
                             "scalar lowered function '{}' received type witness input",
                             name
                         ))),
+                        Value::Bool(_) => Err(SimdError::new(format!(
+                            "scalar lowered function '{}' received bool input",
+                            name
+                        ))),
                         Value::String(_) => Err(SimdError::new(format!(
                             "scalar lowered function '{}' received string input",
                             name
@@ -6978,6 +7501,11 @@ impl<'a> LoweredEvaluator<'a> {
                             "kernel lowering does not support type witness runtime values",
                         ));
                     }
+                    (Value::Bool(_), _) => {
+                        return Err(SimdError::new(
+                            "kernel lowering does not support bool runtime values",
+                        ));
+                    }
                     (Value::String(_), _) => {
                         return Err(SimdError::new(
                             "kernel lowering does not support string runtime values",
@@ -7025,6 +7553,11 @@ impl<'a> LoweredEvaluator<'a> {
                 Pattern::Type(_) => {
                     return Err(SimdError::new(
                         "lowered clauses cannot contain type witness patterns",
+                    ));
+                }
+                Pattern::Bool(_) => {
+                    return Err(SimdError::new(
+                        "lowered clauses cannot contain bool patterns yet",
                     ));
                 }
                 Pattern::Int(expected) if matches_int_pattern(*expected, value) => {}
@@ -7088,6 +7621,7 @@ impl ValueExt for Value {
             Value::Bulk(_) => Err(SimdError::new("expected scalar value, found bulk")),
             Value::TypeToken(_) => Err(SimdError::new("expected scalar value, found type witness")),
             Value::Record(_) => Err(SimdError::new("expected scalar value, found record")),
+            Value::Bool(_) => Err(SimdError::new("expected scalar value, found bool")),
             Value::String(_) => Err(SimdError::new("expected scalar value, found string")),
         }
     }
@@ -7096,6 +7630,7 @@ impl ValueExt for Value {
 #[derive(Debug, Clone, PartialEq)]
 enum JsonValue {
     Number(String),
+    Bool(bool),
     String(String),
     Array(Vec<JsonValue>),
     Object(BTreeMap<String, JsonValue>),
@@ -7137,12 +7672,25 @@ impl<'a> JsonParser<'a> {
             '[' => self.parse_array(),
             '{' => self.parse_object(),
             '"' => self.parse_string().map(JsonValue::String),
+            't' | 'f' => self.parse_bool(),
             '-' | '0'..='9' => self.parse_number(),
             _ => Err(SimdError::new(format!(
                 "unsupported JSON token '{}' in run arguments",
                 ch
             ))),
         }
+    }
+
+    fn parse_bool(&mut self) -> Result<JsonValue> {
+        if self.chars.get(self.pos..self.pos + 4) == Some(&['t', 'r', 'u', 'e']) {
+            self.pos += 4;
+            return Ok(JsonValue::Bool(true));
+        }
+        if self.chars.get(self.pos..self.pos + 5) == Some(&['f', 'a', 'l', 's', 'e']) {
+            self.pos += 5;
+            return Ok(JsonValue::Bool(false));
+        }
+        Err(SimdError::new("invalid JSON boolean literal"))
     }
 
     fn parse_array(&mut self) -> Result<JsonValue> {
@@ -7388,6 +7936,12 @@ fn value_from_json(
                 "string runtime argument must be a JSON string",
             )),
         },
+        Type::Named(name, args) if name == "bool" && args.is_empty() => match json {
+            JsonValue::Bool(value) => Ok(Value::Bool(*value)),
+            _ => Err(SimdError::new(
+                "bool runtime argument must be a JSON boolean",
+            )),
+        },
         Type::Named(_, _) | Type::Var(_) | Type::Infer(_) => Err(SimdError::new(
             "host JSON cannot provide values for unresolved polymorphic types",
         )),
@@ -7424,10 +7978,12 @@ fn project_record_field_json(json: &JsonValue, field: &str) -> Result<JsonValue>
                 .map(|item| project_record_field_json(item, field))
                 .collect::<Result<Vec<_>>>()?,
         )),
-        JsonValue::Number(_) | JsonValue::String(_) => Err(SimdError::new(format!(
-            "record JSON field projection expected object/array structure for field '{}'",
-            field
-        ))),
+        JsonValue::Number(_) | JsonValue::Bool(_) | JsonValue::String(_) => {
+            Err(SimdError::new(format!(
+                "record JSON field projection expected object/array structure for field '{}'",
+                field
+            )))
+        }
     }
 }
 
@@ -7455,7 +8011,7 @@ fn collect_bulk_values(json: &JsonValue, prim: Prim) -> Result<(Vec<usize>, Vec<
             }
         }
         JsonValue::Number(_) => Ok((Vec::new(), vec![scalar_from_json_number(json, prim)?])),
-        JsonValue::String(_) | JsonValue::Object(_) => Err(SimdError::new(
+        JsonValue::Bool(_) | JsonValue::String(_) | JsonValue::Object(_) => Err(SimdError::new(
             "bulk runtime argument must be a JSON array or number",
         )),
     }
@@ -7852,6 +8408,13 @@ mod tests {
     }
 
     #[test]
+    fn parses_bool_literals() {
+        let program =
+            parse_source("main : bool -> bool\nmain x = let y = true in y == x\n").unwrap();
+        assert_eq!(program.decls.len(), 2);
+    }
+
+    #[test]
     fn parses_import_and_qualified_call() {
         let program = parse_source(
             "import math/scalar as scalar\naxpy : i64 -> i64 -> i64 -> i64\naxpy a x y = a * x + y\nmain : i64 -> i64[n] -> i64[n] -> i64[n]\nmain a xs ys = scalar\\axpy a xs ys\n",
@@ -7900,7 +8463,7 @@ mod tests {
     #[test]
     fn parses_family_declarations_and_string_literals() {
         let program = parse_source(
-            "family concat : t -> t -> t\nfamily (==) : t -> t -> i64\nmain : string -> string\nmain s = concat s \"!\"\n",
+            "family concat : t -> t -> t\nfamily (==) : t -> t -> bool\nmain : string -> string\nmain s = concat s \"!\"\n",
         )
         .unwrap();
         assert_eq!(program.decls.len(), 4);
@@ -7970,6 +8533,46 @@ mod tests {
             .unwrap();
         let (_, ret) = function.signature.ty.fun_parts();
         assert_eq!(ret, Type::Scalar(Prim::I64));
+    }
+
+    #[test]
+    fn infers_signature_when_omitted_for_plain_function() {
+        let compiled = compile_source("inc x = x + 1\nmain y = inc y\n")
+            .expect("omitted signatures should be inferred");
+        let inc = compiled
+            .checked
+            .functions
+            .iter()
+            .find(|function| function.name == "inc")
+            .expect("inc is present");
+        let (params, ret) = inc.signature.ty.fun_parts();
+        assert_eq!(params.len(), 1);
+        assert_eq!(params[0], Type::Scalar(Prim::I64));
+        assert_eq!(ret, Type::Scalar(Prim::I64));
+    }
+
+    #[test]
+    fn infers_signature_when_omitted_for_family_instance() {
+        let compiled = compile_source(
+            "family concat : t -> t -> t\nconcat\\string x y = x\nmain a b = concat a b\n",
+        )
+        .expect("family instance signature should be inferred");
+        let concat_instance = compiled
+            .checked
+            .functions
+            .iter()
+            .find(|function| function.name == "__fam$concat$string")
+            .expect("internal concat instance exists");
+        let (params, ret) = concat_instance.signature.ty.fun_parts();
+        assert_eq!(params, vec![builtin_string_type(), builtin_string_type()]);
+        assert_eq!(ret, builtin_string_type());
+    }
+
+    #[test]
+    fn evaluates_bool_literals_and_patterns() {
+        let src = "flip true = false\nflip false = true\nmain x = flip x\n";
+        assert_eq!(run(src, "main", "[true]"), "false");
+        assert_eq!(run(src, "main", "[false]"), "true");
     }
 
     #[test]
@@ -8176,22 +8779,22 @@ mod tests {
         let slice_src = "main : string -> i64 -> i64 -> string\nmain s start n = slice s start n\n";
         assert_eq!(run(slice_src, "main", "[\"abcdef\",2,3]"), "\"cde\"");
 
-        let contains_src = "main : string -> string -> i64\nmain s needle = contains s needle\n";
-        assert_eq!(run(contains_src, "main", "[\"abcdef\",\"cd\"]"), "1");
-        assert_eq!(run(contains_src, "main", "[\"abcdef\",\"zz\"]"), "0");
+        let contains_src = "main : string -> string -> bool\nmain s needle = contains s needle\n";
+        assert_eq!(run(contains_src, "main", "[\"abcdef\",\"cd\"]"), "true");
+        assert_eq!(run(contains_src, "main", "[\"abcdef\",\"zz\"]"), "false");
     }
 
     #[test]
     fn evaluates_string_families_without_explicit_family_declarations() {
-        let src = "concat\\string : string -> string -> string\nconcat\\string a b = a\nmain : i64\nmain = concat\\string \"a\" \"b\" == \"a\"\n";
-        assert_eq!(run(src, "main", "[]"), "1");
+        let src = "concat\\string : string -> string -> string\nconcat\\string a b = a\nmain : bool\nmain = concat\\string \"a\" \"b\" == \"a\"\n";
+        assert_eq!(run(src, "main", "[]"), "true");
     }
 
     #[test]
     fn evaluates_string_equality_with_infix_operator() {
-        let src = "main : string -> string -> i64\nmain a b = a == b\n";
-        assert_eq!(run(src, "main", "[\"simd\",\"simd\"]"), "1");
-        assert_eq!(run(src, "main", "[\"simd\",\"rust\"]"), "0");
+        let src = "main : string -> string -> bool\nmain a b = a == b\n";
+        assert_eq!(run(src, "main", "[\"simd\",\"simd\"]"), "true");
+        assert_eq!(run(src, "main", "[\"simd\",\"rust\"]"), "false");
     }
 
     #[test]

@@ -462,6 +462,10 @@
         },
         {
           "type": "SYMBOL",
+          "name": "bool_literal"
+        },
+        {
+          "type": "SYMBOL",
           "name": "prim_type"
         },
         {
@@ -595,6 +599,10 @@
         },
         {
           "type": "SYMBOL",
+          "name": "bool_type"
+        },
+        {
+          "type": "SYMBOL",
           "name": "type_witness"
         },
         {
@@ -631,6 +639,10 @@
     "string_type": {
       "type": "STRING",
       "value": "string"
+    },
+    "bool_type": {
+      "type": "STRING",
+      "value": "bool"
     },
     "prim_type": {
       "type": "CHOICE",
@@ -1305,6 +1317,10 @@
         },
         {
           "type": "SYMBOL",
+          "name": "bool_literal"
+        },
+        {
+          "type": "SYMBOL",
           "name": "string"
         },
         {
@@ -1519,6 +1535,19 @@
     "float": {
       "type": "PATTERN",
       "value": "[0-9]+\\.[0-9]+"
+    },
+    "bool_literal": {
+      "type": "CHOICE",
+      "members": [
+        {
+          "type": "STRING",
+          "value": "true"
+        },
+        {
+          "type": "STRING",
+          "value": "false"
+        }
+      ]
     }
   },
   "extras": [

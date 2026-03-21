@@ -1,9 +1,9 @@
 use std::fs;
 
 use crate::{
-    Clause, Decl, Expr, FamilyDecl, ImportDecl, LetBinding, OperatorInstanceSpec, Pattern, Prim,
-    PrimOp, RefExpr, Result, Shape, Signature, SimdError, SurfaceProgram, Type, TypeAliasDecl,
-    parse_source, read_source_file,
+    Clause, Decl, Expr, FamilyDecl, FamilyInstanceSpec, ImportDecl, LetBinding,
+    OperatorInstanceSpec, Pattern, Prim, PrimOp, RefExpr, Result, Shape, Signature, SimdError,
+    SurfaceProgram, Type, TypeAliasDecl, parse_source, read_source_file,
 };
 
 const PREC_LET: u8 = 0;
@@ -111,20 +111,35 @@ fn format_type_alias(alias: &TypeAliasDecl) -> String {
 fn format_signature(signature: &Signature) -> String {
     format!(
         "{} : {}",
-        format_decl_head(&signature.name, &signature.operator_instance),
+        format_decl_head(
+            &signature.name,
+            &signature.operator_instance,
+            &signature.family_instance,
+        ),
         format_type(&signature.ty)
     )
 }
 
-fn format_decl_head(name: &str, operator: &Option<OperatorInstanceSpec>) -> String {
-    match operator {
-        Some(spec) => format_operator_instance_spec(spec),
-        None => name.to_string(),
+fn format_decl_head(
+    name: &str,
+    operator: &Option<OperatorInstanceSpec>,
+    family: &Option<FamilyInstanceSpec>,
+) -> String {
+    if let Some(spec) = operator {
+        return format_operator_instance_spec(spec);
     }
+    if let Some(spec) = family {
+        return format_family_instance_spec(spec);
+    }
+    name.to_string()
 }
 
 fn format_clause(clause: &Clause) -> String {
-    let mut out = format_decl_head(&clause.name, &clause.operator_instance);
+    let mut out = format_decl_head(
+        &clause.name,
+        &clause.operator_instance,
+        &clause.family_instance,
+    );
     for pattern in &clause.patterns {
         out.push(' ');
         out.push_str(&format_pattern(pattern));
@@ -196,6 +211,7 @@ fn format_pattern(pattern: &Pattern) -> String {
     match pattern {
         Pattern::Int(value) => value.to_string(),
         Pattern::Float(value) => super::format_float(*value),
+        Pattern::Bool(value) => value.to_string(),
         Pattern::Type(prim) => format_prim(*prim).to_string(),
         Pattern::Name(name) => name.clone(),
         Pattern::Wildcard => "_".to_string(),
@@ -207,6 +223,7 @@ fn format_expr(expr: &Expr, min_prec: u8) -> String {
         Expr::Ref(reference) => format_ref_expr(reference),
         Expr::Int(value) => value.to_string(),
         Expr::Float(value) => super::format_float(*value),
+        Expr::Bool(value) => value.to_string(),
         Expr::String(value) => format_string_literal(value),
         Expr::Lambda { param, body } => {
             format!("\\{} -> {}", param, format_expr(body, PREC_LET))
@@ -308,9 +325,12 @@ fn expr_precedence(expr: &Expr) -> u8 {
         Expr::App(_, _) => PREC_APP,
         Expr::Project(_, _) | Expr::RecordUpdate { .. } => PREC_POSTFIX,
         Expr::Lambda { .. } => PREC_LET,
-        Expr::Ref(_) | Expr::Int(_) | Expr::Float(_) | Expr::String(_) | Expr::Record(_) => {
-            PREC_ATOM
-        }
+        Expr::Ref(_)
+        | Expr::Int(_)
+        | Expr::Float(_)
+        | Expr::Bool(_)
+        | Expr::String(_)
+        | Expr::Record(_) => PREC_ATOM,
     }
 }
 
@@ -388,6 +408,15 @@ fn format_operator_instance_spec(spec: &OperatorInstanceSpec) -> String {
     out
 }
 
+fn format_family_instance_spec(spec: &FamilyInstanceSpec) -> String {
+    let mut out = spec.family.clone();
+    for segment in &spec.segments {
+        out.push('\\');
+        out.push_str(segment);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -439,6 +468,17 @@ mod tests {
             formatted,
             "family (+) : i64 -> i64\nfamily Eq : i64 -> i64 -> i64\n"
         );
+    }
+
+    #[test]
+    fn formats_family_instance_heads_without_internal_names() {
+        let source = "concat\\string : string -> string -> string\nconcat\\string x y = y\n";
+        let formatted = format_source_text(source).expect("format should succeed");
+        assert_eq!(
+            formatted,
+            "concat\\string : string -> string -> string\nconcat\\string x y = y\n"
+        );
+        assert!(!formatted.contains("__fam$"));
     }
 
     #[test]
@@ -496,5 +536,12 @@ mod tests {
         let parsed_original = parse_source(source).expect("original parses");
         let parsed_formatted = parse_source(&formatted).expect("formatted parses");
         assert_eq!(parsed_original, parsed_formatted);
+    }
+
+    #[test]
+    fn formats_bool_literals_and_patterns() {
+        let source = "flip true=false\nflip false=true\n";
+        let formatted = format_source_text(source).expect("format should succeed");
+        assert_eq!(formatted, "flip true = false\nflip false = true\n");
     }
 }

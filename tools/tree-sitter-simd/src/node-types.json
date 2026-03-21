@@ -98,6 +98,10 @@
       "required": true,
       "types": [
         {
+          "type": "bool_literal",
+          "named": true
+        },
+        {
           "type": "expr",
           "named": true
         },
@@ -135,6 +139,11 @@
         }
       ]
     }
+  },
+  {
+    "type": "bool_literal",
+    "named": true,
+    "fields": {}
   },
   {
     "type": "clause",
@@ -636,6 +645,10 @@
       "required": true,
       "types": [
         {
+          "type": "bool_literal",
+          "named": true
+        },
+        {
           "type": "float",
           "named": true
         },
@@ -983,6 +996,10 @@
       "required": true,
       "types": [
         {
+          "type": "bool_type",
+          "named": true
+        },
+        {
           "type": "identifier",
           "named": true
         },
@@ -1188,6 +1205,10 @@
     "named": false
   },
   {
+    "type": "bool_type",
+    "named": true
+  },
+  {
     "type": "comment",
     "named": true,
     "extra": true
@@ -1198,6 +1219,10 @@
   },
   {
     "type": "f64",
+    "named": false
+  },
+  {
+    "type": "false",
     "named": false
   },
   {
@@ -1243,6 +1268,10 @@
   {
     "type": "string_type",
     "named": true
+  },
+  {
+    "type": "true",
+    "named": false
   },
   {
     "type": "type",

@@ -96,7 +96,8 @@ module.exports = grammar({
 
     prim_operator: (_) => choice("+", "-", "*", "/", "%", "==", "<", ">", "<=", ">="),
 
-    pattern: ($) => choice($.wildcard, $.prim_type, $.identifier, $.int, $.float),
+    pattern: ($) =>
+      choice($.wildcard, $.bool_literal, $.prim_type, $.identifier, $.int, $.float),
 
     type: ($) =>
       choice(
@@ -119,6 +120,7 @@ module.exports = grammar({
     type_base: ($) =>
       choice(
         $.prim_type,
+        $.bool_type,
         $.type_witness,
         $.identifier,
         $.string_type,
@@ -127,6 +129,7 @@ module.exports = grammar({
       ),
 
     string_type: (_) => "string",
+    bool_type: (_) => "bool",
 
     prim_type: (_) => choice("i32", "i64", "f32", "f64"),
 
@@ -249,6 +252,7 @@ module.exports = grammar({
       choice(
         $.qualified_ref,
         $.prim_type,
+        $.bool_literal,
         $.string,
         $.string_type,
         $.identifier,
@@ -283,5 +287,6 @@ module.exports = grammar({
     nat: (_) => /[0-9]+/,
     int: (_) => /[0-9]+/,
     float: (_) => /[0-9]+\.[0-9]+/,
+    bool_literal: (_) => choice("true", "false"),
   },
 });
