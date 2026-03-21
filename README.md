@@ -11,6 +11,7 @@ All numbers are machine-dependent and should be compared on the same host.
 - [WAT Inspector](./docs/inspector.html)
 - [Mouse Shader Demo](./docs/canvas_mouse_demo.html)
 - [Image Upload Shader Lab](./docs/image_upload_shader_demo.html)
+- [3D Matrix Canvas Demo](./docs/canvas_3d_matrix_demo.html)
 
 Run all demos locally with:
 
