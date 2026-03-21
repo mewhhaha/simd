@@ -419,23 +419,79 @@ fn function_name_at_line(source: &str, line: usize) -> Option<String> {
         if trimmed.is_empty() || trimmed.starts_with("--") {
             continue;
         }
-        let mut name = String::new();
-        for ch in trimmed.chars() {
-            if ch.is_ascii_alphanumeric() || ch == '_' {
-                name.push(ch);
-            } else {
-                break;
-            }
-        }
-        if name.is_empty() {
+        let Some((name, rest)) = parse_decl_head_and_rest(trimmed) else {
             continue;
-        }
-        let rest = &trimmed[name.len()..];
+        };
         if rest.contains(':') || rest.contains('=') {
             current = Some(name);
         }
     }
     current
+}
+
+fn parse_decl_head_and_rest(trimmed: &str) -> Option<(String, &str)> {
+    if let Some((name, rest)) = parse_operator_decl_head(trimmed) {
+        return Some((name, rest));
+    }
+    let mut end = 0usize;
+    for byte in trimmed.as_bytes() {
+        if is_ident_char(*byte) {
+            end += 1;
+        } else {
+            break;
+        }
+    }
+    if end == 0 {
+        return None;
+    }
+    Some((trimmed[..end].to_string(), &trimmed[end..]))
+}
+
+fn parse_operator_decl_head(trimmed: &str) -> Option<(String, &str)> {
+    let bytes = trimmed.as_bytes();
+    if bytes.first() != Some(&b'(') {
+        return None;
+    }
+    let close = trimmed.find(')')?;
+    let operator = &trimmed[1..close];
+    let key = operator_key_for_lsp(operator)?;
+    let mut index = close + 1;
+    let mut segments = Vec::<String>::new();
+    while bytes.get(index) == Some(&b'\\') {
+        index += 1;
+        let start = index;
+        while bytes.get(index).is_some_and(|byte| is_ident_char(*byte)) {
+            index += 1;
+        }
+        if index == start {
+            return None;
+        }
+        segments.push(trimmed[start..index].to_string());
+    }
+    if segments.is_empty() {
+        return None;
+    }
+    let mut name_parts = Vec::with_capacity(segments.len() + 2);
+    name_parts.push("__op".to_string());
+    name_parts.push(key.to_string());
+    name_parts.extend(segments);
+    Some((name_parts.join("$"), &trimmed[index..]))
+}
+
+fn operator_key_for_lsp(operator: &str) -> Option<&'static str> {
+    match operator {
+        "+" => Some("add"),
+        "-" => Some("sub"),
+        "*" => Some("mul"),
+        "/" => Some("div"),
+        "%" => Some("mod"),
+        "==" => Some("eq"),
+        "<" => Some("lt"),
+        ">" => Some("gt"),
+        "<=" => Some("le"),
+        ">=" => Some("ge"),
+        _ => None,
+    }
 }
 
 fn collect_local_types(function: &crate::CheckedFunction) -> BTreeMap<String, Vec<Type>> {
@@ -639,6 +695,26 @@ mod tests {
     }
 
     #[test]
+    fn hover_shows_type_alias_definition() {
+        let source = "type v3 a = {x:a,y:a,z:a}\nmain : v3 i64 -> i64\nmain p = p.x\n";
+        let hover = hover_for_position(source, Position::new(0, 6)).expect("hover");
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markdown hover content");
+        };
+        assert!(content.value.contains("type v3 a = {x:a,y:a,z:a}"));
+    }
+
+    #[test]
+    fn hover_shows_local_type_inside_operator_instance_clause() {
+        let source = "type v3 a = {x:a,y:a,z:a}\n(*)\\v3\\i64 : v3 i64 -> v3 i64 -> i64\n(*)\\v3\\i64 lhs rhs = let p = lhs.x * rhs.x in p\n";
+        let hover = hover_for_position(source, Position::new(2, 25)).expect("hover");
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markdown hover content");
+        };
+        assert!(content.value.contains("p : i64"));
+    }
+
+    #[test]
     fn diagnostics_report_syntax_errors() {
         let diagnostics = diagnostics_for_source("main : i64 -> i64\nmain x = let y = in x\n");
         assert_eq!(diagnostics.len(), 1);
@@ -662,6 +738,14 @@ mod tests {
     fn diagnostics_empty_for_specialization_chain() {
         let diagnostics = diagnostics_for_source(
             "id : t -> t\nid x = x\nmain : i64 -> i64\nmain x = id\\i64 x\n",
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn diagnostics_empty_for_type_alias_operator_instance_program() {
+        let diagnostics = diagnostics_for_source(
+            "type v3 a = {x:a,y:a,z:a}\n(*)\\v3\\a : v3 a -> v3 a -> v3 a\n(*)\\v3\\a lhs rhs = lhs\nmain : v3 i64 -> v3 i64\nmain x = x * x\n",
         );
         assert!(diagnostics.is_empty());
     }
