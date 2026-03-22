@@ -72,6 +72,7 @@ pub struct TypeAliasDecl {
 #[derive(Debug, Clone, PartialEq)]
 pub struct FamilyDecl {
     pub name: String,
+    pub params: Vec<String>,
     pub ty: Type,
     pub op: Option<PrimOp>,
 }
@@ -931,6 +932,12 @@ fn collect_type_leaves(ty: &Type, prefix: &LeafPath, leaves: &mut Vec<TypeLeaf>)
             path: prefix.clone(),
             ty: ty.clone(),
         }),
+        Type::Named(name, args) if args.is_empty() && (name == "string" || name == "bool") => {
+            leaves.push(TypeLeaf {
+                path: prefix.clone(),
+                ty: ty.clone(),
+            })
+        }
         Type::TypeToken(_) => {}
         Type::Record(fields) => {
             for (name, field_ty) in fields {
@@ -1450,9 +1457,19 @@ impl Parser {
         } else {
             (self.expect_ident()?, None)
         };
+        let mut params = Vec::new();
+        while self.can_parse_backslash_chain() {
+            self.pos += 1;
+            params.push(self.expect_ident()?);
+        }
         self.expect(TokenKind::Colon)?;
         let ty = self.parse_type()?;
-        Ok(Decl::Family(FamilyDecl { name, ty, op }))
+        Ok(Decl::Family(FamilyDecl {
+            name,
+            params,
+            ty,
+            op,
+        }))
     }
 
     fn parse_decl_head(&mut self) -> Result<DeclHead> {
@@ -2254,6 +2271,7 @@ fn builtin_family_declarations() -> Vec<FamilyDecl> {
     vec![
         FamilyDecl {
             name: "add".to_string(),
+            params: vec!["t".to_string()],
             ty: Type::Fun(
                 vec![Type::Var("t".to_string()), Type::Var("t".to_string())],
                 Box::new(Type::Var("t".to_string())),
@@ -2262,6 +2280,7 @@ fn builtin_family_declarations() -> Vec<FamilyDecl> {
         },
         FamilyDecl {
             name: "sub".to_string(),
+            params: vec!["t".to_string()],
             ty: Type::Fun(
                 vec![Type::Var("t".to_string()), Type::Var("t".to_string())],
                 Box::new(Type::Var("t".to_string())),
@@ -2270,6 +2289,7 @@ fn builtin_family_declarations() -> Vec<FamilyDecl> {
         },
         FamilyDecl {
             name: "mul".to_string(),
+            params: vec!["t".to_string()],
             ty: Type::Fun(
                 vec![Type::Var("t".to_string()), Type::Var("t".to_string())],
                 Box::new(Type::Var("t".to_string())),
@@ -2278,6 +2298,7 @@ fn builtin_family_declarations() -> Vec<FamilyDecl> {
         },
         FamilyDecl {
             name: "div".to_string(),
+            params: vec!["t".to_string()],
             ty: Type::Fun(
                 vec![Type::Var("t".to_string()), Type::Var("t".to_string())],
                 Box::new(Type::Var("t".to_string())),
@@ -2286,6 +2307,7 @@ fn builtin_family_declarations() -> Vec<FamilyDecl> {
         },
         FamilyDecl {
             name: "mod".to_string(),
+            params: vec!["t".to_string()],
             ty: Type::Fun(
                 vec![Type::Var("t".to_string()), Type::Var("t".to_string())],
                 Box::new(Type::Var("t".to_string())),
@@ -2294,6 +2316,7 @@ fn builtin_family_declarations() -> Vec<FamilyDecl> {
         },
         FamilyDecl {
             name: "and".to_string(),
+            params: vec!["t".to_string()],
             ty: Type::Fun(
                 vec![builtin_bool_type(), builtin_bool_type()],
                 Box::new(builtin_bool_type()),
@@ -2302,6 +2325,7 @@ fn builtin_family_declarations() -> Vec<FamilyDecl> {
         },
         FamilyDecl {
             name: "or".to_string(),
+            params: vec!["t".to_string()],
             ty: Type::Fun(
                 vec![builtin_bool_type(), builtin_bool_type()],
                 Box::new(builtin_bool_type()),
@@ -2310,6 +2334,7 @@ fn builtin_family_declarations() -> Vec<FamilyDecl> {
         },
         FamilyDecl {
             name: "eq".to_string(),
+            params: vec!["t".to_string()],
             ty: Type::Fun(
                 vec![Type::Var("t".to_string()), Type::Var("t".to_string())],
                 Box::new(Type::Scalar(Prim::I64)),
@@ -2318,6 +2343,7 @@ fn builtin_family_declarations() -> Vec<FamilyDecl> {
         },
         FamilyDecl {
             name: "lt".to_string(),
+            params: vec!["t".to_string()],
             ty: Type::Fun(
                 vec![Type::Var("t".to_string()), Type::Var("t".to_string())],
                 Box::new(Type::Scalar(Prim::I64)),
@@ -2326,6 +2352,7 @@ fn builtin_family_declarations() -> Vec<FamilyDecl> {
         },
         FamilyDecl {
             name: "gt".to_string(),
+            params: vec!["t".to_string()],
             ty: Type::Fun(
                 vec![Type::Var("t".to_string()), Type::Var("t".to_string())],
                 Box::new(Type::Scalar(Prim::I64)),
@@ -2334,6 +2361,7 @@ fn builtin_family_declarations() -> Vec<FamilyDecl> {
         },
         FamilyDecl {
             name: "le".to_string(),
+            params: vec!["t".to_string()],
             ty: Type::Fun(
                 vec![Type::Var("t".to_string()), Type::Var("t".to_string())],
                 Box::new(Type::Scalar(Prim::I64)),
@@ -2342,6 +2370,7 @@ fn builtin_family_declarations() -> Vec<FamilyDecl> {
         },
         FamilyDecl {
             name: "ge".to_string(),
+            params: vec!["t".to_string()],
             ty: Type::Fun(
                 vec![Type::Var("t".to_string()), Type::Var("t".to_string())],
                 Box::new(Type::Scalar(Prim::I64)),
@@ -2350,6 +2379,7 @@ fn builtin_family_declarations() -> Vec<FamilyDecl> {
         },
         FamilyDecl {
             name: "concat".to_string(),
+            params: vec!["t".to_string()],
             ty: Type::Fun(
                 vec![Type::Var("t".to_string()), Type::Var("t".to_string())],
                 Box::new(Type::Var("t".to_string())),
@@ -2358,6 +2388,7 @@ fn builtin_family_declarations() -> Vec<FamilyDecl> {
         },
         FamilyDecl {
             name: "len".to_string(),
+            params: vec!["t".to_string()],
             ty: Type::Fun(
                 vec![Type::Var("t".to_string())],
                 Box::new(Type::Scalar(Prim::I64)),
@@ -2366,6 +2397,7 @@ fn builtin_family_declarations() -> Vec<FamilyDecl> {
         },
         FamilyDecl {
             name: "slice".to_string(),
+            params: vec!["t".to_string()],
             ty: Type::Fun(
                 vec![
                     Type::Var("t".to_string()),
@@ -2378,6 +2410,7 @@ fn builtin_family_declarations() -> Vec<FamilyDecl> {
         },
         FamilyDecl {
             name: "contains".to_string(),
+            params: vec!["t".to_string()],
             ty: Type::Fun(
                 vec![Type::Var("t".to_string()), Type::Var("t".to_string())],
                 Box::new(Type::Scalar(Prim::I64)),
@@ -2424,6 +2457,27 @@ fn group_program(surface: &SurfaceProgram) -> Result<Module> {
                     // Builtin families are injected already; allow source-level redeclaration
                     // to keep authoring ergonomic and avoid duplicate diagnostics.
                     continue;
+                }
+                if family.params.iter().any(|param| param == "_") {
+                    return Err(SimdError::new(format!(
+                        "family '{}' cannot use '_' as a type parameter",
+                        family.name
+                    )));
+                }
+                let mut seen_family_params = BTreeSet::new();
+                for param in &family.params {
+                    if !is_implicit_type_var_name(param) {
+                        return Err(SimdError::new(format!(
+                            "family '{}' has invalid type parameter '{}'",
+                            family.name, param
+                        )));
+                    }
+                    if !seen_family_params.insert(param.clone()) {
+                        return Err(SimdError::new(format!(
+                            "family '{}' repeats type parameter '{}'",
+                            family.name, param
+                        )));
+                    }
                 }
                 if !family_order.contains(&family.name) {
                     family_order.push(family.name.clone());
@@ -2494,6 +2548,7 @@ fn group_program(surface: &SurfaceProgram) -> Result<Module> {
     }
 
     let mut resolved_aliases = Vec::new();
+    let mut resolved_aliases_by_name = BTreeMap::new();
     for name in type_alias_order {
         let alias = type_aliases
             .get(&name)
@@ -2501,11 +2556,13 @@ fn group_program(surface: &SurfaceProgram) -> Result<Module> {
         let params = alias.params.iter().cloned().collect::<BTreeSet<_>>();
         let mut stack = Vec::new();
         let body = resolve_type_aliases_in_type(&alias.body, &type_aliases, &params, &mut stack)?;
-        resolved_aliases.push(TypeAliasDecl {
+        let alias = TypeAliasDecl {
             name: alias.name.clone(),
             params: alias.params.clone(),
             body,
-        });
+        };
+        resolved_aliases_by_name.insert(alias.name.clone(), alias.clone());
+        resolved_aliases.push(alias);
     }
 
     let mut functions = Vec::new();
@@ -2567,6 +2624,15 @@ fn group_program(surface: &SurfaceProgram) -> Result<Module> {
             .get(&name)
             .cloned()
             .ok_or_else(|| SimdError::new(format!("missing family declaration '{}'", name)))?;
+        let mut stack = Vec::new();
+        let params = family.params.iter().cloned().collect::<BTreeSet<_>>();
+        let mut family = family;
+        family.ty = resolve_type_aliases_in_type(
+            &family.ty,
+            &resolved_aliases_by_name,
+            &params,
+            &mut stack,
+        )?;
         resolved_families.push(family);
     }
     let family_names = resolved_families
@@ -2638,30 +2704,24 @@ fn synthesize_family_instance_type(
             name, family
         ))
     })?;
-    let family_vars = collect_type_vars_in_order(&family_decl.ty);
-    if family_vars.len() != segments.len() {
+    let subst = family_instance_substitution(family_decl, segments)?;
+    Ok(apply_type_subst(&family_decl.ty, &subst))
+}
+
+fn resolve_family_parameter_list(family: &FamilyDecl) -> Result<Vec<String>> {
+    if !family.params.is_empty() {
+        return Ok(family.params.clone());
+    }
+    let vars = collect_legacy_family_params(&family.ty);
+    if vars.len() > 1 {
         return Err(SimdError::new(format!(
-            "cannot infer signature for '{}' from '{}': expected {} specialization segments, found {} (add an explicit signature)",
-            name,
-            family,
-            family_vars.len(),
-            segments.len()
+            "family '{}' requires explicit type parameters (found {} in declaration '{}')",
+            family.name,
+            vars.len(),
+            family.name,
         )));
     }
-    let mut subst = BTreeMap::<String, Type>::new();
-    for (var, segment) in family_vars.into_iter().zip(segments.iter()) {
-        let ty = if let Some(prim) = Prim::parse(segment) {
-            Type::Scalar(prim)
-        } else if segment == "bool" || segment == "string" {
-            Type::Named(segment.clone(), Vec::new())
-        } else if is_implicit_type_var_name(segment) {
-            Type::Var(segment.clone())
-        } else {
-            Type::Named(segment.clone(), Vec::new())
-        };
-        subst.insert(var, ty);
-    }
-    Ok(apply_type_subst(&family_decl.ty, &subst))
+    Ok(vars)
 }
 
 fn synthesize_plain_function_type(name: &str, clauses: &[Clause]) -> Result<Type> {
@@ -3068,6 +3128,28 @@ fn check_program(module: &Module, pointwise: &BTreeMap<String, bool>) -> Result<
         .iter()
         .map(|function| (function.name.clone(), function.signature.clone()))
         .collect();
+    let family_types = module
+        .families
+        .iter()
+        .map(|family| (family.name.clone(), family.clone()))
+        .collect::<BTreeMap<_, _>>();
+    for function in &module.functions {
+        let Some(spec) = &function.signature.family_instance else {
+            continue;
+        };
+        let family_decl = family_types
+            .get(&spec.family)
+            .ok_or_else(|| SimdError::new(format!("unknown family '{}'", spec.family)))?;
+        let expected = validate_family_instance_signature(
+            &function.name,
+            &function.signature,
+            spec,
+            family_decl,
+        )?;
+        let mut signature = function.signature.clone();
+        signature.ty = expected;
+        signatures.insert(function.name.clone(), signature);
+    }
     let import_aliases = module
         .imports
         .iter()
@@ -3075,15 +3157,14 @@ fn check_program(module: &Module, pointwise: &BTreeMap<String, bool>) -> Result<
         .collect::<BTreeMap<_, _>>();
     let operator_index = build_operator_index(&module.operator_instances);
     let family_index = build_family_index(&module.family_instances);
-    let family_types = module
-        .families
-        .iter()
-        .map(|family| (family.name.clone(), family.ty.clone()))
-        .collect::<BTreeMap<_, _>>();
 
     let mut checked_functions = Vec::new();
     for function in &module.functions {
-        let (mut arg_types, mut ret_type) = function.signature.ty.fun_parts();
+        let mut signature = signatures
+            .get(&function.name)
+            .cloned()
+            .unwrap_or_else(|| function.signature.clone());
+        let (mut arg_types, mut ret_type) = signature.ty.fun_parts();
         let mut infer_return = matches!(ret_type, Type::Infer(_));
         let mut clauses = Vec::new();
         for clause in &function.clauses {
@@ -3123,7 +3204,6 @@ fn check_program(module: &Module, pointwise: &BTreeMap<String, bool>) -> Result<
         }
         resolve_function_infer_types(&function.name, &mut arg_types, &mut ret_type, &mut clauses)?;
         let tailrec = analyze_tailrec(&function.name, &clauses);
-        let mut signature = function.signature.clone();
         if type_contains_infer(&signature.ty) {
             signature.ty = Type::Fun(arg_types.clone(), Box::new(ret_type.clone()));
         }
@@ -3139,6 +3219,69 @@ fn check_program(module: &Module, pointwise: &BTreeMap<String, bool>) -> Result<
     Ok(CheckedProgram {
         functions: checked_functions,
     })
+}
+
+fn validate_family_instance_signature(
+    function_name: &str,
+    signature: &Signature,
+    spec: &FamilyInstanceSpec,
+    family: &FamilyDecl,
+) -> Result<Type> {
+    let family_vars = resolve_family_parameter_list(family)?;
+    if family_vars.len() != spec.segments.len() {
+        return Err(SimdError::new(format!(
+            "cannot infer signature for '{}' from '{}': expected {} specialization segments, found {} (add an explicit signature)",
+            function_name,
+            spec.family,
+            family_vars.len(),
+            spec.segments.len()
+        )));
+    }
+    let subst = family_instance_substitution(family, &spec.segments)?;
+    let expected =
+        synthesize_family_instance_type(function_name, &spec.family, &spec.segments, &{
+            let mut families = BTreeMap::new();
+            families.insert(family.name.clone(), family.clone());
+            families
+        })?;
+    let specialized = apply_type_subst(&signature.ty, &subst);
+    if specialized != expected {
+        return Err(SimdError::new(format!(
+            "family instance '{}' has signature {:?}, but '{}' specializes it to {:?}",
+            function_name, signature.ty, spec.family, expected
+        )));
+    }
+    Ok(expected)
+}
+
+fn family_instance_substitution(
+    family: &FamilyDecl,
+    segments: &[String],
+) -> Result<BTreeMap<String, Type>> {
+    let family_vars = resolve_family_parameter_list(family)?;
+    if family_vars.len() != segments.len() {
+        return Err(SimdError::new(format!(
+            "cannot infer signature for '{}' from '{}': expected {} specialization segments, found {} (add an explicit signature)",
+            family.name,
+            family.name,
+            family_vars.len(),
+            segments.len()
+        )));
+    }
+    let mut subst = BTreeMap::<String, Type>::new();
+    for (var, segment) in family_vars.into_iter().zip(segments.iter()) {
+        let ty = if let Some(prim) = Prim::parse(segment) {
+            Type::Scalar(prim)
+        } else if segment == "bool" || segment == "string" {
+            Type::Named(segment.clone(), Vec::new())
+        } else if is_implicit_type_var_name(segment) {
+            Type::Var(segment.clone())
+        } else {
+            Type::Named(segment.clone(), Vec::new())
+        };
+        subst.insert(var, ty);
+    }
+    Ok(subst)
 }
 
 fn resolve_function_infer_types(
@@ -3402,7 +3545,7 @@ struct TypeContext<'a> {
     pointwise: &'a BTreeMap<String, bool>,
     operator_instances: &'a BTreeMap<PrimOp, Vec<String>>,
     family_instances: &'a BTreeMap<String, Vec<String>>,
-    families: &'a BTreeMap<String, Type>,
+    families: &'a BTreeMap<String, FamilyDecl>,
 }
 
 fn build_operator_index(instances: &[OperatorInstanceDecl]) -> BTreeMap<PrimOp, Vec<String>> {
@@ -3890,6 +4033,56 @@ fn collect_type_vars_in_order_into(ty: &Type, seen: &mut BTreeSet<String>, vars:
     }
 }
 
+fn collect_legacy_family_params(ty: &Type) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    let mut vars = Vec::new();
+    collect_legacy_family_params_into(ty, &mut seen, &mut vars);
+    vars
+}
+
+fn collect_legacy_family_params_into(
+    ty: &Type,
+    seen: &mut BTreeSet<String>,
+    vars: &mut Vec<String>,
+) {
+    match ty {
+        Type::Var(name) => {
+            if seen.insert(name.clone()) {
+                vars.push(name.clone());
+            }
+        }
+        Type::TypeToken(inner) => {
+            collect_legacy_family_params_into(inner, seen, vars);
+        }
+        Type::Scalar(_) | Type::Bulk(_, _) | Type::Infer(_) => {}
+        Type::Named(name, args) => {
+            if args.is_empty()
+                && is_implicit_type_var_name(name)
+                && name != "string"
+                && name != "bool"
+            {
+                if seen.insert(name.clone()) {
+                    vars.push(name.clone());
+                }
+            }
+            for arg in args {
+                collect_legacy_family_params_into(arg, seen, vars);
+            }
+        }
+        Type::Record(fields) => {
+            for field_ty in fields.values() {
+                collect_legacy_family_params_into(field_ty, seen, vars);
+            }
+        }
+        Type::Fun(args, ret) => {
+            for arg in args {
+                collect_legacy_family_params_into(arg, seen, vars);
+            }
+            collect_legacy_family_params_into(ret, seen, vars);
+        }
+    }
+}
+
 fn apply_type_subst(ty: &Type, subst: &BTreeMap<String, Type>) -> Type {
     match ty {
         Type::Var(name) => subst.get(name).cloned().unwrap_or_else(|| ty.clone()),
@@ -4244,6 +4437,19 @@ fn infer_named_family_call(
     context: &TypeContext<'_>,
     expected: Option<&Type>,
 ) -> Result<Option<TypedExpr>> {
+    if !explicit_type_args.is_empty() {
+        if let Some(family_decl) = context.families.get(family) {
+            let params = resolve_family_parameter_list(family_decl)?;
+            if params.len() != explicit_type_args.len() {
+                return Err(SimdError::new(format!(
+                    "family '{}' expects {} specialization arguments, found {}",
+                    family,
+                    params.len(),
+                    explicit_type_args.len()
+                )));
+            }
+        }
+    }
     let mut matches = Vec::<TypedExpr>::new();
     let mut match_names = Vec::<String>::new();
     if let Some(candidates) = context.family_instances.get(family) {
@@ -4271,13 +4477,23 @@ fn infer_named_family_call(
     }
 
     match matches.len() {
-        0 => infer_builtin_named_family_call(
-            family,
-            explicit_type_args,
-            args_exprs,
-            context,
-            expected,
-        ),
+        0 => {
+            match infer_builtin_named_family_call(
+                family,
+                explicit_type_args,
+                args_exprs,
+                context,
+                expected,
+            )? {
+                Some(call) => Ok(Some(call)),
+                None => {
+                    return Err(SimdError::new(format!(
+                        "no matching family instance for '{}'",
+                        family
+                    )));
+                }
+            }
+        }
         1 => Ok(Some(matches.into_iter().next().unwrap())),
         _ => {
             let rendered = match_names
@@ -5938,12 +6154,9 @@ fn group_lowered_program(
             )));
         }
 
-        let result_prim = lowered_function.result.prim().ok_or_else(|| {
-            SimdError::new(format!(
-                "lowered function '{}' does not have a primitive leaf result",
-                lowered_function.name
-            ))
-        })?;
+        let Some(result_prim) = lowered_function.result.prim() else {
+            continue;
+        };
         let clause_count = match &lowered_function.kind {
             LoweredKind::Scalar { clauses } => clauses.len(),
             LoweredKind::Kernel { clauses, .. } => clauses.len(),
@@ -6384,6 +6597,9 @@ fn lower_function(function: &NormalizedFunction) -> Result<LoweredFunction> {
         .iter()
         .map(|ty| match ty {
             Type::Scalar(_) => AccessKind::Same,
+            Type::Named(name, args) if args.is_empty() && (name == "string" || name == "bool") => {
+                AccessKind::Same
+            }
             Type::Bulk(_, _) => AccessKind::Lane,
             Type::TypeToken(_) => AccessKind::Same,
             Type::Record(_) => AccessKind::Same,
@@ -6414,6 +6630,14 @@ fn lower_function(function: &NormalizedFunction) -> Result<LoweredFunction> {
                 .collect::<Result<Vec<_>>>()?;
             LoweredKind::Scalar { clauses }
         }
+        Type::Named(name, args) if args.is_empty() && (name == "string" || name == "bool") => {
+            let clauses = function
+                .clauses
+                .iter()
+                .map(|clause| lower_clause(clause, &param_access, None))
+                .collect::<Result<Vec<_>>>()?;
+            LoweredKind::Scalar { clauses }
+        }
         Type::Record(_) => {
             return Err(SimdError::new(
                 "normalized lowering encountered an unexpected record result",
@@ -6426,8 +6650,8 @@ fn lower_function(function: &NormalizedFunction) -> Result<LoweredFunction> {
         }
         Type::Named(_, _) | Type::Var(_) | Type::Infer(_) => {
             return Err(SimdError::new(format!(
-                "function '{}' still contains unresolved polymorphic types during lowering",
-                function.name
+                "function '{}' has unsupported return type '{:?}' for loop lowering",
+                function.name, function.signature.ty
             )));
         }
         Type::Fun(_, _) => {
@@ -8620,6 +8844,32 @@ mod tests {
     }
 
     #[test]
+    fn parses_family_declarations_with_parameters() {
+        let program = parse_source("family my_func\\a\\b : a -> b -> a\n")
+            .expect("family declaration with params should parse");
+        assert_eq!(program.decls.len(), 1);
+        match &program.decls[0] {
+            Decl::Family(family) => {
+                assert_eq!(family.params, vec!["a".to_string(), "b".to_string()]);
+            }
+            _ => panic!("expected family declaration"),
+        }
+    }
+
+    #[test]
+    fn requires_explicit_params_for_multivar_families() {
+        let error = compile_source(
+            "family my_func : a -> b -> a\nmy_func\\a\\b x y = x\nmain x y = my_func x y\n",
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("requires explicit type parameters")
+        );
+    }
+
+    #[test]
     fn parses_backtick_function_infix_call() {
         let program =
             parse_source("main : string -> string -> string\nmain a b = a `concat` b\n").unwrap();
@@ -8628,20 +8878,30 @@ mod tests {
 
     #[test]
     fn allows_redeclaring_builtin_family_with_same_signature() {
-        let program = compile_source(
+        let (_, _, checked) = compile_frontend(
             "family concat : t -> t -> t\nconcat\\string : string -> string -> string\nconcat\\string a b = a\nmain : string\nmain = concat\\string \"a\" \"b\"\n",
         )
         .expect("builtin family redeclaration with same signature should be accepted");
-        assert!(!program.checked.functions.is_empty());
+        assert!(!checked.functions.is_empty());
+        assert!(
+            checked
+                .functions
+                .iter()
+                .any(|function| function.name == "__fam$concat$string")
+        );
     }
 
     #[test]
     fn allows_redeclaring_builtin_family_without_duplicate_error() {
-        let program = compile_source(
+        let error = compile_source(
             "family concat : t -> t -> i64\nconcat\\string : string -> string -> i64\nconcat\\string a b = 0\nmain : i64\nmain = concat\\string \"a\" \"b\"\n",
         )
-        .expect("redeclaring injected builtin family should not hard-fail");
-        assert!(!program.checked.functions.is_empty());
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("family instance '__fam$concat$string' has signature")
+        );
     }
 
     #[test]
@@ -8714,6 +8974,32 @@ mod tests {
         let (params, ret) = concat_instance.signature.ty.fun_parts();
         assert_eq!(params, vec![builtin_string_type(), builtin_string_type()]);
         assert_eq!(ret, builtin_string_type());
+    }
+
+    #[test]
+    fn infers_signature_for_ordered_family_parameters() {
+        let checked = compile_frontend(
+            "family my_func\\a\\b : a -> b -> a\nmy_func\\string\\bool x y = x\nmain a b = my_func a b\n",
+        )
+        .map(|(_, _, checked)| checked)
+        .expect("ordered family parameters should infer correctly");
+        let instance = checked
+            .functions
+            .iter()
+            .find(|function| function.name == "__fam$my_func$string$bool")
+            .expect("ordered instance exists");
+        let (params, ret) = instance.signature.ty.fun_parts();
+        assert_eq!(params, vec![builtin_string_type(), builtin_bool_type()]);
+        assert_eq!(ret, builtin_string_type());
+    }
+
+    #[test]
+    fn rejects_family_signature_contradiction() {
+        let error = compile_source(
+            "family concat : t -> t -> t\nconcat\\string : bool -> bool -> bool\nconcat\\string a b = a\n",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("has signature"));
     }
 
     #[test]
@@ -8893,7 +9179,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("unknown function reference 'foo'")
+                .contains("no matching family instance for 'foo'")
         );
     }
 
