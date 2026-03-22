@@ -66,6 +66,7 @@
 
       input[type="text"],
       input[type="range"],
+      select,
       button {
         font: inherit;
         color: var(--text);
@@ -163,6 +164,16 @@
         <label for="size">font</label>
         <input id="size" type="range" min="24" max="220" step="2" value="140" />
         <output id="sizeOut">140</output>
+        <label for="fontFace">typeface</label>
+        <select id="fontFace">
+          <option value="Courier New, monospace">Courier</option>
+          <option value="Times New Roman, serif">Times</option>
+          <option value="Georgia, serif">Georgia</option>
+          <option value="Trebuchet MS, sans-serif">Sans</option>
+        </select>
+        <label for="smoothing">sdf smoothing</label>
+        <input id="smoothing" type="range" min="0" max="4" step="1" value="2" />
+        <output id="smoothingOut">2</output>
         <button id="redraw">rebuild sdf</button>
         <button id="center">center mouse</button>
         <span id="status" class="meta">loading…</span>
@@ -172,7 +183,9 @@
         <section class="panel controls">
           <div class="meta">
             Type text, and we rebuild a signed distance approximation in JS (not in simd yet). The
-            resulting field is sent to a wasm kernel that shades the canvas each frame.
+            resulting field is sent to a wasm kernel each frame. We render the source text at a
+            supersampled mask resolution and downfilter for smoother edges; true SDF fonts still
+            require a dedicated SDF atlas asset.
           </div>
           <div class="control">
             <label>pointer x</label>
@@ -224,6 +237,9 @@
       const messageInput = document.getElementById("message");
       const sizeInput = document.getElementById("size");
       const sizeOutput = document.getElementById("sizeOut");
+      const fontFaceInput = document.getElementById("fontFace");
+      const smoothingInput = document.getElementById("smoothing");
+      const smoothingOutput = document.getElementById("smoothingOut");
       const redrawButton = document.getElementById("redraw");
       const centerButton = document.getElementById("center");
       const status = document.getElementById("status");
@@ -238,6 +254,10 @@
       const outputCtx = outputCanvas.getContext("2d", { alpha: false });
       const textCtx = textCanvas.getContext("2d", { alpha: false });
       const sdfCtx = sdfCanvas.getContext("2d", { alpha: false });
+      const textMaskCanvas = document.createElement("canvas");
+      textMaskCanvas.width = width * 4;
+      textMaskCanvas.height = height * 4;
+      const textMaskCtx = textMaskCanvas.getContext("2d", { alpha: false });
       const outputImage = outputCtx.createImageData(width, height);
       const sqrt2 = 1.41421356;
 
@@ -290,22 +310,61 @@
         }
       }
 
-      function drawTextMask(ctx, text, fontPx) {
-        ctx.clearRect(0, 0, width, height);
-        ctx.fillStyle = "#000";
-        ctx.fillRect(0, 0, width, height);
-        ctx.fillStyle = "#fff";
-        ctx.font = `bold ${fontPx}px "DejaVu Sans", "Courier New", monospace`;
-        ctx.textBaseline = "middle";
-        ctx.textAlign = "center";
+      function drawTextMask(text, fontPx) {
+        const smoothScale = 1 + Number(smoothingInput.value);
+        const maskW = width * smoothScale;
+        const maskH = height * smoothScale;
+
+        textMaskCanvas.width = maskW;
+        textMaskCanvas.height = maskH;
+        textMaskCtx.setTransform(1, 0, 0, 1, 0, 0);
+        textMaskCtx.clearRect(0, 0, maskW, maskH);
+        textMaskCtx.fillStyle = "#000";
+        textMaskCtx.fillRect(0, 0, maskW, maskH);
+        textMaskCtx.fillStyle = "#fff";
+        textMaskCtx.font = `bold ${Math.max(1, Math.floor(fontPx * smoothScale))}px ${fontFaceInput.value}`;
+        textMaskCtx.textBaseline = "middle";
+        textMaskCtx.textAlign = "center";
+
         const lines = text.split("\n");
-        const lineHeight = fontPx * 1.2;
+        const lineHeight = fontPx * smoothScale * 1.2;
         const totalHeight = lines.length * lineHeight;
-        let y = (height - totalHeight) * 0.5 + lineHeight * 0.5;
+        let y = (maskH - totalHeight) * 0.5 + lineHeight * 0.5;
         for (const line of lines) {
-          ctx.fillText(line, width * 0.5, y);
+          textMaskCtx.fillText(line, maskW * 0.5, y);
           y += lineHeight;
         }
+
+        const hiImage = textMaskCtx.getImageData(0, 0, maskW, maskH).data;
+        const mask = new Float32Array(length);
+
+        for (let y0 = 0; y0 < height; y0 += 1) {
+          const py = y0 * smoothScale;
+          const dstBase = y0 * width;
+          for (let x0 = 0; x0 < width; x0 += 1) {
+            let coverage = 0;
+            const px = x0 * smoothScale;
+            for (let sy = 0; sy < smoothScale; sy += 1) {
+              const rowBase = ((py + sy) * maskW + px) * 4;
+              for (let sx = 0; sx < smoothScale; sx += 1) {
+                coverage += hiImage[rowBase + sx * 4 + 3];
+              }
+            }
+            mask[dstBase + x0] = coverage / (255 * smoothScale * smoothScale);
+          }
+        }
+
+        const previewImage = textCtx.createImageData(width, height);
+        const previewPixels = previewImage.data;
+        for (let i = 0, p = 0; i < length; i += 1, p += 4) {
+          const c = Math.max(0, Math.min(255, mask[i] * 255));
+          previewPixels[p] = c;
+          previewPixels[p + 1] = c;
+          previewPixels[p + 2] = c;
+          previewPixels[p + 3] = 255;
+        }
+        textCtx.putImageData(previewImage, 0, 0);
+        return mask;
       }
 
       function distanceTransform(grid, width, height) {
@@ -343,11 +402,10 @@
       }
 
       function buildSignedDistanceField(text) {
-        drawTextMask(textCtx, text, Number(sizeInput.value));
-        const image = textCtx.getImageData(0, 0, width, height).data;
+        const mask = drawTextMask(text, Number(sizeInput.value));
         const insideGrid = new Uint8Array(length);
         for (let i = 0; i < length; i += 1) {
-          insideGrid[i] = image[i * 4 + 3] > 20 ? 1 : 0;
+          insideGrid[i] = mask[i] > 0.45 ? 1 : 0;
         }
 
         const outsideGrid = new Uint8Array(length);
@@ -484,6 +542,15 @@
 
       sizeInput.addEventListener("input", () => {
         sizeOutput.textContent = sizeInput.value;
+      });
+
+      fontFaceInput.addEventListener("change", () => {
+        buildSignedDistanceField(messageInput.value);
+      });
+
+      smoothingInput.addEventListener("input", () => {
+        smoothingOutput.textContent = smoothingInput.value;
+        buildSignedDistanceField(messageInput.value);
       });
 
       redrawButton.addEventListener("click", () => {
