@@ -1,0 +1,2 @@
+main : f32 -> f32 -> f32[n] -> f32[n] -> f32[n] -> f32[n]
+main mx my xs ys sdf = 0.92 / (1.0 + 22.0 * sdf * sdf) * (0.7 + 0.3 * (0.42 / (1.0 + 12.0 * (((xs - mx) * (xs - mx) + (ys - my) * (ys - my))))) + 0.35 * (0.42 / (1.0 + 12.0 * (((xs - mx) * (xs - mx) + (ys - my) * (ys - my))))))

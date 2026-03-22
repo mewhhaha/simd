@@ -1,0 +1,523 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>simd string sdf demo</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #070b14;
+        --panel: #111a2a;
+        --panel-muted: #0d1526;
+        --border: #26314a;
+        --text: #e7edfa;
+        --muted: #97a6c5;
+        --accent: #7ed0ff;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        background: radial-gradient(1000px 520px at 12% -20%, #1d2f5c 0%, var(--bg) 56%);
+        color: var(--text);
+        font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+      }
+
+      .app {
+        max-width: 1180px;
+        margin: 0 auto;
+        padding: 16px;
+        display: grid;
+        gap: 12px;
+      }
+
+      .panel {
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 12px;
+      }
+
+      .toolbar {
+        padding: 12px;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px 12px;
+        align-items: center;
+      }
+
+      .toolbar strong {
+        font-size: 14px;
+      }
+
+      .toolbar .meta {
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      .panel .meta {
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      input[type="text"],
+      input[type="range"],
+      button {
+        font: inherit;
+        color: var(--text);
+        border-radius: 8px;
+        border: 1px solid var(--border);
+        background: #0a1222;
+      }
+
+      input[type="text"] {
+        min-width: 220px;
+        padding: 7px 10px;
+      }
+
+      input[type="range"] {
+        width: 220px;
+      }
+
+      button {
+        padding: 7px 10px;
+        cursor: pointer;
+      }
+
+      .content {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 10px;
+        padding: 12px;
+      }
+
+      .controls {
+        display: grid;
+        gap: 8px;
+        align-content: start;
+      }
+
+      .control {
+        display: grid;
+        grid-template-columns: auto 1fr auto;
+        gap: 8px 10px;
+        align-items: center;
+      }
+
+      .control label {
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      .control output {
+        color: #c7d4ef;
+        font: inherit;
+        font-size: 12px;
+        min-width: 56px;
+      }
+
+      .canvas-stack {
+        display: grid;
+        gap: 10px;
+        padding: 12px;
+      }
+
+      .canvas-box {
+        display: grid;
+        gap: 6px;
+      }
+
+      .canvas-box h3 {
+        margin: 0;
+        font-size: 12px;
+        color: var(--muted);
+        font-weight: 600;
+      }
+
+      canvas {
+        width: 100%;
+        height: auto;
+        border-radius: 10px;
+        border: 1px solid var(--border);
+        background: #05070f;
+        image-rendering: pixelated;
+      }
+
+      @media (max-width: 980px) {
+        .content {
+          grid-template-columns: 1fr;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main class="app">
+      <section class="panel toolbar">
+        <strong>simd string sdf demo</strong>
+        <label for="message">string</label>
+        <input id="message" type="text" value="simd" />
+        <label for="size">font</label>
+        <input id="size" type="range" min="24" max="220" step="2" value="140" />
+        <output id="sizeOut">140</output>
+        <button id="redraw">rebuild sdf</button>
+        <button id="center">center mouse</button>
+        <span id="status" class="meta">loading…</span>
+      </section>
+
+      <section class="content">
+        <section class="panel controls">
+          <div class="meta">
+            Type text, and we rebuild a signed distance approximation in JS (not in simd yet). The
+            resulting field is sent to a wasm kernel that shades the canvas each frame.
+          </div>
+          <div class="control">
+            <label>pointer x</label>
+            <output id="mouseXOut">0.000</output>
+            <span></span>
+          </div>
+          <div class="control">
+            <label>pointer y</label>
+            <output id="mouseYOut">0.000</output>
+            <span></span>
+          </div>
+          <div class="control">
+            <label>status</label>
+            <span id="detail" class="meta"></span>
+            <span></span>
+          </div>
+          <div class="meta">
+            Open this in browser with <code>just demo</code>.
+          </div>
+        </section>
+
+        <section class="canvas-stack">
+          <article class="canvas-box panel">
+            <h3>source text raster</h3>
+            <canvas id="textSource" width="640" height="360"></canvas>
+          </article>
+
+          <article class="canvas-box panel">
+            <h3>approx signed distance</h3>
+            <canvas id="sdfSource" width="640" height="360"></canvas>
+          </article>
+
+          <article class="canvas-box panel">
+            <h3>simd output</h3>
+            <canvas id="output" width="640" height="360"></canvas>
+          </article>
+        </section>
+      </section>
+    </main>
+
+    <script>
+      const WASM_FILE = "./string_sdf_f32.wasm";
+
+      const width = 640;
+      const height = 360;
+      const length = width * height;
+      const outputLength = length * 4;
+
+      const messageInput = document.getElementById("message");
+      const sizeInput = document.getElementById("size");
+      const sizeOutput = document.getElementById("sizeOut");
+      const redrawButton = document.getElementById("redraw");
+      const centerButton = document.getElementById("center");
+      const status = document.getElementById("status");
+      const detail = document.getElementById("detail");
+      const mouseXOut = document.getElementById("mouseXOut");
+      const mouseYOut = document.getElementById("mouseYOut");
+
+      const outputCanvas = document.getElementById("output");
+      const textCanvas = document.getElementById("textSource");
+      const sdfCanvas = document.getElementById("sdfSource");
+
+      const outputCtx = outputCanvas.getContext("2d", { alpha: false });
+      const textCtx = textCanvas.getContext("2d", { alpha: false });
+      const sdfCtx = sdfCanvas.getContext("2d", { alpha: false });
+      const outputImage = outputCtx.createImageData(width, height);
+      const sqrt2 = 1.41421356;
+
+      const state = {
+        mouseX: 0,
+        mouseY: 0,
+      };
+      const instanceState = {
+        instance: null,
+        memory: null,
+        main: null,
+        xsPtr: 0,
+        ysPtr: 0,
+        sdfPtr: 0,
+        outPtr: 0,
+      };
+
+      const sdfValues = new Float32Array(length);
+      const pixels = outputImage.data;
+
+      function align16(value) {
+        return (value + 15) & ~15;
+      }
+
+      function ensureMemory(memory, needed) {
+        const page = 65536;
+        if (memory.buffer.byteLength >= needed) {
+          return;
+        }
+        const missing = needed - memory.buffer.byteLength;
+        const pages = Math.ceil(missing / page);
+        memory.grow(pages);
+      }
+
+      function buildCoords(buffer, xsPtr, ysPtr) {
+        const xs = new Float32Array(buffer, xsPtr, length);
+        const ys = new Float32Array(buffer, ysPtr, length);
+        const invW = width > 1 ? 1 / (width - 1) : 0;
+        const invH = height > 1 ? 1 / (height - 1) : 0;
+        const aspect = width / Math.max(1, height);
+        let i = 0;
+        for (let y = 0; y < height; y += 1) {
+          const ny = y * invH * 2 - 1;
+          for (let x = 0; x < width; x += 1) {
+            const nx = (x * invW * 2 - 1) * aspect;
+            xs[i] = nx;
+            ys[i] = ny;
+            i += 1;
+          }
+        }
+      }
+
+      function drawTextMask(ctx, text, fontPx) {
+        ctx.clearRect(0, 0, width, height);
+        ctx.fillStyle = "#000";
+        ctx.fillRect(0, 0, width, height);
+        ctx.fillStyle = "#fff";
+        ctx.font = `bold ${fontPx}px "DejaVu Sans", "Courier New", monospace`;
+        ctx.textBaseline = "middle";
+        ctx.textAlign = "center";
+        const lines = text.split("\n");
+        const lineHeight = fontPx * 1.2;
+        const totalHeight = lines.length * lineHeight;
+        let y = (height - totalHeight) * 0.5 + lineHeight * 0.5;
+        for (const line of lines) {
+          ctx.fillText(line, width * 0.5, y);
+          y += lineHeight;
+        }
+      }
+
+      function distanceTransform(grid, width, height) {
+        const dist = new Float32Array(length);
+        const inf = 1e9;
+        for (let i = 0; i < length; i += 1) {
+          dist[i] = grid[i] ? 0 : inf;
+        }
+
+        for (let y = 0; y < height; y += 1) {
+          for (let x = 0; x < width; x += 1) {
+            const i = y * width + x;
+            let d = dist[i];
+            if (x > 0) d = Math.min(d, dist[i - 1] + 1);
+            if (y > 0) d = Math.min(d, dist[i - width] + 1);
+            if (x > 0 && y > 0) d = Math.min(d, dist[i - width - 1] + sqrt2);
+            if (x + 1 < width && y > 0) d = Math.min(d, dist[i - width + 1] + sqrt2);
+            dist[i] = d;
+          }
+        }
+
+        for (let y = height - 1; y >= 0; y -= 1) {
+          for (let x = width - 1; x >= 0; x -= 1) {
+            const i = y * width + x;
+            let d = dist[i];
+            if (x + 1 < width) d = Math.min(d, dist[i + 1] + 1);
+            if (y + 1 < height) d = Math.min(d, dist[i + width] + 1);
+            if (x + 1 < width && y + 1 < height) d = Math.min(d, dist[i + width + 1] + sqrt2);
+            if (x > 0 && y + 1 < height) d = Math.min(d, dist[i + width - 1] + sqrt2);
+            dist[i] = d;
+          }
+        }
+
+        return dist;
+      }
+
+      function buildSignedDistanceField(text) {
+        drawTextMask(textCtx, text, Number(sizeInput.value));
+        const image = textCtx.getImageData(0, 0, width, height).data;
+        const insideGrid = new Uint8Array(length);
+        for (let i = 0; i < length; i += 1) {
+          insideGrid[i] = image[i * 4 + 3] > 20 ? 1 : 0;
+        }
+
+        const outsideGrid = new Uint8Array(length);
+        for (let i = 0; i < length; i += 1) {
+          outsideGrid[i] = insideGrid[i] === 0 ? 1 : 0;
+        }
+
+        const insideDist = distanceTransform(insideGrid, width, height);
+        const outsideDist = distanceTransform(outsideGrid, width, height);
+        for (let i = 0; i < length; i += 1) {
+          sdfValues[i] = insideGrid[i] ? -insideDist[i] : outsideDist[i];
+        }
+
+        // Keep a short preview for debugging.
+        const preview = sdfCtx.createImageData(width, height);
+        const previewPixels = preview.data;
+        const scale = 1 / Math.max(width, height);
+        for (let i = 0, p = 0; i < length; i += 1, p += 4) {
+          const v = sdfValues[i] * scale * 2.5;
+          const c = Math.max(0, Math.min(1, 0.5 + v));
+          previewPixels[p] = 255 * c;
+          previewPixels[p + 1] = 255 * c;
+          previewPixels[p + 2] = 255 * c;
+          previewPixels[p + 3] = 255;
+        }
+        sdfCtx.putImageData(preview, 0, 0);
+        if (instanceState.memory) {
+          const dest = new Float32Array(instanceState.memory.buffer, instanceState.sdfPtr, length);
+          dest.set(sdfValues);
+        }
+      }
+
+      function renderPreview() {
+        if (!instanceState.main || !instanceState.memory) return;
+        const {
+          main,
+          memory,
+          xsPtr,
+          ysPtr,
+          sdfPtr,
+          outPtr,
+        } = instanceState;
+        main(
+          state.mouseX,
+          state.mouseY,
+          xsPtr,
+          length,
+          ysPtr,
+          length,
+          sdfPtr,
+          length,
+          outPtr,
+          length,
+        );
+
+        const out = new Float32Array(memory.buffer, outPtr, length);
+        for (let i = 0, p = 0; i < length; i += 1, p += 4) {
+          let value = out[i];
+          if (value < 0) value = 0;
+          if (value > 1.2) value = 1.2;
+          let tone = value / 1.2;
+          if (tone < 0) tone = 0;
+          if (tone > 1) tone = 1;
+          const edge = Math.max(0, Math.min(1, 0.45 + 0.55 * (1 - Math.abs(sdfValues[i]) / 80)));
+          pixels[p] = 26 + 229 * tone;
+          pixels[p + 1] = 40 + 120 * tone * edge;
+          pixels[p + 2] = 80 + 90 * edge;
+          pixels[p + 3] = 255;
+        }
+        outputCtx.putImageData(outputImage, 0, 0);
+      }
+
+      async function loadDemo() {
+        status.textContent = "loading wasm…";
+        const response = await fetch(WASM_FILE);
+        if (!response.ok) {
+          throw new Error(`failed to fetch ${WASM_FILE} (${response.status})`);
+        }
+        const bytes = await response.arrayBuffer();
+        const { instance } = await WebAssembly.instantiate(bytes, {});
+        const main = instance.exports.main;
+        const memory = instance.exports.memory;
+        if (typeof main !== "function" || !(memory instanceof WebAssembly.Memory)) {
+          throw new Error("wasm export shape mismatch; expected (main + memory)");
+        }
+
+        const bytesPerArray = length * 4;
+        const xsPtr = align16(0);
+        const ysPtr = align16(xsPtr + bytesPerArray);
+        const sdfPtr = align16(ysPtr + bytesPerArray);
+        const outPtr = align16(sdfPtr + bytesPerArray);
+        const totalBytes = outPtr + bytesPerArray;
+        ensureMemory(memory, totalBytes);
+        buildCoords(memory.buffer, xsPtr, ysPtr);
+
+        instanceState.instance = instance;
+        instanceState.memory = memory;
+        instanceState.main = main;
+        instanceState.xsPtr = xsPtr;
+        instanceState.ysPtr = ysPtr;
+        instanceState.sdfPtr = sdfPtr;
+        instanceState.outPtr = outPtr;
+
+        buildSignedDistanceField(messageInput.value);
+        status.textContent = "running";
+        detail.textContent = "hover pointer over output to move highlight";
+      }
+
+      outputCanvas.addEventListener("mousemove", (event) => {
+        const rect = outputCanvas.getBoundingClientRect();
+        const px = Math.max(0, Math.min(rect.width, event.clientX - rect.left));
+        const py = Math.max(0, Math.min(rect.height, event.clientY - rect.top));
+        const nx = px / rect.width;
+        const ny = py / rect.height;
+        const aspect = width / Math.max(1, height);
+        state.mouseX = (nx * 2 - 1) * aspect;
+        state.mouseY = ny * 2 - 1;
+        mouseXOut.textContent = state.mouseX.toFixed(3);
+        mouseYOut.textContent = state.mouseY.toFixed(3);
+      });
+
+      outputCanvas.addEventListener("mouseleave", () => {
+        state.mouseX = 0;
+        state.mouseY = 0;
+      });
+
+      outputCanvas.addEventListener("mouseenter", () => {
+        const rect = outputCanvas.getBoundingClientRect();
+        if (rect.width > 0 && rect.height > 0) {
+          state.mouseX = 0;
+          state.mouseY = 0;
+        }
+      });
+
+      sizeInput.addEventListener("input", () => {
+        sizeOutput.textContent = sizeInput.value;
+      });
+
+      redrawButton.addEventListener("click", () => {
+        buildSignedDistanceField(messageInput.value);
+      });
+
+      centerButton.addEventListener("click", () => {
+        state.mouseX = 0;
+        state.mouseY = 0;
+        mouseXOut.textContent = "0.000";
+        mouseYOut.textContent = "0.000";
+      });
+
+      messageInput.addEventListener("change", () => {
+        buildSignedDistanceField(messageInput.value);
+      });
+
+      window.addEventListener("keydown", (event) => {
+        if (event.key === "Enter") {
+          buildSignedDistanceField(messageInput.value);
+        }
+      });
+
+      function tick() {
+        requestAnimationFrame(tick);
+        if (instanceState.main) {
+          renderPreview();
+        }
+      }
+
+      tick();
+      loadDemo().catch((error) => {
+        status.textContent = `error: ${error.message}`;
+      });
+    </script>
+  </body>
+</html>

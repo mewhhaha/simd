@@ -19,6 +19,7 @@ inspect-html:
 demo:
 	cargo run --quiet -- wasm examples/mouse_glow_f32.simd --main main --out docs/mouse_glow_f32.wasm >/dev/null
 	cargo run --quiet -- wasm examples/mouse_rings_f32.simd --main main --out docs/mouse_rings_f32.wasm >/dev/null
+	cargo run --quiet -- wasm examples/string_sdf_f32.simd --main main --out docs/string_sdf_f32.wasm >/dev/null
 	deno run --allow-net --allow-read scripts/dev_server.ts 8000
 
 fmt file:
