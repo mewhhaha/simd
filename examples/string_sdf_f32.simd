@@ -1,2 +1,194 @@
-main : f32 -> f32 -> f32[n] -> f32[n] -> f32[n] -> f32[n]
-main mx my xs ys sdf = 0.92 / (1.0 + 22.0 * sdf * sdf) * (0.7 + 0.3 * (0.42 / (1.0 + 12.0 * (((xs - mx) * (xs - mx) + (ys - my) * (ys - my))))) + 0.35 * (0.42 / (1.0 + 12.0 * (((xs - mx) * (xs - mx) + (ys - my) * (ys - my))))))
+type Color = { r: f32, g: f32, b: f32 }
+type ColorA = { r: f32, g: f32, b: f32, a: f32 }
+
+pi : f32
+pi = 3.1415926535897932384626433832795
+
+waveAmplitude : f32
+waveAmplitude = 0.076
+
+period : f32
+period = 2.0 * pi
+
+logoRotation : f32
+logoRotation = 0.124
+
+logoScale : f32
+logoScale = 1.472
+
+logoOffsetX : f32
+logoOffsetX = 0.7
+
+logoOffsetY : f32
+logoOffsetY = 0.68
+
+logoSplitOffset : f32
+logoSplitOffset = 0.54
+
+logoSinScale : f32
+logoSinScale = 0.22
+
+logoCosScale : f32
+logoCosScale = 0.28
+
+logoSplitK : f32
+logoSplitK = 150.0
+
+logoGlowK : f32
+logoGlowK = 18.0
+
+logoColorBase : f32
+logoColorBase = 0.15
+
+logoColorAmount : f32
+logoColorAmount = 0.85
+
+logoBlendBase : f32
+logoBlendBase = 0.5
+
+sq : f32 -> f32
+sq x = x * x
+
+inv : f32 -> f32
+inv x = 1.0 / x
+
+approxSin : f32 -> f32
+approxSin x = let
+  x2 = sq x
+  x3 = x2 * x
+  x5 = x3 * x2
+in x + (0.0 - x3 * 0.16666667) + x5 * 0.008333333
+
+approxCos : f32 -> f32
+approxCos x = let
+  x2 = sq x
+  x4 = x2 * x2
+in 1.0 + (0.0 - 0.5 * x2) + 0.041666667 * x4
+
+scaleColor : Color -> f32 -> Color
+scaleColor c s = { r = c.r * s, g = c.g * s, b = c.b * s }
+
+addColor : Color -> Color -> Color
+addColor a b = { r = a.r + b.r, g = a.g + b.g, b = a.b + b.b }
+
+mixColor : Color -> Color -> f32 -> Color
+mixColor a b t = let
+  oneMinus = 1.0 - t
+in { r = a.r * oneMinus + b.r * t, g = a.g * oneMinus + b.g * t, b = a.b * oneMinus + b.b * t }
+
+mixColorA : ColorA -> ColorA -> f32 -> ColorA
+mixColorA a b t = let
+  oneMinus = 1.0 - t
+in
+  {
+    r = a.r * oneMinus + b.r * t,
+    g = a.g * oneMinus + b.g * t,
+    b = a.b * oneMinus + b.b * t,
+    a = a.a * oneMinus + b.a * t
+  }
+
+wavePhase : f32 -> f32
+wavePhase t = approxSin t
+
+trailPieceHeight : f32
+trailPieceHeight = 7.0 / 0.69
+
+trailPieceWidth : f32
+trailPieceWidth = 6.0 / 0.54
+
+square : f32 -> f32 -> f32
+square stx sty = inv (1.0 + 20.0 * (sq stx + sq sty))
+
+frame : f32 -> f32 -> f32 -> ColorA
+frame x y t = let
+  phase = wavePhase (x * 1.8 + t * 0.35)
+  wave = 0.05 * inv (1.0 + 20.0 * sq (approxSin (period * t + phase)))
+
+  s0 = square (x * 1.48) (y * 0.69)
+  s1 = square (x * 6.25 + 0.0 * 0.16) (y * 0.69 + 0.280)
+  s2 = square (x * 6.25 + 0.0 * 0.16) (y * 0.69 + 0.060)
+  s3 = square (x * 6.25 - 0.240) (y * 0.69 - 0.280)
+  s4 = square (x * 6.25 - 0.240) (y * 0.69 - 0.060)
+
+  shade0 = 0.941 * s0 + 0.435 * s1 + 0.659 * s2 + 0.996 * s3 + 0.1 * wave
+  shade1 = 0.439 * s0 + 0.682 * s1 + 0.808 * s2 + 0.859 * s3 + 0.05 * s4
+  shade2 = 0.404 * s0 + 0.843 * s1 + 0.506 * s2 + 0.114 * s3 + 0.05 * s4
+
+  alpha = s0 * 0.45 + s1 * 0.15 + s2 * 0.15 + s3 * 0.15 + s4 * 0.10
+in { r = shade0, g = shade1, b = shade2, a = alpha }
+
+trailPiece : f32 -> f32 -> f32 -> f32 -> ColorA
+trailPiece x y phase scale = let
+  p = 1.0 / scale
+  shift = (0.5 - scale) / (2.0 * scale)
+  stx = p * (x - shift)
+  glow = 0.3 + 0.7 * approxSin (phase + y * 2.4)
+  core = inv (1.0 + sq stx + sq (y * p) + sq (0.8 * (phase + y * 0.25)))
+  mask = 1.0 / (1.0 + 36.0 * core)
+  tone = 0.5 + 0.5 * approxCos (phase + y * 3.0)
+in {
+  r = (0.435 * tone) * mask,
+  g = (0.682 + 0.12 * glow) * mask,
+  b = (0.843 - 0.1 * glow) * mask,
+  a = mask * inv (1.0 + scale * scale)
+}
+
+trail : f32 -> f32 -> f32 -> ColorA
+trail x y t = let
+  pieceHeight = trailPieceHeight
+  pieceWidth = trailPieceWidth
+  incline = approxCos (0.5 * period + wavePhase t) * waveAmplitude
+  xCell = approxSin (x * pieceWidth + t * 1.3)
+  warp = xCell * incline
+
+  p0 = trailPiece (x * pieceWidth + warp + 0.0) (y - (0.35 + 0.15 * approxSin (t + y))) (x * pieceHeight + 0.0 * pieceHeight + t * 0.2) 0.752
+  p1 = trailPiece (x * pieceWidth + warp + 1.0) (y - (0.95 + 0.14 * approxCos (t + xCell))) (x * pieceHeight + 1.3 * pieceHeight + t * 0.2) 0.752
+  p2 = trailPiece (x * pieceWidth + warp - 0.75) (y - (1.55 + 0.17 * approxSin (t + xCell * 1.7))) (x * pieceHeight + 2.5 * pieceHeight + t * 0.2) 0.752
+
+  r0 = p0.r + p1.r + p2.r
+  g0 = p0.g + p1.g + p2.g
+  b0 = p0.b + p1.b + p2.b
+  a0 = p0.a + p1.a + p2.a
+  invN = inv 3.0
+  blend = 0.35 + 0.15 * approxSin (t + x * 3.3)
+in {
+    r = r0 * invN * blend,
+    g = g0 * invN * blend,
+    b = b0 * invN * blend,
+    a = a0 * invN
+  }
+
+logo : f32 -> f32 -> f32 -> f32 -> f32 -> Color
+logo t mx my x y = let
+  rot = logoRotation - 0.0
+  c = approxCos rot
+  s = approxSin rot
+
+  stx = (x * c + y * s) - logoOffsetX - mx
+  sty = (x * c + my - logoOffsetY) - (x * s)
+  sx = stx * logoScale + approxSin (t * logoSinScale)
+  sy = sty * logoScale + approxCos (t * logoCosScale)
+
+  frameV = frame sx sy t
+  trailV = trail sx sy t
+  split = inv (1.0 + logoSplitK * sq (sx - logoSplitOffset))
+  combined = mixColorA frameV trailV split
+  logoGlow = inv (1.0 + logoGlowK * (sq sx + sq sy))
+in {
+  r = (logoColorBase + logoColorAmount * combined.r) * (logoBlendBase + logoBlendBase * logoGlow),
+  g = (logoColorBase + logoColorAmount * combined.g) * (logoBlendBase + logoBlendBase * logoGlow),
+  b = (logoColorBase + logoColorAmount * combined.b) * (logoBlendBase + logoBlendBase * logoGlow)
+}
+
+bg : f32 -> f32 -> f32
+bg x y = 0.15 + 0.05 * approxSin (x * 2.0 + y * 1.5)
+
+main : f32 -> f32 -> f32 -> f32[n] -> f32[n] -> { r: f32[n], g: f32[n], b: f32[n] }
+main t mx my xs ys = let
+    c = logo t mx my xs ys
+    b = bg xs ys
+  in {
+    r = 1.0 * b + c.r,
+    g = 1.0 * b + c.g,
+    b = 1.0 * b + c.b
+  }

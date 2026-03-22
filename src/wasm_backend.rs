@@ -1967,8 +1967,12 @@ fn specialize_expr(
                         generic_instances,
                     )?;
                     if binding.name != "_" {
-                        if let Some(template) = extract_known_function_binding(&rewritten_expr) {
-                            next_fun_subst.insert(binding.name.clone(), template);
+                        if matches!(rewritten_expr.ty, Type::Fun(_, _)) {
+                            if let Some(template) = extract_known_function_binding(&rewritten_expr) {
+                                next_fun_subst.insert(binding.name.clone(), template);
+                            } else {
+                                next_fun_subst.remove(&binding.name);
+                            }
                         } else {
                             next_fun_subst.remove(&binding.name);
                         }
@@ -8243,14 +8247,37 @@ fn normalize_expr_for_leaf(
     match &expr.kind {
         TypedExprKind::Local(name) => {
             let local_ty = local_types.get(name).ok_or_else(|| {
-                SimdError::new(format!("unknown local '{}' in Wasm normalization", name))
+                let keys = local_types
+                    .keys()
+                    .map(std::string::ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                SimdError::new(format!(
+                    "unknown local '{}' in Wasm normalization (leaf_path={leaf_path:?}, locals=[{keys}] )",
+                    name
+                ))
             })?;
             let local_name = local_leaf_names
                 .get(name)
                 .and_then(|names| names.get(leaf_path))
                 .cloned()
                 .unwrap_or_else(|| name.clone());
-            let _ = local_ty;
+            if !leaf_path.is_root() {
+                let projected = project_local_path(name, local_ty, leaf_path)?;
+                return Ok(projected);
+            }
+            if local_leaf_names
+                .get(name)
+                .is_some()
+                && local_leaf_names
+                    .get(name)
+                    .and_then(|names| names.get(leaf_path))
+                    .is_none()
+                && matches!(local_ty, Type::Record(_))
+            {
+                let projected = project_local_path(name, local_ty, leaf_path)?;
+                return Ok(projected);
+            }
             Ok(TypedExpr {
                 ty: leaf_ty,
                 kind: TypedExprKind::Local(local_name),
@@ -8295,9 +8322,45 @@ fn normalize_expr_for_leaf(
         TypedExprKind::TypeToken(_) => Err(SimdError::new(
             "Wasm record normalization does not support type witness expressions",
         )),
-        TypedExprKind::FunctionRef { .. }
-        | TypedExprKind::Lambda { .. }
-        | TypedExprKind::Apply { .. } => Err(SimdError::new(
+        TypedExprKind::FunctionRef { name } => {
+            let function = checked_map.get(name).ok_or_else(|| {
+                SimdError::new(format!("unknown function '{}' in Wasm record normalization", name))
+            })?;
+            let expected_arity = function.signature.ty.arity();
+            if expected_arity != 0 {
+                return Err(SimdError::new(
+                    "Wasm record normalization does not support higher-order expressions",
+                ));
+            }
+            let return_ty = match &function.signature.ty {
+                Type::Fun(_, ret) => ret.as_ref().clone(),
+                other => other.clone(),
+            };
+            match &return_ty {
+                Type::Scalar(_) | Type::Bulk(_, _) | Type::Record(_) => {}
+                other => {
+                    return Err(SimdError::new(format!(
+                        "unsupported zero-arity function '{}' type in Wasm record normalization: {:?}",
+                        name, other
+                    )))
+                }
+            }
+            if function.clauses.len() != 1 || !function.clauses[0].patterns.is_empty() {
+                return Err(SimdError::new(format!(
+                    "zero-arity function '{}' must be a single-clause constant",
+                    name
+                )));
+            }
+            normalize_expr_for_leaf(
+                &function.clauses[0].body,
+                leaf_path,
+                local_types,
+                local_leaf_names,
+                checked_map,
+                result_leaf_names,
+            )
+        }
+        TypedExprKind::Lambda { .. } | TypedExprKind::Apply { .. } => Err(SimdError::new(
             "Wasm record normalization does not support higher-order expressions",
         )),
         TypedExprKind::Record(fields) => {
@@ -8318,7 +8381,7 @@ fn normalize_expr_for_leaf(
         }
         TypedExprKind::Project { base, field } => normalize_expr_for_leaf(
             base,
-            &leaf_path.prepend(field),
+            &advance_field_for_projection(base, leaf_path, field),
             local_types,
             local_leaf_names,
             checked_map,
@@ -8486,6 +8549,64 @@ fn normalize_expr_for_leaf(
             }
         },
     }
+}
+
+fn project_local_path(name: &str, local_ty: &Type, path: &LeafPath) -> Result<TypedExpr> {
+    if path.is_root() {
+        return Ok(TypedExpr {
+            ty: local_ty.clone(),
+            kind: TypedExprKind::Local(name.to_string()),
+        });
+    }
+    let mut expr = TypedExpr {
+        ty: local_ty.clone(),
+        kind: TypedExprKind::Local(name.to_string()),
+    };
+    for index in 0..path.0.len() {
+        let field = &path.0[index];
+        let field_ty = match &expr.ty {
+            Type::Record(fields) => fields.get(field).cloned().ok_or_else(|| {
+                SimdError::new(format!(
+                    "cannot project field '{}' from type {:?} for local '{}'",
+                    field, local_ty, name
+                ))
+            })?,
+            _ => {
+                return Err(SimdError::new(format!(
+                    "cannot project field '{}' from type {:?} for local '{}'",
+                    field, local_ty, name
+                )));
+            }
+        };
+        expr = TypedExpr {
+            ty: field_ty,
+            kind: TypedExprKind::Project {
+                base: Box::new(expr),
+                field: field.clone(),
+            },
+        };
+        if index + 1 == path.0.len() {
+            break;
+        }
+    }
+    Ok(expr)
+}
+
+fn advance_field_for_projection(
+    base: &TypedExpr,
+    leaf_path: &LeafPath,
+    field: &str,
+) -> LeafPath {
+    if leaf_path.is_root() {
+        if matches!(base.ty, Type::Record(_)) {
+            return LeafPath(vec![field.to_string()]);
+        }
+        return leaf_path.clone();
+    }
+    let mut path = Vec::with_capacity(leaf_path.0.len() + 1);
+    path.push(field.to_string());
+    path.extend(leaf_path.0.iter().cloned());
+    LeafPath(path)
 }
 
 fn wasm_param_abi_from_type(ty: &[Type]) -> Result<Vec<WasmParamAbi>> {
@@ -10227,6 +10348,101 @@ mod tests {
             .unwrap()
             .to_json_string();
         assert_eq!(eval, wasm);
+    }
+
+    #[test]
+    fn debug_custom_record_types() {
+        let src = include_str!("../examples/custom_record_types.simd");
+        let (_surface, _module, checked) = compile_frontend(src).unwrap();
+        let specialized = specialize_checked_program_for_main(&checked, "main").unwrap();
+        let lowered_ready = eliminate_non_escaping_lambdas_program(&specialized.checked).unwrap();
+        let canonical = canonicalize_backend_higher_order_program(&lowered_ready).unwrap();
+        let normalized = normalize_records(&canonical).unwrap();
+        let lowered = lower_program(&normalized).unwrap();
+
+        eprintln!("normalized functions:");
+        for function in &normalized.functions {
+            eprintln!("  {} : {:?}", function.name, function.signature.ty);
+            for (idx, clause) in function.clauses.iter().enumerate() {
+                eprintln!("    clause {} patterns={:?}", idx, clause.patterns);
+                eprintln!("    body={:?}", clause.body);
+            }
+        }
+
+        eprintln!("lowered functions:");
+        for function in &lowered.functions {
+            eprintln!("  {} : {:?}", function.name, function.kind);
+            eprintln!("    result={:?}", function.result);
+            match &function.kind {
+                LoweredKind::Scalar { clauses } | LoweredKind::Kernel { clauses, .. } => {
+                    for (idx, clause) in clauses.iter().enumerate() {
+                        eprintln!("    clause {} patterns={:?}", idx, clause.patterns);
+                        eprintln!("    body={:?}", clause.body);
+                    }
+                }
+            }
+            if let Some(loop_form) = &function.tail_loop {
+                eprintln!("    tail_loop clauses={:?}", loop_form.clauses);
+            }
+        }
+    }
+
+    #[test]
+    fn debug_axpy2_record_wasm_pipeline() {
+        let src =
+            "axpy2 : i64 -> {x:i64,y:i64} -> {x:i64,y:i64} -> {x:i64,y:i64}\naxpy2 a u v = { x = a * u.x + v.x, y = a * u.y + v.y }\nmain : i64 -> {x:i64[n],y:i64[n]} -> {x:i64[n],y:i64[n]} -> {x:i64[n],y:i64[n]}\nmain a us vs = axpy2 a us vs";
+        let (_surface, _module, checked) = compile_frontend(src).unwrap();
+        let specialized = specialize_checked_program_for_main(&checked, "main").unwrap();
+        let lowered_ready = eliminate_non_escaping_lambdas_program(&specialized.checked).unwrap();
+        let canonical = canonicalize_backend_higher_order_program(&lowered_ready).unwrap();
+        eprintln!("canonical checked:\n{:#?}", canonical);
+        let normalized = normalize_records(&canonical).unwrap();
+        eprintln!("normalized function signatures:");
+        for function in &normalized.functions {
+            eprintln!("  {} : {:?}", function.name, function.signature.ty);
+            for clause in &function.clauses {
+                eprintln!("    body {:?}", clause.body);
+            }
+        }
+    }
+
+    #[test]
+    fn debug_scalar_record_update_wasm_pipeline() {
+        let src = concat!(
+            "bump : { x: i64, y: i64 } -> { x: i64, y: i64 }\n",
+            "bump p = p { x = p.x + 1 }\n",
+            "main : { x: i64, y: i64 } -> { x: i64, y: i64 }\n",
+            "main p = bump p\n",
+        );
+        let (_surface, _module, checked) = compile_frontend(src).unwrap();
+        let specialized = specialize_checked_program_for_main(&checked, "main").unwrap();
+        let lowered_ready = eliminate_non_escaping_lambdas_program(&specialized.checked).unwrap();
+        let canonical = canonicalize_backend_higher_order_program(&lowered_ready).unwrap();
+        eprintln!("canonical checked:\n{:#?}", canonical);
+        let normalized = normalize_records(&canonical);
+        eprintln!("normalize_records result: {:?}", normalized.as_ref().map(|_| "ok"));
+        let normalized = normalized.unwrap();
+        eprintln!("normalized functions:");
+        for function in &normalized.functions {
+            eprintln!("  {} : {:?}", function.name, function.signature.ty);
+            for clause in &function.clauses {
+                eprintln!("    patterns={:?}", clause.patterns);
+                eprintln!("    body={:?}", clause.body);
+            }
+        }
+
+        let plan = build_wasm_plan(&canonical, "main").expect("plan should build");
+        eprintln!("plan.checked:");
+        for function in &plan.checked.functions {
+            eprintln!("  {} : {:?}", function.name, function.signature.ty);
+            for clause in &function.clauses {
+                eprintln!("    patterns={:?}", clause.patterns);
+                eprintln!("    body={:?}", clause.body);
+            }
+        }
+        let normalized_from_plan = normalize_records(&plan.checked);
+        eprintln!("normalize plan.checked result: {:?}", normalized_from_plan.as_ref().map(|_| "ok"));
+        let _ = normalized_from_plan.expect("plan checked should normalize");
     }
 
     #[test]

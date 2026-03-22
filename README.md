@@ -12,7 +12,7 @@ All numbers are machine-dependent and should be compared on the same host.
 - [Mouse Shader Demo](./docs/canvas_mouse_demo.html)
 - [Image Upload Shader Lab](./docs/image_upload_shader_demo.html)
 - [3D Matrix Canvas Demo](./docs/canvas_3d_matrix_demo.html)
-- [String SDF Demo](./docs/canvas_string_sdf_demo.html)
+- [Shadertoy Logo Shader Demo](./docs/canvas_string_sdf_demo.html)
 
 Run all demos locally with:
 

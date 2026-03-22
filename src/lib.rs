@@ -1610,8 +1610,10 @@ impl Parser {
             ty
         } else if self.eat(TokenKind::LBrace) {
             let mut fields = BTreeMap::new();
+            self.skip_newlines();
             if !self.eat(TokenKind::RBrace) {
                 loop {
+                    self.skip_newlines();
                     let name = self.expect_ident()?;
                     self.expect(TokenKind::Colon)?;
                     let ty = self.parse_type()?;
@@ -1622,8 +1624,10 @@ impl Parser {
                         )));
                     }
                     if self.eat(TokenKind::Comma) {
+                        self.skip_newlines();
                         continue;
                     }
+                    self.skip_newlines();
                     self.expect(TokenKind::RBrace)?;
                     break;
                 }
@@ -1824,17 +1828,22 @@ impl Parser {
 
     fn parse_record_expr_fields(&mut self) -> Result<Vec<(String, Expr)>> {
         let mut fields = Vec::new();
+        self.skip_newlines();
         if self.eat(TokenKind::RBrace) {
             return Ok(fields);
         }
         loop {
+            self.skip_newlines();
             let name = self.expect_ident()?;
             self.expect(TokenKind::Eq)?;
             let expr = self.parse_expr(0)?;
+            self.skip_newlines();
             fields.push((name, expr));
             if self.eat(TokenKind::Comma) {
+                self.skip_newlines();
                 continue;
             }
+            self.skip_newlines();
             self.expect(TokenKind::RBrace)?;
             break;
         }
