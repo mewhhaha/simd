@@ -1,0 +1,26 @@
+name: json-tape-pr
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  json-tape:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out PR branch
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build json_tape
+        run: cargo build --bin json_tape
+
+      - name: Test json_tape
+        run: cargo test --bin json_tape -- --nocapture
+
+      - name: Run json_tape sample
+        run: cargo run --bin json_tape -- '{"demo":[1,true,null,"x"]}'
