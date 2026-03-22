@@ -1,0 +1,6 @@
+main : string -> string -> {joined: string, swapped: string, contains_left: bool, eq_roundtrip: bool, total_len: i64}
+main left right = let
+  joined = concat left right
+  swapped = concat right left
+  contains_left = contains joined left
+in {joined = joined, swapped = swapped, contains_left = contains_left, eq_roundtrip = (left == right), total_len = len joined + len swapped}

@@ -1,0 +1,19 @@
+type Vec2 a = {x:a, y:a}
+type Rect a = {min: Vec2 a, max: Vec2 a}
+
+(+)\Vec2\a : Vec2 a -> Vec2 a -> Vec2 a
+(+)\Vec2\a lhs rhs = {x = lhs.x + rhs.x, y = lhs.y + rhs.y}
+
+(*)\Vec2\a : Vec2 a -> Vec2 a -> Vec2 a
+(*)\Vec2\a lhs rhs = {x = lhs.x * rhs.x, y = lhs.y * rhs.y}
+
+scale_vec2 : f32 -> Vec2 f32 -> Vec2 f32
+scale_vec2 k v = {x = k * v.x, y = k * v.y}
+
+rect_area2 : Rect f32[n] -> f32[n]
+rect_area2 rect = (rect.max.x - rect.min.x) * (rect.max.y - rect.min.y)
+
+main : Vec2 f32 -> Rect f32[n] -> {translated: Rect f32[n], area: f32[n]}
+main offset rect = let
+  translated = {min = {x = rect.min.x + offset.x, y = rect.min.y + offset.y}, max = {x = rect.max.x + offset.x, y = rect.max.y + offset.y}}
+in {translated = translated, area = rect_area2 translated}

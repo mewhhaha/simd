@@ -8519,11 +8519,28 @@ fn bundled_examples_inspector_html() -> Result<String> {
             "main",
             include_str!("../examples/type_alias_operator_v3.simd"),
         ),
+        (
+            "custom-record-types",
+            "custom-record-types",
+            "examples/custom_record_types.simd",
+            "main",
+            include_str!("../examples/custom_record_types.simd"),
+        ),
+        (
+            "string-family-demo",
+            "string-family-demo",
+            "examples/string_family_demo.simd",
+            "main",
+            include_str!("../examples/string_family_demo.simd"),
+        ),
     ];
 
     let mut preset_json = String::from("[\n");
     for (index, (id, label, file, main, source)) in presets.iter().enumerate() {
-        let wat = wat_main(source, main)?;
+        let wat = match wat_main(source, main) {
+            Ok(wat) => wat,
+            Err(error) => format!(";; evaluator-only example: {}", error),
+        };
         if index > 0 {
             preset_json.push_str(",\n");
         }
@@ -9457,6 +9474,8 @@ mod tests {
         assert!(html.contains("mouse-rings-f32"));
         assert!(html.contains("poly-square-i64"));
         assert!(html.contains("lambda-capture-i64"));
+        assert!(html.contains("custom-record-types"));
+        assert!(html.contains("string-family-demo"));
         assert!(html.contains("(module"));
         assert!(html.contains("color-scheme: dark"));
         assert!(html.contains("--bg: #0b1020"));
@@ -9510,6 +9529,32 @@ mod tests {
                 .expect("plus1_t should run")
                 .to_json_string(),
             "3.5"
+        );
+    }
+
+    #[test]
+    fn custom_record_types_example_runs() {
+        let source = include_str!("../examples/custom_record_types.simd");
+        assert_eq!(
+            run_main(
+                source,
+                "main",
+                "[{\"x\":1,\"y\":2},[{\"min\":{\"x\":0,\"y\":4},\"max\":{\"x\":2,\"y\":6}}]]"
+            )
+            .expect("custom record example should run")
+            .to_json_string(),
+            "[{\"area\":4.0,\"translated\":{\"max\":{\"x\":3.0,\"y\":8.0},\"min\":{\"x\":1.0,\"y\":6.0}}}]"
+        );
+    }
+
+    #[test]
+    fn string_family_demo_runs_with_strings() {
+        let source = include_str!("../examples/string_family_demo.simd");
+        assert_eq!(
+            run_main(source, "main", "[\"ab\",\"cd\"]")
+                .expect("string example should run")
+                .to_json_string(),
+            "{\"contains_left\":true,\"eq_roundtrip\":false,\"joined\":\"abcd\",\"swapped\":\"cdab\",\"total_len\":8}"
         );
     }
 
