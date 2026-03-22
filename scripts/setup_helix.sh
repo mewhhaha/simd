@@ -31,9 +31,9 @@ case "$(uname -s)" in
 esac
 
 mkdir -p "$helix_queries_dir"
-cp "$repo_root/editors/helix/queries/simd/highlights.scm" \
+cp "$repo_root/tools/tree-sitter-simd/queries/highlights.scm" \
   "$helix_queries_dir/highlights.scm"
-cp "$repo_root/editors/helix/queries/simd/rainbows.scm" \
+cp "$repo_root/tools/tree-sitter-simd/queries/rainbows.scm" \
   "$helix_queries_dir/rainbows.scm"
 
 mkdir -p "$helix_grammars_dir"

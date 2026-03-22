@@ -1,4 +1,6 @@
 const PREC = {
+  or: 20,
+  and: 25,
   cmp: 30,
   add: 40,
   mul: 50,
@@ -42,7 +44,7 @@ module.exports = grammar({
 
     _newline: (_) => token(/\r?\n/),
 
-    comment: (_) => token(seq("--", /[^\n]*/)),
+    comment: (_) => token(choice(seq("--", /[^\n]*/), seq("#", /[^\n]*/))),
 
     type_alias: ($) =>
       seq(
@@ -80,6 +82,9 @@ module.exports = grammar({
         seq("(", field("operator", $.prim_operator), ")"),
       ),
 
+    and_operator: (_) => "&&",
+    or_operator: (_) => "||",
+
     family_instance_head: ($) =>
       seq(
         field("name", $.identifier),
@@ -94,7 +99,21 @@ module.exports = grammar({
         repeat1(seq("\\", field("segment", choice($.identifier, $.prim_type)))),
       ),
 
-    prim_operator: (_) => choice("+", "-", "*", "/", "%", "==", "<", ">", "<=", ">="),
+    prim_operator: ($) =>
+      choice(
+        "+",
+        "-",
+        "*",
+        "/",
+        "%",
+        $.and_operator,
+        $.or_operator,
+        "==",
+        "<",
+        ">",
+        "<=",
+        ">=",
+      ),
 
     pattern: ($) =>
       choice($.wildcard, $.bool_literal, $.prim_type, $.identifier, $.int, $.float),
@@ -145,7 +164,7 @@ module.exports = grammar({
 
     dim: ($) => choice($.nat, $.identifier),
 
-    expr: ($) => choice($.let_expr, $.lambda_expr, $.comparison_expr),
+    expr: ($) => choice($.let_expr, $.lambda_expr, $.logic_or_expr),
 
     lambda_expr: ($) =>
       prec.right(seq("\\", field("param", $.identifier), "->", field("body", $.expr))),
@@ -164,6 +183,32 @@ module.exports = grammar({
         field("name", choice($.identifier, $.wildcard)),
         "=",
         field("value", $.expr),
+      ),
+
+    logic_or_expr: ($) =>
+      choice(
+          prec.left(
+            PREC.or,
+            seq(
+              field("left", $.logic_or_expr),
+              field("operator", $.or_operator),
+              field("right", $.logic_and_expr),
+            ),
+          ),
+        $.logic_and_expr,
+      ),
+
+    logic_and_expr: ($) =>
+      choice(
+          prec.left(
+            PREC.and,
+            seq(
+              field("left", $.logic_and_expr),
+              field("operator", $.and_operator),
+              field("right", $.comparison_expr),
+            ),
+          ),
+        $.comparison_expr,
       ),
 
     comparison_expr: ($) =>

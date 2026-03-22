@@ -29,6 +29,19 @@ if [[ ! -x "$tree_sitter_bin" ]]; then
   exit 1
 fi
 
+if ! cmp -s "$repo_root/editors/helix/queries/simd/highlights.scm" \
+  "$grammar_dir/queries/highlights.scm"; then
+  echo "editors/helix highlights query is out of sync with tools/tree-sitter-simd/queries/highlights.scm" >&2
+  echo "sync it with: cp tools/tree-sitter-simd/queries/highlights.scm editors/helix/queries/simd/highlights.scm" >&2
+  exit 1
+fi
+if ! cmp -s "$repo_root/editors/helix/queries/simd/rainbows.scm" \
+  "$grammar_dir/queries/rainbows.scm"; then
+  echo "editors/helix rainbow query is out of sync with tools/tree-sitter-simd/queries/rainbows.scm" >&2
+  echo "sync it with: cp tools/tree-sitter-simd/queries/rainbows.scm editors/helix/queries/simd/rainbows.scm" >&2
+  exit 1
+fi
+
 cd "$grammar_dir"
 "$tree_sitter_bin" generate
 "$tree_sitter_bin" test

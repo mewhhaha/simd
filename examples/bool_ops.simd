@@ -1,0 +1,13 @@
+both : bool -> bool -> bool
+both a b = a && b
+
+either : bool -> bool -> bool
+either a b = a || b
+
+flip : bool -> bool
+flip true = false
+flip false = true
+
+main : bool -> bool -> bool -> {both:bool,either:bool,flip:bool}
+main a b c = { both = both a b, either = either a c, flip = flip b }
+

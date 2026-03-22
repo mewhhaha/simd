@@ -318,6 +318,8 @@ fn expr_precedence(expr: &Expr) -> u8 {
     match expr {
         Expr::Let { .. } => PREC_LET,
         Expr::Infix { op, .. } => match op {
+            PrimOp::Or => 20,
+            PrimOp::And => 25,
             PrimOp::Eq | PrimOp::Lt | PrimOp::Gt | PrimOp::Le | PrimOp::Ge => PREC_CMP,
             PrimOp::Add | PrimOp::Sub => PREC_ADD,
             PrimOp::Mul | PrimOp::Div | PrimOp::Mod => PREC_MUL,
@@ -371,6 +373,8 @@ fn infix_binding_power(op: PrimOp) -> (u8, u8) {
     match op {
         PrimOp::Mul | PrimOp::Div | PrimOp::Mod => (PREC_MUL, PREC_MUL + 1),
         PrimOp::Add | PrimOp::Sub => (PREC_ADD, PREC_ADD + 1),
+        PrimOp::And => (25, 26),
+        PrimOp::Or => (20, 21),
         PrimOp::Eq | PrimOp::Lt | PrimOp::Gt | PrimOp::Le | PrimOp::Ge => (PREC_CMP, PREC_CMP + 1),
     }
 }
@@ -391,6 +395,8 @@ fn format_prim_op(op: PrimOp) -> &'static str {
         PrimOp::Mul => "*",
         PrimOp::Div => "/",
         PrimOp::Mod => "%",
+        PrimOp::And => "&&",
+        PrimOp::Or => "||",
         PrimOp::Eq => "==",
         PrimOp::Lt => "<",
         PrimOp::Gt => ">",

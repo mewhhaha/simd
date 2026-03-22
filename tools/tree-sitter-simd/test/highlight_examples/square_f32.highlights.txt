@@ -1,23 +1,23 @@
     pattern:  9, capture: 4 - function, start: (0, 0), end: (0, 6), text: `square`
-    pattern: 28, capture: 13 - punctuation.delimiter, start: (0, 7), end: (0, 8), text: `:`
+    pattern: 30, capture: 13 - punctuation.delimiter, start: (0, 7), end: (0, 8), text: `:`
     pattern:  9, capture: 5 - type, start: (0, 9), end: (0, 19), text: `f32 -> f32`
     pattern:  1, capture: 1 - type.builtin, start: (0, 9), end: (0, 12), text: `f32`
-    pattern: 28, capture: 13 - punctuation.delimiter, start: (0, 13), end: (0, 15), text: `->`
+    pattern: 30, capture: 13 - punctuation.delimiter, start: (0, 13), end: (0, 15), text: `->`
     pattern:  1, capture: 1 - type.builtin, start: (0, 16), end: (0, 19), text: `f32`
     pattern: 15, capture: 4 - function, start: (1, 0), end: (1, 6), text: `square`
     pattern: 16, capture: 8 - variable.parameter, start: (1, 7), end: (1, 8), text: `x`
-    pattern: 28, capture: 13 - punctuation.delimiter, start: (1, 9), end: (1, 10), text: `=`
+    pattern: 30, capture: 13 - punctuation.delimiter, start: (1, 9), end: (1, 10), text: `=`
     pattern: 25, capture: 7 - operator, start: (1, 13), end: (1, 14), text: `*`
     pattern:  9, capture: 4 - function, start: (3, 0), end: (3, 4), text: `main`
-    pattern: 28, capture: 13 - punctuation.delimiter, start: (3, 5), end: (3, 6), text: `:`
+    pattern: 30, capture: 13 - punctuation.delimiter, start: (3, 5), end: (3, 6), text: `:`
     pattern:  9, capture: 5 - type, start: (3, 7), end: (3, 23), text: `f32[n] -> f32[n]`
     pattern:  1, capture: 1 - type.builtin, start: (3, 7), end: (3, 10), text: `f32`
-    pattern: 27, capture: 12 - punctuation.bracket, start: (3, 10), end: (3, 11), text: `[`
-    pattern: 27, capture: 12 - punctuation.bracket, start: (3, 12), end: (3, 13), text: `]`
-    pattern: 28, capture: 13 - punctuation.delimiter, start: (3, 14), end: (3, 16), text: `->`
+    pattern: 29, capture: 12 - punctuation.bracket, start: (3, 10), end: (3, 11), text: `[`
+    pattern: 29, capture: 12 - punctuation.bracket, start: (3, 12), end: (3, 13), text: `]`
+    pattern: 30, capture: 13 - punctuation.delimiter, start: (3, 14), end: (3, 16), text: `->`
     pattern:  1, capture: 1 - type.builtin, start: (3, 17), end: (3, 20), text: `f32`
-    pattern: 27, capture: 12 - punctuation.bracket, start: (3, 20), end: (3, 21), text: `[`
-    pattern: 27, capture: 12 - punctuation.bracket, start: (3, 22), end: (3, 23), text: `]`
+    pattern: 29, capture: 12 - punctuation.bracket, start: (3, 20), end: (3, 21), text: `[`
+    pattern: 29, capture: 12 - punctuation.bracket, start: (3, 22), end: (3, 23), text: `]`
     pattern: 15, capture: 4 - function, start: (4, 0), end: (4, 4), text: `main`
     pattern: 16, capture: 8 - variable.parameter, start: (4, 5), end: (4, 7), text: `xs`
-    pattern: 28, capture: 13 - punctuation.delimiter, start: (4, 8), end: (4, 9), text: `=`
+    pattern: 30, capture: 13 - punctuation.delimiter, start: (4, 8), end: (4, 9), text: `=`

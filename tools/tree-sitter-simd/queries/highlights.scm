@@ -105,6 +105,9 @@
   "%"
 ] @operator
 
+(and_operator) @operator
+(or_operator) @operator
+
 (string_type) @type.builtin
 
 [

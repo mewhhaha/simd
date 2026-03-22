@@ -1,16 +1,16 @@
     pattern:  9, capture: 4 - function, start: (0, 0), end: (0, 5), text: `shade`
-    pattern: 28, capture: 13 - punctuation.delimiter, start: (0, 6), end: (0, 7), text: `:`
+    pattern: 30, capture: 13 - punctuation.delimiter, start: (0, 6), end: (0, 7), text: `:`
     pattern:  9, capture: 5 - type, start: (0, 8), end: (0, 46), text: `f32 -> f32 -> f32 -> f32 -> f32 -> f32`
     pattern:  1, capture: 1 - type.builtin, start: (0, 8), end: (0, 11), text: `f32`
-    pattern: 28, capture: 13 - punctuation.delimiter, start: (0, 12), end: (0, 14), text: `->`
+    pattern: 30, capture: 13 - punctuation.delimiter, start: (0, 12), end: (0, 14), text: `->`
     pattern:  1, capture: 1 - type.builtin, start: (0, 15), end: (0, 18), text: `f32`
-    pattern: 28, capture: 13 - punctuation.delimiter, start: (0, 19), end: (0, 21), text: `->`
+    pattern: 30, capture: 13 - punctuation.delimiter, start: (0, 19), end: (0, 21), text: `->`
     pattern:  1, capture: 1 - type.builtin, start: (0, 22), end: (0, 25), text: `f32`
-    pattern: 28, capture: 13 - punctuation.delimiter, start: (0, 26), end: (0, 28), text: `->`
+    pattern: 30, capture: 13 - punctuation.delimiter, start: (0, 26), end: (0, 28), text: `->`
     pattern:  1, capture: 1 - type.builtin, start: (0, 29), end: (0, 32), text: `f32`
-    pattern: 28, capture: 13 - punctuation.delimiter, start: (0, 33), end: (0, 35), text: `->`
+    pattern: 30, capture: 13 - punctuation.delimiter, start: (0, 33), end: (0, 35), text: `->`
     pattern:  1, capture: 1 - type.builtin, start: (0, 36), end: (0, 39), text: `f32`
-    pattern: 28, capture: 13 - punctuation.delimiter, start: (0, 40), end: (0, 42), text: `->`
+    pattern: 30, capture: 13 - punctuation.delimiter, start: (0, 40), end: (0, 42), text: `->`
     pattern:  1, capture: 1 - type.builtin, start: (0, 43), end: (0, 46), text: `f32`
     pattern: 15, capture: 4 - function, start: (1, 0), end: (1, 5), text: `shade`
     pattern: 16, capture: 8 - variable.parameter, start: (1, 6), end: (1, 7), text: `t`
@@ -18,73 +18,73 @@
     pattern: 16, capture: 8 - variable.parameter, start: (1, 11), end: (1, 13), text: `my`
     pattern: 16, capture: 8 - variable.parameter, start: (1, 14), end: (1, 15), text: `x`
     pattern: 16, capture: 8 - variable.parameter, start: (1, 16), end: (1, 17), text: `y`
-    pattern: 28, capture: 13 - punctuation.delimiter, start: (1, 18), end: (1, 19), text: `=`
+    pattern: 30, capture: 13 - punctuation.delimiter, start: (1, 18), end: (1, 19), text: `=`
     pattern: 19, capture: 3 - keyword, start: (1, 20), end: (1, 23), text: `let`
     pattern: 20, capture: 9 - variable, start: (2, 2), end: (2, 4), text: `dx`
-    pattern: 28, capture: 13 - punctuation.delimiter, start: (2, 5), end: (2, 6), text: `=`
+    pattern: 30, capture: 13 - punctuation.delimiter, start: (2, 5), end: (2, 6), text: `=`
     pattern: 25, capture: 7 - operator, start: (2, 9), end: (2, 10), text: `-`
-    pattern: 28, capture: 13 - punctuation.delimiter, start: (3, 5), end: (3, 6), text: `=`
+    pattern: 30, capture: 13 - punctuation.delimiter, start: (3, 5), end: (3, 6), text: `=`
     pattern: 25, capture: 7 - operator, start: (3, 9), end: (3, 10), text: `-`
-    pattern: 28, capture: 13 - punctuation.delimiter, start: (4, 5), end: (4, 6), text: `=`
+    pattern: 30, capture: 13 - punctuation.delimiter, start: (4, 5), end: (4, 6), text: `=`
     pattern: 25, capture: 7 - operator, start: (4, 10), end: (4, 11), text: `*`
     pattern: 25, capture: 7 - operator, start: (4, 15), end: (4, 16), text: `+`
     pattern: 25, capture: 7 - operator, start: (4, 20), end: (4, 21), text: `*`
-    pattern: 28, capture: 13 - punctuation.delimiter, start: (5, 7), end: (5, 8), text: `=`
+    pattern: 30, capture: 13 - punctuation.delimiter, start: (5, 7), end: (5, 8), text: `=`
     pattern:  0, capture: 0 - constant.numeric, start: (5, 9), end: (5, 13), text: `0.78`
     pattern: 25, capture: 7 - operator, start: (5, 14), end: (5, 15), text: `/`
-    pattern: 27, capture: 12 - punctuation.bracket, start: (5, 16), end: (5, 17), text: `(`
+    pattern: 29, capture: 12 - punctuation.bracket, start: (5, 16), end: (5, 17), text: `(`
     pattern:  0, capture: 0 - constant.numeric, start: (5, 17), end: (5, 20), text: `1.0`
     pattern: 25, capture: 7 - operator, start: (5, 21), end: (5, 22), text: `+`
     pattern:  0, capture: 0 - constant.numeric, start: (5, 23), end: (5, 27), text: `36.0`
     pattern: 25, capture: 7 - operator, start: (5, 28), end: (5, 29), text: `*`
-    pattern: 27, capture: 12 - punctuation.bracket, start: (5, 32), end: (5, 33), text: `)`
-    pattern: 28, capture: 13 - punctuation.delimiter, start: (6, 5), end: (6, 6), text: `=`
+    pattern: 29, capture: 12 - punctuation.bracket, start: (5, 32), end: (5, 33), text: `)`
+    pattern: 30, capture: 13 - punctuation.delimiter, start: (6, 5), end: (6, 6), text: `=`
     pattern: 25, capture: 7 - operator, start: (6, 9), end: (6, 10), text: `+`
     pattern:  0, capture: 0 - constant.numeric, start: (6, 11), end: (6, 15), text: `0.31`
     pattern: 25, capture: 7 - operator, start: (6, 16), end: (6, 17), text: `*`
-    pattern: 28, capture: 13 - punctuation.delimiter, start: (7, 5), end: (7, 6), text: `=`
+    pattern: 30, capture: 13 - punctuation.delimiter, start: (7, 5), end: (7, 6), text: `=`
     pattern: 25, capture: 7 - operator, start: (7, 9), end: (7, 10), text: `-`
     pattern:  0, capture: 0 - constant.numeric, start: (7, 11), end: (7, 15), text: `0.19`
     pattern: 25, capture: 7 - operator, start: (7, 16), end: (7, 17), text: `*`
-    pattern: 28, capture: 13 - punctuation.delimiter, start: (8, 5), end: (8, 6), text: `=`
+    pattern: 30, capture: 13 - punctuation.delimiter, start: (8, 5), end: (8, 6), text: `=`
     pattern: 25, capture: 7 - operator, start: (8, 10), end: (8, 11), text: `*`
     pattern: 25, capture: 7 - operator, start: (8, 15), end: (8, 16), text: `+`
     pattern: 25, capture: 7 - operator, start: (8, 20), end: (8, 21), text: `*`
-    pattern: 28, capture: 13 - punctuation.delimiter, start: (9, 6), end: (9, 7), text: `=`
+    pattern: 30, capture: 13 - punctuation.delimiter, start: (9, 6), end: (9, 7), text: `=`
     pattern:  0, capture: 0 - constant.numeric, start: (9, 8), end: (9, 12), text: `0.22`
     pattern: 25, capture: 7 - operator, start: (9, 13), end: (9, 14), text: `/`
-    pattern: 27, capture: 12 - punctuation.bracket, start: (9, 15), end: (9, 16), text: `(`
+    pattern: 29, capture: 12 - punctuation.bracket, start: (9, 15), end: (9, 16), text: `(`
     pattern:  0, capture: 0 - constant.numeric, start: (9, 16), end: (9, 19), text: `1.0`
     pattern: 25, capture: 7 - operator, start: (9, 20), end: (9, 21), text: `+`
     pattern:  0, capture: 0 - constant.numeric, start: (9, 22), end: (9, 25), text: `2.8`
     pattern: 25, capture: 7 - operator, start: (9, 26), end: (9, 27), text: `*`
-    pattern: 27, capture: 12 - punctuation.bracket, start: (9, 30), end: (9, 31), text: `)`
+    pattern: 29, capture: 12 - punctuation.bracket, start: (9, 30), end: (9, 31), text: `)`
     pattern: 19, capture: 3 - keyword, start: (10, 2), end: (10, 4), text: `in`
     pattern: 25, capture: 7 - operator, start: (10, 10), end: (10, 11), text: `+`
     pattern:  9, capture: 4 - function, start: (12, 0), end: (12, 4), text: `main`
-    pattern: 28, capture: 13 - punctuation.delimiter, start: (12, 5), end: (12, 6), text: `:`
+    pattern: 30, capture: 13 - punctuation.delimiter, start: (12, 5), end: (12, 6), text: `:`
     pattern:  9, capture: 5 - type, start: (12, 7), end: (12, 54), text: `f32 -> f32 -> f32 -> f32[n] -> f32[n] -> f32[n]`
     pattern:  1, capture: 1 - type.builtin, start: (12, 7), end: (12, 10), text: `f32`
-    pattern: 28, capture: 13 - punctuation.delimiter, start: (12, 11), end: (12, 13), text: `->`
+    pattern: 30, capture: 13 - punctuation.delimiter, start: (12, 11), end: (12, 13), text: `->`
     pattern:  1, capture: 1 - type.builtin, start: (12, 14), end: (12, 17), text: `f32`
-    pattern: 28, capture: 13 - punctuation.delimiter, start: (12, 18), end: (12, 20), text: `->`
+    pattern: 30, capture: 13 - punctuation.delimiter, start: (12, 18), end: (12, 20), text: `->`
     pattern:  1, capture: 1 - type.builtin, start: (12, 21), end: (12, 24), text: `f32`
-    pattern: 28, capture: 13 - punctuation.delimiter, start: (12, 25), end: (12, 27), text: `->`
+    pattern: 30, capture: 13 - punctuation.delimiter, start: (12, 25), end: (12, 27), text: `->`
     pattern:  1, capture: 1 - type.builtin, start: (12, 28), end: (12, 31), text: `f32`
-    pattern: 27, capture: 12 - punctuation.bracket, start: (12, 31), end: (12, 32), text: `[`
-    pattern: 27, capture: 12 - punctuation.bracket, start: (12, 33), end: (12, 34), text: `]`
-    pattern: 28, capture: 13 - punctuation.delimiter, start: (12, 35), end: (12, 37), text: `->`
+    pattern: 29, capture: 12 - punctuation.bracket, start: (12, 31), end: (12, 32), text: `[`
+    pattern: 29, capture: 12 - punctuation.bracket, start: (12, 33), end: (12, 34), text: `]`
+    pattern: 30, capture: 13 - punctuation.delimiter, start: (12, 35), end: (12, 37), text: `->`
     pattern:  1, capture: 1 - type.builtin, start: (12, 38), end: (12, 41), text: `f32`
-    pattern: 27, capture: 12 - punctuation.bracket, start: (12, 41), end: (12, 42), text: `[`
-    pattern: 27, capture: 12 - punctuation.bracket, start: (12, 43), end: (12, 44), text: `]`
-    pattern: 28, capture: 13 - punctuation.delimiter, start: (12, 45), end: (12, 47), text: `->`
+    pattern: 29, capture: 12 - punctuation.bracket, start: (12, 41), end: (12, 42), text: `[`
+    pattern: 29, capture: 12 - punctuation.bracket, start: (12, 43), end: (12, 44), text: `]`
+    pattern: 30, capture: 13 - punctuation.delimiter, start: (12, 45), end: (12, 47), text: `->`
     pattern:  1, capture: 1 - type.builtin, start: (12, 48), end: (12, 51), text: `f32`
-    pattern: 27, capture: 12 - punctuation.bracket, start: (12, 51), end: (12, 52), text: `[`
-    pattern: 27, capture: 12 - punctuation.bracket, start: (12, 53), end: (12, 54), text: `]`
+    pattern: 29, capture: 12 - punctuation.bracket, start: (12, 51), end: (12, 52), text: `[`
+    pattern: 29, capture: 12 - punctuation.bracket, start: (12, 53), end: (12, 54), text: `]`
     pattern: 15, capture: 4 - function, start: (13, 0), end: (13, 4), text: `main`
     pattern: 16, capture: 8 - variable.parameter, start: (13, 5), end: (13, 6), text: `t`
     pattern: 16, capture: 8 - variable.parameter, start: (13, 7), end: (13, 9), text: `mx`
     pattern: 16, capture: 8 - variable.parameter, start: (13, 10), end: (13, 12), text: `my`
     pattern: 16, capture: 8 - variable.parameter, start: (13, 13), end: (13, 15), text: `xs`
     pattern: 16, capture: 8 - variable.parameter, start: (13, 16), end: (13, 18), text: `ys`
-    pattern: 28, capture: 13 - punctuation.delimiter, start: (13, 19), end: (13, 20), text: `=`
+    pattern: 30, capture: 13 - punctuation.delimiter, start: (13, 19), end: (13, 20), text: `=`

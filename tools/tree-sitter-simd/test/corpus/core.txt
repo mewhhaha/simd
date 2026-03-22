@@ -38,19 +38,21 @@ f x = x + 1
       pattern: (pattern
         (identifier))
       body: (expr
-        (comparison_expr
-          (add_expr
-            left: (add_expr
-              (mul_expr
-                (application_expr
-                  (postfix_expr
-                    (atom
-                      (identifier))))))
-            right: (mul_expr
-              (application_expr
-                (postfix_expr
-                  (atom
-                    (int)))))))))))
+        (logic_or_expr
+          (logic_and_expr
+            (comparison_expr
+              (add_expr
+                left: (add_expr
+                  (mul_expr
+                    (application_expr
+                      (postfix_expr
+                        (atom
+                          (identifier))))))
+                right: (mul_expr
+                  (application_expr
+                    (postfix_expr
+                      (atom
+                        (int)))))))))))))
 
 ==================
 let, record, projection, and update
@@ -72,45 +74,53 @@ main p = let q = p { x = 3 }; r = q.x in r
           (let_binding
             name: (identifier)
             value: (expr
-              (comparison_expr
-                (add_expr
-                  (mul_expr
-                    (application_expr
-                      (postfix_expr
-                        base: (postfix_expr
-                          (atom
-                            (identifier)))
-                        update: (record_update
-                          (record_field
-                            name: (identifier)
-                            value: (expr
-                              (comparison_expr
-                                (add_expr
-                                  (mul_expr
-                                    (application_expr
-                                      (postfix_expr
-                                        (atom
-                                          (int)))))))))))))))))
+              (logic_or_expr
+                (logic_and_expr
+                  (comparison_expr
+                    (add_expr
+                      (mul_expr
+                        (application_expr
+                          (postfix_expr
+                            base: (postfix_expr
+                              (atom
+                                (identifier)))
+                            update: (record_update
+                              (record_field
+                                name: (identifier)
+                                value: (expr
+                                  (logic_or_expr
+                                    (logic_and_expr
+                                      (comparison_expr
+                                        (add_expr
+                                          (mul_expr
+                                            (application_expr
+                                              (postfix_expr
+                                                (atom
+                                                  (int)))))))))))))))))))))
           (let_binding
             name: (identifier)
             value: (expr
-              (comparison_expr
-                (add_expr
-                  (mul_expr
-                    (application_expr
-                      (postfix_expr
-                        base: (postfix_expr
-                          (atom
-                            (identifier)))
-                        field: (identifier))))))))
+              (logic_or_expr
+                (logic_and_expr
+                  (comparison_expr
+                    (add_expr
+                      (mul_expr
+                        (application_expr
+                          (postfix_expr
+                            base: (postfix_expr
+                              (atom
+                                (identifier)))
+                            field: (identifier))))))))))
           (expr
-            (comparison_expr
-              (add_expr
-                (mul_expr
-                  (application_expr
-                    (postfix_expr
-                      (atom
-                        (identifier)))))))))))))
+            (logic_or_expr
+              (logic_and_expr
+                (comparison_expr
+                  (add_expr
+                    (mul_expr
+                      (application_expr
+                        (postfix_expr
+                          (atom
+                            (identifier)))))))))))))))
 
 ==================
 application and infix precedence
@@ -132,24 +142,26 @@ axpy a x y = a * x + y
       pattern: (pattern
         (identifier))
       body: (expr
-        (comparison_expr
-          (add_expr
-            left: (add_expr
-              (mul_expr
-                left: (mul_expr
+        (logic_or_expr
+          (logic_and_expr
+            (comparison_expr
+              (add_expr
+                left: (add_expr
+                  (mul_expr
+                    left: (mul_expr
+                      (application_expr
+                        (postfix_expr
+                          (atom
+                            (identifier)))))
+                    right: (application_expr
+                      (postfix_expr
+                        (atom
+                          (identifier))))))
+                right: (mul_expr
                   (application_expr
                     (postfix_expr
                       (atom
-                        (identifier)))))
-                right: (application_expr
-                  (postfix_expr
-                    (atom
-                      (identifier))))))
-            right: (mul_expr
-              (application_expr
-                (postfix_expr
-                  (atom
-                    (identifier)))))))))))
+                        (identifier)))))))))))))
 
 ==================
 type witness signature
@@ -199,13 +211,15 @@ wrap i64 x = x
       pattern: (pattern
         (identifier))
       body: (expr
-        (comparison_expr
-          (add_expr
-            (mul_expr
-              (application_expr
-                (postfix_expr
-                  (atom
-                    (identifier)))))))))))
+        (logic_or_expr
+          (logic_and_expr
+            (comparison_expr
+              (add_expr
+                (mul_expr
+                  (application_expr
+                    (postfix_expr
+                      (atom
+                        (identifier)))))))))))))
 
 ==================
 specialization chain signature
@@ -247,20 +261,22 @@ main x = scalar\axpy\i64 x
       pattern: (pattern
         (identifier))
       body: (expr
-        (comparison_expr
-          (add_expr
-            (mul_expr
-              (application_expr
-                function: (application_expr
-                  (postfix_expr
-                    (atom
-                      (qualified_ref
-                        head: (identifier)
-                        segment: (identifier)
-                        segment: (prim_type)))))
-                argument: (postfix_expr
-                  (atom
-                    (identifier)))))))))))
+        (logic_or_expr
+          (logic_and_expr
+            (comparison_expr
+              (add_expr
+                (mul_expr
+                  (application_expr
+                    function: (application_expr
+                      (postfix_expr
+                        (atom
+                          (qualified_ref
+                            head: (identifier)
+                            segment: (identifier)
+                            segment: (prim_type)))))
+                    argument: (postfix_expr
+                      (atom
+                        (identifier)))))))))))))
 
 ==================
 type alias declaration
@@ -355,10 +371,12 @@ operator instance declarations
       pattern: (pattern
         (identifier))
       body: (expr
-        (comparison_expr
-          (add_expr
-            (mul_expr
-              (application_expr
-                (postfix_expr
-                  (atom
-                    (identifier)))))))))))
+        (logic_or_expr
+          (logic_and_expr
+            (comparison_expr
+              (add_expr
+                (mul_expr
+                  (application_expr
+                    (postfix_expr
+                      (atom
+                        (identifier)))))))))))))

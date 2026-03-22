@@ -1,34 +1,34 @@
 /home/mewhhaha/src/simd/tools/tree-sitter-simd/test/highlight_snapshots/main_and_family_heads.simd
     pattern: 11, capture: 4 - function, start: (0, 0), end: (0, 6), text: `concat`
     pattern: 11, capture: 5 - type, start: (0, 7), end: (0, 13), text: `string`
-    pattern: 28, capture: 13 - punctuation.delimiter, start: (0, 14), end: (0, 15), text: `:`
-    pattern: 26, capture: 1 - type.builtin, start: (0, 16), end: (0, 22), text: `string`
-    pattern: 28, capture: 13 - punctuation.delimiter, start: (0, 23), end: (0, 25), text: `->`
-    pattern: 26, capture: 1 - type.builtin, start: (0, 26), end: (0, 32), text: `string`
-    pattern: 28, capture: 13 - punctuation.delimiter, start: (0, 33), end: (0, 35), text: `->`
-    pattern: 26, capture: 1 - type.builtin, start: (0, 36), end: (0, 42), text: `string`
+    pattern: 30, capture: 13 - punctuation.delimiter, start: (0, 14), end: (0, 15), text: `:`
+    pattern: 28, capture: 1 - type.builtin, start: (0, 16), end: (0, 22), text: `string`
+    pattern: 30, capture: 13 - punctuation.delimiter, start: (0, 23), end: (0, 25), text: `->`
+    pattern: 28, capture: 1 - type.builtin, start: (0, 26), end: (0, 32), text: `string`
+    pattern: 30, capture: 13 - punctuation.delimiter, start: (0, 33), end: (0, 35), text: `->`
+    pattern: 28, capture: 1 - type.builtin, start: (0, 36), end: (0, 42), text: `string`
     pattern: 18, capture: 4 - function, start: (1, 0), end: (1, 6), text: `concat`
     pattern: 18, capture: 5 - type, start: (1, 7), end: (1, 13), text: `string`
     pattern: 16, capture: 8 - variable.parameter, start: (1, 14), end: (1, 15), text: `x`
     pattern: 16, capture: 8 - variable.parameter, start: (1, 16), end: (1, 17), text: `y`
-    pattern: 28, capture: 13 - punctuation.delimiter, start: (1, 18), end: (1, 19), text: `=`
+    pattern: 30, capture: 13 - punctuation.delimiter, start: (1, 18), end: (1, 19), text: `=`
     pattern:  9, capture: 4 - function, start: (3, 0), end: (3, 4), text: `main`
-    pattern: 28, capture: 13 - punctuation.delimiter, start: (3, 5), end: (3, 6), text: `:`
+    pattern: 30, capture: 13 - punctuation.delimiter, start: (3, 5), end: (3, 6), text: `:`
     pattern:  9, capture: 5 - type, start: (3, 7), end: (3, 23), text: `i64[n] -> i64[n]`
     pattern:  1, capture: 1 - type.builtin, start: (3, 7), end: (3, 10), text: `i64`
-    pattern: 27, capture: 12 - punctuation.bracket, start: (3, 10), end: (3, 11), text: `[`
-    pattern: 27, capture: 12 - punctuation.bracket, start: (3, 12), end: (3, 13), text: `]`
-    pattern: 28, capture: 13 - punctuation.delimiter, start: (3, 14), end: (3, 16), text: `->`
+    pattern: 29, capture: 12 - punctuation.bracket, start: (3, 10), end: (3, 11), text: `[`
+    pattern: 29, capture: 12 - punctuation.bracket, start: (3, 12), end: (3, 13), text: `]`
+    pattern: 30, capture: 13 - punctuation.delimiter, start: (3, 14), end: (3, 16), text: `->`
     pattern:  1, capture: 1 - type.builtin, start: (3, 17), end: (3, 20), text: `i64`
-    pattern: 27, capture: 12 - punctuation.bracket, start: (3, 20), end: (3, 21), text: `[`
-    pattern: 27, capture: 12 - punctuation.bracket, start: (3, 22), end: (3, 23), text: `]`
+    pattern: 29, capture: 12 - punctuation.bracket, start: (3, 20), end: (3, 21), text: `[`
+    pattern: 29, capture: 12 - punctuation.bracket, start: (3, 22), end: (3, 23), text: `]`
     pattern: 15, capture: 4 - function, start: (4, 0), end: (4, 4), text: `main`
     pattern: 16, capture: 8 - variable.parameter, start: (4, 5), end: (4, 7), text: `xs`
-    pattern: 28, capture: 13 - punctuation.delimiter, start: (4, 8), end: (4, 9), text: `=`
+    pattern: 30, capture: 13 - punctuation.delimiter, start: (4, 8), end: (4, 9), text: `=`
     pattern:  9, capture: 4 - function, start: (6, 0), end: (6, 5), text: `main0`
-    pattern: 28, capture: 13 - punctuation.delimiter, start: (6, 6), end: (6, 7), text: `:`
+    pattern: 30, capture: 13 - punctuation.delimiter, start: (6, 6), end: (6, 7), text: `:`
     pattern:  9, capture: 5 - type, start: (6, 8), end: (6, 11), text: `i64`
     pattern:  1, capture: 1 - type.builtin, start: (6, 8), end: (6, 11), text: `i64`
     pattern: 15, capture: 4 - function, start: (7, 0), end: (7, 5), text: `main0`
-    pattern: 28, capture: 13 - punctuation.delimiter, start: (7, 6), end: (7, 7), text: `=`
+    pattern: 30, capture: 13 - punctuation.delimiter, start: (7, 6), end: (7, 7), text: `=`
     pattern:  0, capture: 0 - constant.numeric, start: (7, 8), end: (7, 9), text: `1`

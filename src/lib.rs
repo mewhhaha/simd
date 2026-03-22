@@ -171,6 +171,8 @@ pub enum PrimOp {
     Mul,
     Div,
     Mod,
+    And,
+    Or,
     Eq,
     Lt,
     Gt,
@@ -186,6 +188,8 @@ impl PrimOp {
             TokenKind::Star => Some(Self::Mul),
             TokenKind::Slash => Some(Self::Div),
             TokenKind::Percent => Some(Self::Mod),
+            TokenKind::AmpAmp => Some(Self::And),
+            TokenKind::PipePipe => Some(Self::Or),
             TokenKind::EqEq => Some(Self::Eq),
             TokenKind::Lt => Some(Self::Lt),
             TokenKind::Gt => Some(Self::Gt),
@@ -386,6 +390,8 @@ pub enum BuiltinFamilyCallee {
     LenString,
     SliceString,
     ContainsString,
+    AndBool,
+    OrBool,
     EqString,
     EqBool,
 }
@@ -1058,6 +1064,8 @@ enum TokenKind {
     Star,
     Slash,
     Percent,
+    AmpAmp,
+    PipePipe,
     Lt,
     Gt,
     Le,
@@ -1101,6 +1109,20 @@ fn lex(source: &str) -> Result<Vec<Token>> {
             }
         }
         let ch = chars[index];
+        if ch == '#' {
+            index += 1;
+            while index < chars.len() && chars[index] != '\n' {
+                index += 1;
+            }
+            continue;
+        }
+        if ch == '-' && chars.get(index + 1) == Some(&'-') {
+            index += 2;
+            while index < chars.len() && chars[index] != '\n' {
+                index += 1;
+            }
+            continue;
+        }
         if ch == '\n' {
             tokens.push(Token {
                 kind: TokenKind::Newline,
@@ -1234,6 +1256,20 @@ fn lex(source: &str) -> Result<Vec<Token>> {
             '*' => (TokenKind::Star, 1),
             '/' => (TokenKind::Slash, 1),
             '%' => (TokenKind::Percent, 1),
+            '&' => {
+                if chars.get(index + 1) == Some(&'&') {
+                    (TokenKind::AmpAmp, 2)
+                } else {
+                    return Err(SimdError::new("unexpected character '&' in input"));
+                }
+            }
+            '|' => {
+                if chars.get(index + 1) == Some(&'|') {
+                    (TokenKind::PipePipe, 2)
+                } else {
+                    return Err(SimdError::new("unexpected character '|' in input"));
+                }
+            }
             '<' => {
                 if chars.get(index + 1) == Some(&'=') {
                     (TokenKind::Le, 2)
@@ -1984,6 +2020,8 @@ fn operator_token(op: PrimOp) -> &'static str {
         PrimOp::Mul => "*",
         PrimOp::Div => "/",
         PrimOp::Mod => "%",
+        PrimOp::And => "&&",
+        PrimOp::Or => "||",
         PrimOp::Eq => "==",
         PrimOp::Lt => "<",
         PrimOp::Gt => ">",
@@ -1999,6 +2037,8 @@ fn parse_operator_token_kind(kind: &TokenKind) -> Option<PrimOp> {
         TokenKind::Star => Some(PrimOp::Mul),
         TokenKind::Slash => Some(PrimOp::Div),
         TokenKind::Percent => Some(PrimOp::Mod),
+        TokenKind::AmpAmp => Some(PrimOp::And),
+        TokenKind::PipePipe => Some(PrimOp::Or),
         TokenKind::EqEq => Some(PrimOp::Eq),
         TokenKind::Lt => Some(PrimOp::Lt),
         TokenKind::Gt => Some(PrimOp::Gt),
@@ -2015,6 +2055,8 @@ fn operator_key(op: PrimOp) -> &'static str {
         PrimOp::Mul => "mul",
         PrimOp::Div => "div",
         PrimOp::Mod => "mod",
+        PrimOp::And => "and",
+        PrimOp::Or => "or",
         PrimOp::Eq => "eq",
         PrimOp::Lt => "lt",
         PrimOp::Gt => "gt",
@@ -2030,6 +2072,8 @@ fn parse_operator_key(name: &str) -> Option<PrimOp> {
         "mul" => Some(PrimOp::Mul),
         "div" => Some(PrimOp::Div),
         "mod" => Some(PrimOp::Mod),
+        "and" => Some(PrimOp::And),
+        "or" => Some(PrimOp::Or),
         "eq" => Some(PrimOp::Eq),
         "lt" => Some(PrimOp::Lt),
         "gt" => Some(PrimOp::Gt),
@@ -2097,6 +2141,8 @@ fn infix_binding_power(op: PrimOp) -> (u8, u8) {
         PrimOp::Mul | PrimOp::Div | PrimOp::Mod => (50, 51),
         PrimOp::Add | PrimOp::Sub => (40, 41),
         PrimOp::Eq | PrimOp::Lt | PrimOp::Gt | PrimOp::Le | PrimOp::Ge => (30, 31),
+        PrimOp::And => (25, 26),
+        PrimOp::Or => (20, 21),
     }
 }
 
@@ -2245,6 +2291,22 @@ fn builtin_family_declarations() -> Vec<FamilyDecl> {
                 Box::new(Type::Var("t".to_string())),
             ),
             op: Some(PrimOp::Mod),
+        },
+        FamilyDecl {
+            name: "and".to_string(),
+            ty: Type::Fun(
+                vec![builtin_bool_type(), builtin_bool_type()],
+                Box::new(builtin_bool_type()),
+            ),
+            op: Some(PrimOp::And),
+        },
+        FamilyDecl {
+            name: "or".to_string(),
+            ty: Type::Fun(
+                vec![builtin_bool_type(), builtin_bool_type()],
+                Box::new(builtin_bool_type()),
+            ),
+            op: Some(PrimOp::Or),
         },
         FamilyDecl {
             name: "eq".to_string(),
@@ -4286,6 +4348,20 @@ fn infer_named_family_builtin_signature(
 ) -> Option<(BuiltinFamilyCallee, Type)> {
     let string_ty = builtin_string_type();
     match (family, arg_count) {
+        ("and", 2) => Some((
+            BuiltinFamilyCallee::AndBool,
+            Type::Fun(
+                vec![builtin_bool_type(), builtin_bool_type()],
+                Box::new(builtin_bool_type()),
+            ),
+        )),
+        ("or", 2) => Some((
+            BuiltinFamilyCallee::OrBool,
+            Type::Fun(
+                vec![builtin_bool_type(), builtin_bool_type()],
+                Box::new(builtin_bool_type()),
+            ),
+        )),
         ("concat", 2) => Some((
             BuiltinFamilyCallee::ConcatString,
             Type::Fun(
@@ -4578,6 +4654,18 @@ fn infer_primitive_call(
     if let Some(instance_call) = infer_operator_instance_call(op, lhs, rhs, context, expected)? {
         return Ok(instance_call);
     }
+    if matches!(op, PrimOp::And | PrimOp::Or) {
+        let bool_ty = builtin_bool_type();
+        let left = infer_expr(lhs, context, Some(&bool_ty))?;
+        let right = infer_expr(rhs, context, Some(&bool_ty))?;
+        if let Some(builtin_call) = infer_builtin_operator_call(op, &left, &right) {
+            return Ok(builtin_call);
+        }
+        return Err(SimdError::new(format!(
+            "boolean operator family {:?} expects bool operands",
+            op
+        )));
+    }
     let operand_expected = match op {
         PrimOp::Eq | PrimOp::Lt | PrimOp::Gt | PrimOp::Le | PrimOp::Ge => None,
         _ => expected,
@@ -4643,11 +4731,38 @@ fn infer_builtin_operator_call(
     left: &TypedExpr,
     right: &TypedExpr,
 ) -> Option<TypedExpr> {
+    let string_ty = builtin_string_type();
+    let bool_ty = builtin_bool_type();
+    if op == PrimOp::And || op == PrimOp::Or {
+        if left.ty != bool_ty || right.ty != bool_ty {
+            return None;
+        }
+        let callee = if op == PrimOp::And {
+            BuiltinFamilyCallee::AndBool
+        } else {
+            BuiltinFamilyCallee::OrBool
+        };
+        return Some(TypedExpr {
+            ty: builtin_bool_type(),
+            kind: TypedExprKind::Call {
+                callee: Callee::Builtin(callee),
+                args: vec![
+                    TypedArg {
+                        mode: AccessKind::Same,
+                        expr: Box::new(left.clone()),
+                    },
+                    TypedArg {
+                        mode: AccessKind::Same,
+                        expr: Box::new(right.clone()),
+                    },
+                ],
+                lifted_shape: None,
+            },
+        });
+    }
     if op != PrimOp::Eq {
         return None;
     }
-    let string_ty = builtin_string_type();
-    let bool_ty = builtin_bool_type();
     if left.ty == string_ty && right.ty == string_ty {
         return Some(TypedExpr {
             ty: builtin_bool_type(),
@@ -4764,6 +4879,11 @@ fn infer_primitive_signature(
     left: &Type,
     right: &Type,
 ) -> Result<(AccessKind, AccessKind, Type)> {
+    if matches!(op, PrimOp::And | PrimOp::Or) {
+        return Err(SimdError::new(
+            "boolean operator families require bool operands",
+        ));
+    }
     match (left, right) {
         (Type::Infer(_left_id), Type::Infer(_right_id)) => Ok((
             AccessKind::Same,
@@ -6079,6 +6199,7 @@ fn fold_int_prim_call(ty: Type, callee: Callee, args: Vec<IrExpr>) -> IrExprKind
             PrimOp::Gt => Some((lhs > rhs) as i64),
             PrimOp::Le => Some((lhs <= rhs) as i64),
             PrimOp::Ge => Some((lhs >= rhs) as i64),
+            PrimOp::And | PrimOp::Or => None,
         };
         if let Some(value) = folded {
             let result_prim = ty.prim().unwrap_or(lhs_prim);
@@ -7141,6 +7262,7 @@ fn builtin_family_result_type(kind: &BuiltinFamilyCallee) -> Type {
             builtin_string_type()
         }
         BuiltinFamilyCallee::LenString => Type::Scalar(Prim::I64),
+        BuiltinFamilyCallee::AndBool | BuiltinFamilyCallee::OrBool => builtin_bool_type(),
         BuiltinFamilyCallee::ContainsString
         | BuiltinFamilyCallee::EqString
         | BuiltinFamilyCallee::EqBool => builtin_bool_type(),
@@ -7185,6 +7307,22 @@ fn eval_builtin_family_scalar(kind: &BuiltinFamilyCallee, args: &[Value]) -> Res
             let haystack = expect_string_value(&args[0], "contains\\string argument 1")?;
             let needle = expect_string_value(&args[1], "contains\\string argument 2")?;
             Ok(Value::Bool(haystack.contains(needle)))
+        }
+        BuiltinFamilyCallee::AndBool => {
+            if args.len() != 2 {
+                return Err(SimdError::new("(&&)\\bool expects 2 arguments"));
+            }
+            let a = expect_bool_value(&args[0], "(&&)\\bool argument 1")?;
+            let b = expect_bool_value(&args[1], "(&&)\\bool argument 2")?;
+            Ok(Value::Bool(a && b))
+        }
+        BuiltinFamilyCallee::OrBool => {
+            if args.len() != 2 {
+                return Err(SimdError::new("(||)\\bool expects 2 arguments"));
+            }
+            let a = expect_bool_value(&args[0], "(||)\\bool argument 1")?;
+            let b = expect_bool_value(&args[1], "(||)\\bool argument 2")?;
+            Ok(Value::Bool(a || b))
         }
         BuiltinFamilyCallee::EqString => {
             if args.len() != 2 {
@@ -7283,6 +7421,11 @@ fn apply_int_primitive_i64(op: PrimOp, left: i64, right: i64) -> Result<i64> {
         PrimOp::Gt => return Ok(if left > right { 1 } else { 0 }),
         PrimOp::Le => return Ok(if left <= right { 1 } else { 0 }),
         PrimOp::Ge => return Ok(if left >= right { 1 } else { 0 }),
+        PrimOp::And | PrimOp::Or => {
+            return Err(SimdError::new(
+                "boolean operator families are only defined on bool values",
+            ));
+        }
     };
     Ok(value)
 }
@@ -7309,6 +7452,11 @@ fn apply_float_primitive(op: PrimOp, left: f64, right: f64) -> Result<f64> {
         PrimOp::Gt => return Ok(if left > right { 1.0 } else { 0.0 }),
         PrimOp::Le => return Ok(if left <= right { 1.0 } else { 0.0 }),
         PrimOp::Ge => return Ok(if left >= right { 1.0 } else { 0.0 }),
+        PrimOp::And | PrimOp::Or => {
+            return Err(SimdError::new(
+                "boolean operator families are only defined on bool values",
+            ));
+        }
     };
     Ok(value)
 }
@@ -8573,6 +8721,15 @@ mod tests {
         let src = "flip true = false\nflip false = true\nmain x = flip x\n";
         assert_eq!(run(src, "main", "[true]"), "false");
         assert_eq!(run(src, "main", "[false]"), "true");
+    }
+
+    #[test]
+    fn evaluates_boolean_operator_families() {
+        let src = "both a b = a && b\neither a b = a || b\nmain a b c = { x = both a b, y = either a c }\n";
+        assert_eq!(
+            run(src, "main", "[true,false,true]"),
+            "{\"x\":false,\"y\":true}"
+        );
     }
 
     #[test]

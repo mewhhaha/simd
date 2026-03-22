@@ -445,7 +445,7 @@ fn function_name_at_line(source: &str, line: usize) -> Option<String> {
             continue;
         }
         let trimmed = raw_line.trim();
-        if trimmed.is_empty() || trimmed.starts_with("--") {
+        if trimmed.is_empty() || trimmed.starts_with("--") || trimmed.starts_with('#') {
             continue;
         }
         let Some((name, rest)) = parse_decl_head_and_rest(trimmed) else {
@@ -547,6 +547,8 @@ fn format_prim_op(op: PrimOp) -> &'static str {
         PrimOp::Mul => "*",
         PrimOp::Div => "/",
         PrimOp::Mod => "%",
+        PrimOp::And => "&&",
+        PrimOp::Or => "||",
         PrimOp::Eq => "==",
         PrimOp::Lt => "<",
         PrimOp::Gt => ">",
