@@ -1,0 +1,26 @@
+name: recursive-tape-pr
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  recursive-tape:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out PR branch
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build recursive_tape
+        run: cargo build --bin recursive_tape
+
+      - name: Test recursive_tape
+        run: cargo test --bin recursive_tape -- --nocapture
+
+      - name: Run recursive_tape
+        run: cargo run --bin recursive_tape
