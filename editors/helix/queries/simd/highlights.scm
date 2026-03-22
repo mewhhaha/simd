@@ -49,11 +49,13 @@
 
 (family_decl
   head: (family_head
-    (identifier) @type))
+    (identifier) @type
+    (identifier) @type.parameter))
 
 (family_decl
   head: (family_head
-    (prim_operator) @operator))
+    (prim_operator) @operator
+    (identifier) @type.parameter))
 
 (clause
   head: (decl_head

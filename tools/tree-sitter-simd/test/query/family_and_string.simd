@@ -1,8 +1,17 @@
+family concat\t : t -> t -> t
+family (==)\t : t -> t -> bool
+family my_func\a\b : a -> b -> a
+
 concat\string : string -> string -> string
 concat\string x y = y
 
 (==)\string : string -> string -> bool
 (==)\string a b = contains a b
+
+my_func\string\bool : string -> bool -> string
+my_func\string\bool a b = a
+
+probe = my_func\string\bool "a" true
 
 main : bool
 main = "a" `concat` "b" == "ab"

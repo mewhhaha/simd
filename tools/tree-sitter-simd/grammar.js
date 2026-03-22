@@ -78,8 +78,16 @@ module.exports = grammar({
 
     family_head: ($) =>
       choice(
-        $.identifier,
-        seq("(", field("operator", $.prim_operator), ")"),
+        seq(
+          $.identifier,
+          repeat(seq("\\", field("param", $.identifier))),
+        ),
+        seq(
+          "(",
+          field("operator", $.prim_operator),
+          ")",
+          repeat(seq("\\", field("param", $.identifier))),
+        ),
       ),
 
     and_operator: (_) => "&&",

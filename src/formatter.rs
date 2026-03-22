@@ -88,9 +88,18 @@ fn format_import(import_decl: &ImportDecl) -> String {
 }
 
 fn format_family_decl(family: &FamilyDecl) -> String {
+    let params = if family.params.is_empty() {
+        String::new()
+    } else {
+        family.params.iter().fold(String::new(), |mut out, param| {
+            out.push('\\');
+            out.push_str(param);
+            out
+        })
+    };
     let head = match family.op {
-        Some(op) => format!("({})", format_prim_op(op)),
-        None => family.name.clone(),
+        Some(op) => format!("({}){}", format_prim_op(op), params),
+        None => format!("{}{}", family.name, params),
     };
     format!("family {} : {}", head, format_type(&family.ty))
 }
@@ -474,6 +483,29 @@ mod tests {
             formatted,
             "family (+) : i64 -> i64\nfamily Eq : i64 -> i64 -> i64\n"
         );
+    }
+
+    #[test]
+    fn formats_ordered_family_parameters() {
+        let source = "family my_func\\a\\b:a->b->a\n";
+        let formatted = format_source_text(source).expect("format should succeed");
+        assert_eq!(formatted, "family my_func\\a\\b : a -> b -> a\n");
+    }
+
+    #[test]
+    fn formats_operator_family_declaration_parameters() {
+        let source = "family (+)\\a : a -> a -> a\n";
+        let formatted = format_source_text(source).expect("format should succeed");
+        assert_eq!(formatted, "family (+)\\a : a -> a -> a\n");
+    }
+
+    #[test]
+    fn formats_family_declarations_roundtrip_with_explicit_params() {
+        let source = "family my_func\\a\\b : a -> b -> a\n";
+        let formatted = format_source_text(source).expect("format should succeed");
+        let parsed_original = parse_source(source).expect("original parses");
+        let parsed_formatted = parse_source(&formatted).expect("formatted parses");
+        assert_eq!(parsed_original, parsed_formatted);
     }
 
     #[test]

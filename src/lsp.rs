@@ -241,8 +241,30 @@ fn hover_for_position(source: &str, position: Position) -> Option<Hover> {
         .find(|family| family.name == ident.name)
     {
         let head = match family.op {
-            Some(op) => format!("({})", format_prim_op(op)),
-            None => family.name.clone(),
+            Some(op) => {
+                let params = if family.params.is_empty() {
+                    String::new()
+                } else {
+                    family
+                        .params
+                        .iter()
+                        .map(|param| format!("\\{}", param))
+                        .collect::<String>()
+                };
+                format!("({}){}", format_prim_op(op), params)
+            }
+            None => {
+                let params = if family.params.is_empty() {
+                    String::new()
+                } else {
+                    family
+                        .params
+                        .iter()
+                        .map(|param| format!("\\{}", param))
+                        .collect::<String>()
+                };
+                format!("{}{}", family.name, params)
+            }
         };
         return Some(Hover {
             contents: HoverContents::Markup(MarkupContent {
@@ -777,6 +799,16 @@ mod tests {
             panic!("expected markdown hover content");
         };
         assert!(content.value.contains("family Eq : i64 -> i64 -> i64"));
+    }
+
+    #[test]
+    fn hover_shows_family_declaration_with_parameters() {
+        let source = "family my_func\\a\\b : a -> b -> a\nmain : i64 -> i64\nmain x = x\n";
+        let hover = hover_for_position(source, Position::new(0, 8)).expect("hover");
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markdown hover content");
+        };
+        assert!(content.value.contains("family my_func\\a\\b : a -> b -> a"));
     }
 
     #[test]

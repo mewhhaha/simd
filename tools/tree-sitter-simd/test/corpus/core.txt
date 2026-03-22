@@ -380,3 +380,65 @@ operator instance declarations
                     (postfix_expr
                       (atom
                         (identifier)))))))))))))
+
+==================
+family declarations with ordered params
+==================
+
+family my_func\a\b : a -> b -> a
+
+---
+
+(source_file
+  (declaration
+    (family_decl
+      head: (family_head
+        (identifier)
+        param: (identifier)
+        param: (identifier))
+      type: (type
+        arg: (type_nonfun
+          (type_atom
+            (type_base
+              (identifier))))
+        result: (type
+          arg: (type_nonfun
+            (type_atom
+              (type_base
+                (identifier))))
+          result: (type
+            (type_nonfun
+              (type_atom
+                (type_base
+                  (identifier))))))))))
+
+==================
+operator-family declarations with ordered params
+==================
+
+family (+)\a\b : a -> b -> a
+
+---
+
+(source_file
+  (declaration
+    (family_decl
+      head: (family_head
+        operator: (prim_operator)
+        param: (identifier)
+        param: (identifier))
+      type: (type
+        arg: (type_nonfun
+          (type_atom
+            (type_base
+              (identifier))))
+        result: (type
+          arg: (type_nonfun
+            (type_atom
+              (type_base
+                (identifier))))
+          result: (type
+            (type_nonfun
+              (type_atom
+                (type_base
+                  (identifier))))))))))
