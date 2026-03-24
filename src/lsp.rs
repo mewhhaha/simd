@@ -603,6 +603,7 @@ fn collect_expr_local_types(expr: &TypedExpr, map: &mut BTreeMap<String, Vec<Typ
             }
         }
         TypedExprKind::FunctionRef { .. }
+        | TypedExprKind::ConstructorRef { .. }
         | TypedExprKind::Int(_, _)
         | TypedExprKind::Float(_, _)
         | TypedExprKind::Bool(_)

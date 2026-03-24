@@ -1119,6 +1119,11 @@ fn load_prepared_args(bound: &mut BoundPreparedRun, args: &[Value]) -> Result<()
                     "prepared execution does not support type witness runtime values",
                 ));
             }
+            Value::Enum(_) => {
+                return Err(SimdError::new(
+                    "prepared execution does not support enum host arguments yet",
+                ));
+            }
         }
     }
     Ok(())
@@ -1682,6 +1687,9 @@ fn specialize_checked_program_for_main(
 
     Ok(SpecializedProgram {
         checked: CheckedProgram {
+            enum_names: checked.enum_names.clone(),
+            enum_ctors: checked.enum_ctors.clone(),
+            enum_layouts: checked.enum_layouts.clone(),
             functions: built.into_values().collect(),
         },
         origins,
@@ -1808,7 +1816,8 @@ fn specialize_function_instance(
                         Pattern::Int(_)
                         | Pattern::Float(_)
                         | Pattern::Bool(_)
-                        | Pattern::Type(_) => {
+                        | Pattern::Type(_)
+                        | Pattern::Ctor(_, _) => {
                             return Err(SimdError::new(format!(
                                 "function-typed parameter {} in '{}' used a literal pattern",
                                 index, pending.base_name
@@ -1824,7 +1833,7 @@ fn specialize_function_instance(
                             }
                         }
                         Pattern::Wildcard | Pattern::Name(_) => {}
-                        Pattern::Int(_) | Pattern::Float(_) | Pattern::Bool(_) => {
+                        Pattern::Int(_) | Pattern::Float(_) | Pattern::Bool(_) | Pattern::Ctor(_, _) => {
                             return Err(SimdError::new(format!(
                                 "type witness parameter {} in '{}' used a non-Type literal pattern",
                                 index, pending.base_name
@@ -1910,6 +1919,9 @@ fn specialize_expr(
                 generic_instances,
                 &format!("fnref:{current_function}"),
             )?,
+        },
+        TypedExprKind::ConstructorRef { name } => {
+            TypedExprKind::ConstructorRef { name: name.clone() }
         },
         TypedExprKind::Int(value, prim) => match &ty {
             Type::Scalar(target_prim) if target_prim.is_int() => {
@@ -2194,6 +2206,7 @@ fn extract_known_function_binding(expr: &TypedExpr) -> Option<KnownFunctionBindi
             Some(binding)
         }
         TypedExprKind::Local(_)
+        | TypedExprKind::ConstructorRef { .. }
         | TypedExprKind::Lambda { .. }
         | TypedExprKind::Let { .. }
         | TypedExprKind::Record(_)
@@ -2357,7 +2370,11 @@ fn try_inline_lambda_result_call(
                     });
                 }
             }
-            Pattern::Int(_) | Pattern::Float(_) | Pattern::Bool(_) | Pattern::Type(_) => {
+            Pattern::Int(_)
+            | Pattern::Float(_)
+            | Pattern::Bool(_)
+            | Pattern::Type(_)
+            | Pattern::Ctor(_, _) => {
                 return Ok(None);
             }
         }
@@ -3030,7 +3047,12 @@ fn eliminate_non_escaping_lambdas_program(checked: &CheckedProgram) -> Result<Ch
             tailrec: function.tailrec.clone(),
         });
     }
-    Ok(CheckedProgram { functions })
+    Ok(CheckedProgram {
+        enum_names: checked.enum_names.clone(),
+        enum_ctors: checked.enum_ctors.clone(),
+        enum_layouts: checked.enum_layouts.clone(),
+        functions,
+    })
 }
 
 fn eliminate_non_escaping_lambdas_expr(
@@ -3042,6 +3064,9 @@ fn eliminate_non_escaping_lambdas_expr(
     let kind = match &expr.kind {
         TypedExprKind::Local(name) => TypedExprKind::Local(name.clone()),
         TypedExprKind::FunctionRef { name } => TypedExprKind::FunctionRef { name: name.clone() },
+        TypedExprKind::ConstructorRef { name } => {
+            TypedExprKind::ConstructorRef { name: name.clone() }
+        },
         TypedExprKind::Int(value, prim) => TypedExprKind::Int(*value, *prim),
         TypedExprKind::Float(value, prim) => TypedExprKind::Float(*value, *prim),
         TypedExprKind::Bool(value) => TypedExprKind::Bool(*value),
@@ -3257,6 +3282,7 @@ fn collect_free_locals(
             }
         }
         TypedExprKind::FunctionRef { .. }
+        | TypedExprKind::ConstructorRef { .. }
         | TypedExprKind::Int(_, _)
         | TypedExprKind::Float(_, _)
         | TypedExprKind::Bool(_)
@@ -3320,6 +3346,9 @@ fn rename_free_locals(
             }
         }
         TypedExprKind::FunctionRef { name } => TypedExprKind::FunctionRef { name: name.clone() },
+        TypedExprKind::ConstructorRef { name } => {
+            TypedExprKind::ConstructorRef { name: name.clone() }
+        },
         TypedExprKind::Int(value, prim) => TypedExprKind::Int(*value, *prim),
         TypedExprKind::Float(value, prim) => TypedExprKind::Float(*value, *prim),
         TypedExprKind::Bool(value) => TypedExprKind::Bool(*value),
@@ -3415,6 +3444,7 @@ fn collect_used_locals(expr: &TypedExpr, names: &mut BTreeSet<String>) {
             names.insert(name.clone());
         }
         TypedExprKind::FunctionRef { .. }
+        | TypedExprKind::ConstructorRef { .. }
         | TypedExprKind::Int(_, _)
         | TypedExprKind::Float(_, _)
         | TypedExprKind::Bool(_)
@@ -3488,7 +3518,12 @@ fn canonicalize_backend_higher_order_program(checked: &CheckedProgram) -> Result
             tailrec: function.tailrec.clone(),
         });
     }
-    Ok(CheckedProgram { functions })
+    Ok(CheckedProgram {
+        enum_names: checked.enum_names.clone(),
+        enum_ctors: checked.enum_ctors.clone(),
+        enum_layouts: checked.enum_layouts.clone(),
+        functions,
+    })
 }
 
 fn canonicalize_backend_higher_order_expr(
@@ -3500,6 +3535,9 @@ fn canonicalize_backend_higher_order_expr(
     let kind = match &expr.kind {
         TypedExprKind::Local(name) => TypedExprKind::Local(name.clone()),
         TypedExprKind::FunctionRef { name } => TypedExprKind::FunctionRef { name: name.clone() },
+        TypedExprKind::ConstructorRef { name } => {
+            TypedExprKind::ConstructorRef { name: name.clone() }
+        },
         TypedExprKind::Int(value, prim) => TypedExprKind::Int(*value, *prim),
         TypedExprKind::Float(value, prim) => TypedExprKind::Float(*value, *prim),
         TypedExprKind::Bool(value) => TypedExprKind::Bool(*value),
@@ -3629,6 +3667,7 @@ fn extract_known_function_template(
             name: name.clone(),
             bound_args: Vec::new(),
         }),
+        TypedExprKind::ConstructorRef { .. } => None,
         TypedExprKind::Local(name) => known_functions.get(name).cloned(),
         TypedExprKind::Apply { callee, arg } => {
             let mut template = extract_known_function_template(callee, known_functions)?;
@@ -3642,6 +3681,7 @@ fn extract_known_function_template(
 fn classify_function_value_expr_for_backend(expr: &TypedExpr) -> FunctionValueClass {
     match &expr.kind {
         TypedExprKind::FunctionRef { .. } => FunctionValueClass::KnownFn,
+        TypedExprKind::ConstructorRef { .. } => FunctionValueClass::EscapingUnknown,
         TypedExprKind::Lambda { .. } => FunctionValueClass::KnownLambda,
         TypedExprKind::Local(_)
         | TypedExprKind::Apply { .. }
@@ -3999,6 +4039,7 @@ fn collect_higher_order_expr_counts(
 ) {
     match &expr.kind {
         TypedExprKind::FunctionRef { .. } => *known_fn_values += 1,
+        TypedExprKind::ConstructorRef { .. } => *escaping_unknown_values += 1,
         TypedExprKind::Lambda { body, .. } => {
             *known_lambda_values += 1;
             collect_higher_order_expr_counts(
@@ -4090,9 +4131,29 @@ fn collect_higher_order_expr_counts(
     }
 }
 
+fn typed_expr_apply_chain_root<'a>(expr: &'a TypedExpr) -> (&'a TypedExpr, Vec<&'a TypedExpr>) {
+    let mut head = expr;
+    let mut args = Vec::<&TypedExpr>::new();
+    while let TypedExprKind::Apply { callee, arg } = &head.kind {
+        args.push(arg.as_ref());
+        head = callee.as_ref();
+    }
+    args.reverse();
+    (head, args)
+}
+
 fn typed_expr_contains_lambda_or_apply(expr: &TypedExpr) -> bool {
     match &expr.kind {
-        TypedExprKind::Lambda { .. } | TypedExprKind::Apply { .. } => true,
+        TypedExprKind::Lambda { .. } => true,
+        TypedExprKind::Apply { .. } => {
+            let (head, args) = typed_expr_apply_chain_root(expr);
+            if matches!(head.kind, TypedExprKind::ConstructorRef { .. }) {
+                args.iter()
+                    .any(|arg| typed_expr_contains_lambda_or_apply(arg))
+            } else {
+                true
+            }
+        }
         TypedExprKind::Let { bindings, body } => {
             bindings
                 .iter()
@@ -4110,6 +4171,7 @@ fn typed_expr_contains_lambda_or_apply(expr: &TypedExpr) -> bool {
             .any(|arg| typed_expr_contains_lambda_or_apply(&arg.expr)),
         TypedExprKind::Local(_)
         | TypedExprKind::FunctionRef { .. }
+        | TypedExprKind::ConstructorRef { .. }
         | TypedExprKind::Int(_, _)
         | TypedExprKind::Float(_, _)
         | TypedExprKind::Bool(_)
@@ -4142,6 +4204,7 @@ fn typed_expr_contains_fun_local(expr: &TypedExpr) -> bool {
         TypedExprKind::Lambda { body, .. } => typed_expr_contains_fun_local(body),
         TypedExprKind::Local(_)
         | TypedExprKind::FunctionRef { .. }
+        | TypedExprKind::ConstructorRef { .. }
         | TypedExprKind::Int(_, _)
         | TypedExprKind::Float(_, _)
         | TypedExprKind::Bool(_)
@@ -4290,7 +4353,13 @@ fn compile_wasm_artifact_checked(
                     vector_unroll: 0,
                     fallback_reason: None,
                 });
-                compile_scalar_function(lowered, function, &scalar_indices, &signatures)?
+                compile_scalar_function(
+                    lowered,
+                    function,
+                    &plan.checked.enum_ctors,
+                    &scalar_indices,
+                    &signatures,
+                )?
             }
             LoweredKind::Kernel { .. } => {
                 let compiled = compile_kernel_entry(
@@ -5230,28 +5299,18 @@ fn compile_grouped_kernel_function(
     }
 
     let scalar_locals = kernel_scalar_local_map(&reference.clauses, &abi_params, &lane_locals);
-    let param_prims = reference_clause
-        .patterns
-        .iter()
-        .map(|pattern| match &pattern.ty {
-            Type::Scalar(prim) => Ok(*prim),
-            other => Err(SimdError::new(format!(
-                "grouped kernel clause pattern has non-scalar lowered type {:?}",
-                other
-            ))),
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let empty_enum_ctors = BTreeMap::<String, EnumCtorInfo>::new();
 
     for clause_index in 0..reference.clauses.len() {
         let reference_clause = &reference.clauses[clause_index];
         let clause_key = reference_clause as *const _ as usize;
         let locals = scalar_locals.get(&clause_key).cloned().unwrap_or_default();
-        if clause_has_condition(&reference_clause.patterns) {
+        if clause_has_condition(&reference_clause.patterns, &empty_enum_ctors) {
             emit_matching_if(
                 &mut function,
                 &reference_clause.patterns,
-                &param_prims,
-                Some(&locals),
+                &empty_enum_ctors,
+                None,
             )?;
             for ((leaf, output), output_ptr_loop_local) in prepared_leaves
                 .iter()
@@ -5265,6 +5324,8 @@ fn compile_grouped_kernel_function(
                     &locals,
                     scalar_indices,
                     signatures,
+                    &empty_enum_ctors,
+                    None,
                     &cleanup_hoisted_locals,
                     &cleanup_inline_bindings,
                 )?;
@@ -5301,6 +5362,8 @@ fn compile_grouped_kernel_function(
                     &locals,
                     scalar_indices,
                     signatures,
+                    &empty_enum_ctors,
+                    None,
                     &cleanup_hoisted_locals,
                     &cleanup_inline_bindings,
                 )?;
@@ -5361,6 +5424,7 @@ fn vectorizable_grouped_kernel_clause<'a>(
     leaves: &'a [PreparedGroupedLeaf],
     params: &'a [KernelParam],
 ) -> Option<VectorizableGroupedKernel<'a>> {
+    let empty_enum_ctors = BTreeMap::<String, EnumCtorInfo>::new();
     let reference = leaves.first()?;
     if reference.clauses.is_empty() {
         return None;
@@ -5371,7 +5435,7 @@ fn vectorizable_grouped_kernel_clause<'a>(
     {
         return None;
     }
-    if clause_has_condition(&reference.clauses.last()?.patterns) {
+    if clause_has_condition(&reference.clauses.last()?.patterns, &empty_enum_ctors) {
         return None;
     }
 
@@ -5420,6 +5484,15 @@ fn inline_grouped_kernel_expr(
 ) -> Result<IrExpr> {
     match &expr.kind {
         IrExprKind::Local(..) | IrExprKind::Int(..) | IrExprKind::Float(..) => Ok(expr.clone()),
+        IrExprKind::Record(..) => Err(SimdError::new(
+            "Wasm grouped-kernel inlining does not yet support record IR",
+        )),
+        IrExprKind::EnumCtor { .. }
+        | IrExprKind::EnumTag { .. }
+        | IrExprKind::EnumChildBySlot { .. }
+        | IrExprKind::EnumNonRecField { .. } => Err(SimdError::new(
+            "Wasm grouped-kernel inlining does not yet support enum IR",
+        )),
         IrExprKind::Let { bindings, body } => Ok(IrExpr {
             ty: expr.ty.clone(),
             kind: IrExprKind::Let {
@@ -5524,6 +5597,13 @@ fn try_inline_grouped_leaf_call(
 fn ir_expr_node_count(expr: &IrExpr) -> usize {
     match &expr.kind {
         IrExprKind::Local(_) | IrExprKind::Int(_, _) | IrExprKind::Float(_, _) => 1,
+        IrExprKind::Record(fields) => 1 + fields.values().map(ir_expr_node_count).sum::<usize>(),
+        IrExprKind::EnumCtor { args, .. } => {
+            1 + args.iter().map(ir_expr_node_count).sum::<usize>()
+        }
+        IrExprKind::EnumTag { value }
+        | IrExprKind::EnumChildBySlot { value, .. }
+        | IrExprKind::EnumNonRecField { value, .. } => 1 + ir_expr_node_count(value),
         IrExprKind::Let { bindings, body } => {
             1 + bindings
                 .iter()
@@ -5538,6 +5618,11 @@ fn ir_expr_node_count(expr: &IrExpr) -> usize {
 fn expr_contains_non_scalar_calls(expr: &IrExpr, scalar_indices: &BTreeMap<String, u32>) -> bool {
     match &expr.kind {
         IrExprKind::Local(_) | IrExprKind::Int(_, _) | IrExprKind::Float(_, _) => false,
+        IrExprKind::Record(_) => true,
+        IrExprKind::EnumCtor { .. }
+        | IrExprKind::EnumTag { .. }
+        | IrExprKind::EnumChildBySlot { .. }
+        | IrExprKind::EnumNonRecField { .. } => true,
         IrExprKind::Let { bindings, body } => {
             bindings
                 .iter()
@@ -5566,6 +5651,47 @@ fn substitute_ir_expr(expr: &IrExpr, substitutions: &BTreeMap<String, IrExpr>) -
             .cloned()
             .unwrap_or_else(|| expr.clone()),
         IrExprKind::Int(_, _) | IrExprKind::Float(_, _) => expr.clone(),
+        IrExprKind::Record(fields) => IrExpr {
+            ty: expr.ty.clone(),
+            kind: IrExprKind::Record(
+                fields
+                    .iter()
+                    .map(|(name, field)| (name.clone(), substitute_ir_expr(field, substitutions)))
+                    .collect(),
+            ),
+        },
+        IrExprKind::EnumCtor { ctor, args } => IrExpr {
+            ty: expr.ty.clone(),
+            kind: IrExprKind::EnumCtor {
+                ctor: ctor.clone(),
+                args: args
+                    .iter()
+                    .map(|arg| substitute_ir_expr(arg, substitutions))
+                    .collect(),
+            },
+        },
+        IrExprKind::EnumTag { value } => IrExpr {
+            ty: expr.ty.clone(),
+            kind: IrExprKind::EnumTag {
+                value: Box::new(substitute_ir_expr(value, substitutions)),
+            },
+        },
+        IrExprKind::EnumChildBySlot { value, ctor, slot } => IrExpr {
+            ty: expr.ty.clone(),
+            kind: IrExprKind::EnumChildBySlot {
+                value: Box::new(substitute_ir_expr(value, substitutions)),
+                ctor: ctor.clone(),
+                slot: *slot,
+            },
+        },
+        IrExprKind::EnumNonRecField { value, ctor, field } => IrExpr {
+            ty: expr.ty.clone(),
+            kind: IrExprKind::EnumNonRecField {
+                value: Box::new(substitute_ir_expr(value, substitutions)),
+                ctor: ctor.clone(),
+                field: *field,
+            },
+        },
         IrExprKind::Let { bindings, body } => {
             let mut extended = substitutions.clone();
             for binding in bindings {
@@ -5600,6 +5726,7 @@ fn scalar_signature(function: &CheckedFunction) -> Result<(Vec<ValType>, Option<
         .into_iter()
         .map(|ty| match ty {
             Type::Scalar(prim) => Ok(wasm_val_type(prim)),
+            Type::Named(name, args) if is_wasm_enum_named_type(&name, &args) => Ok(ValType::I32),
             Type::Record(_) => Err(SimdError::new(format!(
                 "scalar Wasm function '{}' cannot accept record parameters",
                 function.name
@@ -5616,6 +5743,7 @@ fn scalar_signature(function: &CheckedFunction) -> Result<(Vec<ValType>, Option<
         .collect::<Result<Vec<_>>>()?;
     let result = match result {
         Type::Scalar(prim) => Some(wasm_val_type(prim)),
+        Type::Named(name, args) if is_wasm_enum_named_type(&name, &args) => Some(ValType::I32),
         Type::Record(_) => {
             return Err(SimdError::new(format!(
                 "scalar Wasm function '{}' cannot return records",
@@ -5650,6 +5778,9 @@ fn entry_signature(function: &CheckedFunction) -> Result<(Vec<ValType>, Option<V
                 lowered.push(ValType::I32);
                 lowered.push(ValType::I32);
             }
+            Type::Named(name, args) if is_wasm_enum_named_type(&name, &args) => {
+                lowered.push(ValType::I32);
+            }
             Type::TypeToken(_) => {
                 return Err(SimdError::new(
                     "Wasm backend does not support Type witness entry parameters",
@@ -5674,6 +5805,7 @@ fn entry_signature(function: &CheckedFunction) -> Result<(Vec<ValType>, Option<V
     }
     let result_ty = match result {
         Type::Scalar(prim) => Some(wasm_val_type(prim)),
+        Type::Named(name, args) if is_wasm_enum_named_type(&name, &args) => Some(ValType::I32),
         Type::Bulk(_, _) => {
             if saw_bulk.is_none() {
                 return Err(SimdError::new(
@@ -5720,12 +5852,14 @@ fn wasm_val_type(prim: Prim) -> ValType {
 fn compile_scalar_function(
     lowered: &LoweredFunction,
     checked: &CheckedFunction,
+    enum_ctors: &BTreeMap<String, EnumCtorInfo>,
     scalar_indices: &BTreeMap<String, u32>,
     signatures: &BTreeMap<String, &CheckedFunction>,
 ) -> Result<Function> {
     let (param_types, result_ty) = checked.signature.ty.fun_parts();
-    let _result_prim = match result_ty {
-        Type::Scalar(prim) => prim,
+    let result_val_type = match result_ty {
+        Type::Scalar(prim) => wasm_val_type(prim),
+        Type::Named(name, args) if is_wasm_enum_named_type(&name, &args) => ValType::I32,
         other => {
             return Err(SimdError::new(format!(
                 "scalar function '{}' has unsupported result {:?}",
@@ -5734,10 +5868,12 @@ fn compile_scalar_function(
         }
     };
     let mut locals = Vec::<(u32, ValType)>::new();
+    let mut next_local = param_types.len() as u32;
     let temp_locals = if lowered.tail_loop.is_some() {
         let mut temp = Vec::new();
-        for prim in param_types.iter().map(|ty| match ty {
-            Type::Scalar(prim) => Ok(*prim),
+        for val_type in param_types.iter().map(|ty| match ty {
+            Type::Scalar(prim) => Ok(wasm_val_type(*prim)),
+            Type::Named(name, args) if is_wasm_enum_named_type(name, args) => Ok(ValType::I32),
             Type::Record(_) => Err(SimdError::new(format!(
                 "scalar function '{}' has unsupported record parameters",
                 checked.name
@@ -5747,42 +5883,75 @@ fn compile_scalar_function(
                 checked.name, other
             ))),
         }) {
-            let prim = prim?;
-            temp.push((param_types.len() + temp.len()) as u32);
-            locals.push((1, wasm_val_type(prim)));
+            let val_type = val_type?;
+            temp.push(next_local);
+            next_local += 1;
+            locals.push((1, val_type));
         }
         temp
     } else {
         Vec::new()
     };
     let result_local = if lowered.tail_loop.is_some() {
-        let local = (param_types.len() + temp_locals.len()) as u32;
-        locals.push((1, wasm_val_type(_result_prim)));
+        let local = next_local;
+        next_local += 1;
+        locals.push((1, result_val_type));
         Some(local)
     } else {
         None
     };
-    let mut function = Function::new(locals);
-    let local_map = checked
-        .signature
-        .ty
-        .fun_parts()
-        .0
-        .into_iter()
-        .enumerate()
-        .map(|(index, ty)| match ty {
-            Type::Scalar(prim) => Ok((index as u32, prim)),
-            Type::Record(_) => Err(SimdError::new(format!(
-                "scalar function '{}' has unsupported record parameters",
+    let enum_ptr_local = next_local;
+    next_local += 1;
+    locals.push((1, ValType::I32));
+    let enum_base_local = next_local;
+    next_local += 1;
+    locals.push((1, ValType::I32));
+    let enum_save_sp_local = next_local;
+    next_local += 1;
+    locals.push((1, ValType::I32));
+    let enum_state = EnumWasmState {
+        ptr_local: enum_ptr_local,
+        base_local: enum_base_local,
+        save_sp_local: enum_save_sp_local,
+    };
+
+    let mut clause_locals = BTreeMap::<usize, BTreeMap<String, u32>>::new();
+    let mut shared_named_locals = BTreeMap::<String, (u32, Type)>::new();
+    match (&lowered.kind, &lowered.tail_loop) {
+        (LoweredKind::Scalar { clauses: _ }, Some(tail_loop)) => {
+            for clause in &tail_loop.clauses {
+                let map = build_clause_local_map(
+                    &clause.patterns,
+                    &mut locals,
+                    &mut next_local,
+                    &mut shared_named_locals,
+                    enum_ctors,
+                )?;
+                clause_locals.insert(clause as *const _ as usize, map);
+            }
+        }
+        (LoweredKind::Scalar { clauses }, None) => {
+            for clause in clauses {
+                let map = build_clause_local_map(
+                    &clause.patterns,
+                    &mut locals,
+                    &mut next_local,
+                    &mut shared_named_locals,
+                    enum_ctors,
+                )?;
+                clause_locals.insert(clause as *const _ as usize, map);
+            }
+        }
+        (LoweredKind::Kernel { .. }, _) => {
+            return Err(SimdError::new(format!(
+                "compile_scalar_function received kernel '{}'",
                 checked.name
-            ))),
-            other => Err(SimdError::new(format!(
-                "scalar function '{}' has unsupported parameter {:?}",
-                checked.name, other
-            ))),
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let param_prims = local_map.iter().map(|(_, prim)| *prim).collect::<Vec<_>>();
+            )));
+        }
+    }
+    let mut function = Function::new(locals);
+    function.instruction(&Instruction::I32Const(ENUM_SAVE_STACK_START));
+    function.instruction(&Instruction::LocalSet(enum_state.save_sp_local));
 
     match (&lowered.kind, &lowered.tail_loop) {
         (LoweredKind::Scalar { clauses: _ }, Some(tail_loop)) => {
@@ -5791,16 +5960,34 @@ fn compile_scalar_function(
             function.instruction(&Instruction::Block(BlockType::Empty));
             function.instruction(&Instruction::Loop(BlockType::Empty));
             for clause in &tail_loop.clauses {
-                emit_matching_if(&mut function, &clause.patterns, &param_prims, None)?;
+                let locals = clause_locals
+                    .get(&(clause as *const _ as usize))
+                    .cloned()
+                    .unwrap_or_default();
+                emit_matching_if(
+                    &mut function,
+                    &clause.patterns,
+                    enum_ctors,
+                    Some(enum_state),
+                )?;
+                emit_clause_bindings(
+                    &mut function,
+                    &clause.patterns,
+                    &locals,
+                    enum_ctors,
+                    Some(enum_state),
+                )?;
                 match &clause.action {
                     TailAction::Continue { args } => {
                         for (temp_local, arg) in temp_locals.iter().zip(args) {
                             compile_scalar_ir_expr(
                                 &mut function,
                                 arg,
-                                &pattern_local_map(&clause.patterns),
+                                &locals,
                                 scalar_indices,
                                 signatures,
+                                enum_ctors,
+                                Some(enum_state),
                             )?;
                             function.instruction(&Instruction::LocalSet(*temp_local));
                         }
@@ -5814,9 +6001,11 @@ fn compile_scalar_function(
                         emit_tail_position_scalar_return(
                             &mut function,
                             expr,
-                            &pattern_local_map(&clause.patterns),
+                            &locals,
                             scalar_indices,
                             signatures,
+                            enum_ctors,
+                            Some(enum_state),
                         )?;
                     }
                 }
@@ -5829,24 +6018,50 @@ fn compile_scalar_function(
         }
         (LoweredKind::Scalar { clauses }, None) => {
             for clause in clauses {
-                let locals = pattern_local_map(&clause.patterns);
-                if clause_has_condition(&clause.patterns) {
-                    emit_matching_if(&mut function, &clause.patterns, &param_prims, None)?;
+                let locals = clause_locals
+                    .get(&(clause as *const _ as usize))
+                    .cloned()
+                    .unwrap_or_default();
+                if clause_has_condition(&clause.patterns, enum_ctors) {
+                    emit_matching_if(
+                        &mut function,
+                        &clause.patterns,
+                        enum_ctors,
+                        Some(enum_state),
+                    )?;
+                    emit_clause_bindings(
+                        &mut function,
+                        &clause.patterns,
+                        &locals,
+                        enum_ctors,
+                        Some(enum_state),
+                    )?;
                     emit_tail_position_scalar_return(
                         &mut function,
                         &clause.body,
                         &locals,
                         scalar_indices,
                         signatures,
+                        enum_ctors,
+                        Some(enum_state),
                     )?;
                     function.instruction(&Instruction::End);
                 } else {
+                    emit_clause_bindings(
+                        &mut function,
+                        &clause.patterns,
+                        &locals,
+                        enum_ctors,
+                        Some(enum_state),
+                    )?;
                     emit_tail_position_scalar_return(
                         &mut function,
                         &clause.body,
                         &locals,
                         scalar_indices,
                         signatures,
+                        enum_ctors,
+                        Some(enum_state),
                     )?;
                     break;
                 }
@@ -6349,25 +6564,16 @@ fn compile_kernel_entry(
     }
 
     let scalar_locals = kernel_scalar_local_map(&clauses, &abi_params, &lane_locals);
+    let empty_enum_ctors = BTreeMap::<String, EnumCtorInfo>::new();
     for clause in &clauses {
         let clause_key = clause as *const _ as usize;
         let locals = scalar_locals.get(&clause_key).cloned().unwrap_or_default();
-        if clause_has_condition(&clause.patterns) {
+        if clause_has_condition(&clause.patterns, &empty_enum_ctors) {
             emit_matching_if(
                 &mut function,
                 &clause.patterns,
-                &clause
-                    .patterns
-                    .iter()
-                    .map(|pattern| match &pattern.ty {
-                        Type::Scalar(prim) => Ok(*prim),
-                        other => Err(SimdError::new(format!(
-                            "kernel clause pattern has non-scalar lowered type {:?}",
-                            other
-                        ))),
-                    })
-                    .collect::<Result<Vec<_>>>()?,
-                Some(&locals),
+                &empty_enum_ctors,
+                None,
             )?;
             function.instruction(&Instruction::LocalGet(output_ptr_loop_local));
             compile_scalar_ir_expr_with_hoists(
@@ -6376,6 +6582,8 @@ fn compile_kernel_entry(
                 &locals,
                 scalar_indices,
                 signatures,
+                &empty_enum_ctors,
+                None,
                 &cleanup_hoisted_locals,
                 &cleanup_inline_bindings,
             )?;
@@ -6404,6 +6612,8 @@ fn compile_kernel_entry(
                 &locals,
                 scalar_indices,
                 signatures,
+                &empty_enum_ctors,
+                None,
                 &cleanup_hoisted_locals,
                 &cleanup_inline_bindings,
             )?;
@@ -6465,6 +6675,24 @@ enum HoistExprKey {
     Local(String),
     Int(i64, Prim),
     Float(u64, Prim),
+    Record(Vec<(String, HoistExprKey)>),
+    EnumCtor {
+        ctor: String,
+        args: Vec<HoistExprKey>,
+    },
+    EnumTag {
+        value: Box<HoistExprKey>,
+    },
+    EnumChildBySlot {
+        value: Box<HoistExprKey>,
+        ctor: String,
+        slot: usize,
+    },
+    EnumNonRecField {
+        value: Box<HoistExprKey>,
+        ctor: String,
+        field: usize,
+    },
     Let {
         bindings: Vec<(String, HoistExprKey)>,
         body: Box<HoistExprKey>,
@@ -6583,6 +6811,25 @@ fn collect_hoisted_expr<'a>(
     let invariant = match &expr.kind {
         IrExprKind::Local(name) => !variant_locals.contains(name),
         IrExprKind::Int(_, _) | IrExprKind::Float(_, _) => true,
+        IrExprKind::Record(fields) => {
+            let mut invariant = true;
+            for field in fields.values() {
+                invariant &= collect_hoisted_expr(field, variant_locals, mode, seen, out);
+            }
+            invariant
+        }
+        IrExprKind::EnumCtor { args, .. } => {
+            let mut invariant = true;
+            for arg in args {
+                invariant &= collect_hoisted_expr(arg, variant_locals, mode, seen, out);
+            }
+            invariant
+        }
+        IrExprKind::EnumTag { value }
+        | IrExprKind::EnumChildBySlot { value, .. }
+        | IrExprKind::EnumNonRecField { value, .. } => {
+            collect_hoisted_expr(value, variant_locals, mode, seen, out)
+        }
         IrExprKind::Let { bindings, body } => {
             let mut invariant = true;
             for binding in bindings {
@@ -6626,6 +6873,29 @@ fn hoist_expr_key(expr: &IrExpr) -> HoistExprKey {
         IrExprKind::Local(name) => HoistExprKey::Local(name.clone()),
         IrExprKind::Int(value, prim) => HoistExprKey::Int(*value, *prim),
         IrExprKind::Float(value, prim) => HoistExprKey::Float(value.to_bits(), *prim),
+        IrExprKind::Record(fields) => HoistExprKey::Record(
+            fields
+                .iter()
+                .map(|(name, field)| (name.clone(), hoist_expr_key(field)))
+                .collect(),
+        ),
+        IrExprKind::EnumCtor { ctor, args } => HoistExprKey::EnumCtor {
+            ctor: ctor.clone(),
+            args: args.iter().map(hoist_expr_key).collect(),
+        },
+        IrExprKind::EnumTag { value } => HoistExprKey::EnumTag {
+            value: Box::new(hoist_expr_key(value)),
+        },
+        IrExprKind::EnumChildBySlot { value, ctor, slot } => HoistExprKey::EnumChildBySlot {
+            value: Box::new(hoist_expr_key(value)),
+            ctor: ctor.clone(),
+            slot: *slot,
+        },
+        IrExprKind::EnumNonRecField { value, ctor, field } => HoistExprKey::EnumNonRecField {
+            value: Box::new(hoist_expr_key(value)),
+            ctor: ctor.clone(),
+            field: *field,
+        },
         IrExprKind::Let { bindings, body } => HoistExprKey::Let {
             bindings: bindings
                 .iter()
@@ -6706,6 +6976,7 @@ fn emit_scalar_hoists(
 ) -> Result<()> {
     let mut emitted = BTreeMap::<HoistExprKey, u32>::new();
     let inline_bindings = BTreeMap::<String, IrExpr>::new();
+    let empty_enum_ctors = BTreeMap::<String, EnumCtorInfo>::new();
     for hoisted_expr in hoisted {
         let local = *hoisted_locals
             .get(&hoisted_expr.key)
@@ -6716,6 +6987,8 @@ fn emit_scalar_hoists(
             locals,
             scalar_indices,
             signatures,
+            &empty_enum_ctors,
+            None,
             &emitted,
             &inline_bindings,
         )?;
@@ -6725,37 +6998,289 @@ fn emit_scalar_hoists(
     Ok(())
 }
 
-fn clause_has_condition(patterns: &[TypedPattern]) -> bool {
-    patterns.iter().any(|pattern| {
-        matches!(
-            pattern.pattern,
-            Pattern::Int(_) | Pattern::Float(_) | Pattern::Bool(_)
-        )
+#[derive(Debug, Clone, Copy)]
+struct EnumWasmState {
+    ptr_local: u32,
+    base_local: u32,
+    save_sp_local: u32,
+}
+
+const ENUM_HEAP_PTR_ADDR: u32 = 0;
+const ENUM_HEAP_START: i32 = 4096;
+const ENUM_SAVE_STACK_START: i32 = 2048;
+const ENUM_NODE_HEADER_BYTES: i32 = 8;
+const ENUM_FIELD_SLOT_BYTES: i32 = 8;
+
+fn enum_field_slot_offset(field_index: usize) -> Result<u64> {
+    let index = u64::try_from(field_index).map_err(|_| {
+        SimdError::new(format!(
+            "enum field index {} does not fit Wasm addressing",
+            field_index
+        ))
+    })?;
+    Ok(8 + index * 8)
+}
+
+fn is_wasm_direct_self_recursive_field(field_ty: &Type, ctor: &EnumCtorInfo) -> bool {
+    let Type::Named(name, args) = field_ty else {
+        return false;
+    };
+    if name != &ctor.enum_name || args.len() != ctor.enum_params.len() {
+        return false;
+    }
+    args.iter().zip(&ctor.enum_params).all(|(arg, param)| {
+        matches!(arg, Type::Var(var) if var == param)
     })
 }
 
-fn pattern_local_map(patterns: &[TypedPattern]) -> BTreeMap<String, u32> {
-    patterns
+fn enum_ctor_recursive_field_indices(ctor: &EnumCtorInfo) -> Vec<usize> {
+    ctor.fields
         .iter()
         .enumerate()
-        .filter_map(|(index, pattern)| match &pattern.pattern {
-            Pattern::Name(name) => Some((name.clone(), index as u32)),
-            Pattern::Wildcard
-            | Pattern::Int(_)
-            | Pattern::Float(_)
-            | Pattern::Bool(_)
-            | Pattern::Type(_) => None,
+        .filter_map(|(index, field)| {
+            if is_wasm_direct_self_recursive_field(field, ctor) {
+                Some(index)
+            } else {
+                None
+            }
         })
         .collect()
+}
+
+fn enum_ctor_non_recursive_field_indices(ctor: &EnumCtorInfo) -> Vec<usize> {
+    ctor.fields
+        .iter()
+        .enumerate()
+        .filter_map(|(index, field)| {
+            if is_wasm_direct_self_recursive_field(field, ctor) {
+                None
+            } else {
+                Some(index)
+            }
+        })
+        .collect()
+}
+
+fn emit_enum_alloc(function: &mut Function, enum_state: EnumWasmState, bytes: i32) {
+    function.instruction(&Instruction::I32Const(ENUM_HEAP_PTR_ADDR as i32));
+    function.instruction(&Instruction::I32Load(memarg(0, 2)));
+    function.instruction(&Instruction::LocalSet(enum_state.ptr_local));
+    function.instruction(&Instruction::LocalGet(enum_state.ptr_local));
+    function.instruction(&Instruction::I32Eqz);
+    function.instruction(&Instruction::If(BlockType::Empty));
+    function.instruction(&Instruction::I32Const(ENUM_HEAP_START));
+    function.instruction(&Instruction::LocalSet(enum_state.ptr_local));
+    function.instruction(&Instruction::End);
+    function.instruction(&Instruction::I32Const(ENUM_HEAP_PTR_ADDR as i32));
+    function.instruction(&Instruction::LocalGet(enum_state.ptr_local));
+    function.instruction(&Instruction::I32Const(bytes));
+    function.instruction(&Instruction::I32Add);
+    function.instruction(&Instruction::I32Store(memarg(0, 2)));
+}
+
+fn emit_enum_field_store(
+    function: &mut Function,
+    field_index: usize,
+    field_ty: &Type,
+) -> Result<()> {
+    let offset = enum_field_slot_offset(field_index)?;
+    match field_ty {
+        Type::Scalar(Prim::I32) => {
+            function.instruction(&Instruction::I32Store(memarg(offset, 2)));
+        }
+        Type::Scalar(Prim::I64) => {
+            function.instruction(&Instruction::I64Store(memarg(offset, 3)));
+        }
+        Type::Scalar(Prim::F32) => {
+            function.instruction(&Instruction::F32Store(memarg(offset, 2)));
+        }
+        Type::Scalar(Prim::F64) => {
+            function.instruction(&Instruction::F64Store(memarg(offset, 3)));
+        }
+        Type::Named(name, args) if is_wasm_enum_named_type(name, args) => {
+            function.instruction(&Instruction::I32Store(memarg(offset, 2)));
+        }
+        other => {
+            return Err(SimdError::new(format!(
+                "Wasm enum field store does not support field type {:?}",
+                other
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn emit_enum_field_load(
+    function: &mut Function,
+    value_local: u32,
+    field_index: usize,
+    field_ty: &Type,
+) -> Result<()> {
+    let offset = enum_field_slot_offset(field_index)?;
+    function.instruction(&Instruction::LocalGet(value_local));
+    match field_ty {
+        Type::Scalar(Prim::I32) => {
+            function.instruction(&Instruction::I32Load(memarg(offset, 2)));
+        }
+        Type::Scalar(Prim::I64) => {
+            function.instruction(&Instruction::I64Load(memarg(offset, 3)));
+        }
+        Type::Scalar(Prim::F32) => {
+            function.instruction(&Instruction::F32Load(memarg(offset, 2)));
+        }
+        Type::Scalar(Prim::F64) => {
+            function.instruction(&Instruction::F64Load(memarg(offset, 3)));
+        }
+        Type::Named(name, args) if is_wasm_enum_named_type(name, args) => {
+            function.instruction(&Instruction::I32Load(memarg(offset, 2)));
+        }
+        other => {
+            return Err(SimdError::new(format!(
+                "Wasm enum field load does not support field type {:?}",
+                other
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn emit_enum_field_as_condition_value(
+    function: &mut Function,
+    value_local: u32,
+    field_index: usize,
+    field_ty: &Type,
+) -> Result<()> {
+    emit_enum_field_load(function, value_local, field_index, field_ty)
+}
+
+fn is_pattern_constructor_name(name: &str, enum_ctors: &BTreeMap<String, EnumCtorInfo>) -> bool {
+    is_constructor_name(name) && enum_ctors.contains_key(name)
+}
+
+fn wasm_local_val_type_for_pattern_binding(ty: &Type) -> Result<ValType> {
+    match ty {
+        Type::Scalar(prim) => Ok(wasm_val_type(*prim)),
+        Type::Named(name, args) if is_wasm_enum_named_type(name, args) => Ok(ValType::I32),
+        other => Err(SimdError::new(format!(
+            "Wasm scalar clause local binding has unsupported type {:?}",
+            other
+        ))),
+    }
+}
+
+fn collect_pattern_binding_types(
+    pattern: &Pattern,
+    ty: &Type,
+    enum_ctors: &BTreeMap<String, EnumCtorInfo>,
+    out: &mut Vec<(String, Type)>,
+) -> Result<()> {
+    match pattern {
+        Pattern::Name(name) => {
+            if !is_pattern_constructor_name(name, enum_ctors) && name != "_" {
+                out.push((name.clone(), ty.clone()));
+            }
+            Ok(())
+        }
+        Pattern::Ctor(name, subpatterns) => {
+            let ctor = enum_ctors
+                .get(name)
+                .ok_or_else(|| SimdError::new(format!("unknown constructor '{}'", name)))?;
+            let Type::Named(enum_name, enum_args) = ty else {
+                return Err(SimdError::new(format!(
+                    "constructor pattern '{}' requires enum type, found {:?}",
+                    name, ty
+                )));
+            };
+            if enum_name != &ctor.enum_name {
+                return Err(SimdError::new(format!(
+                    "constructor '{}' belongs to enum '{}', not '{}'",
+                    name, ctor.enum_name, enum_name
+                )));
+            }
+            let subst = ctor
+                .enum_params
+                .iter()
+                .cloned()
+                .zip(enum_args.iter().cloned())
+                .collect::<BTreeMap<_, _>>();
+            for (subpattern, field_ty) in subpatterns.iter().zip(&ctor.fields) {
+                let field_ty = apply_type_subst(field_ty, &subst);
+                collect_pattern_binding_types(subpattern, &field_ty, enum_ctors, out)?;
+            }
+            Ok(())
+        }
+        Pattern::Wildcard | Pattern::Int(_) | Pattern::Float(_) | Pattern::Bool(_) | Pattern::Type(_) => {
+            Ok(())
+        }
+    }
+}
+
+fn clause_has_condition(
+    patterns: &[TypedPattern],
+    enum_ctors: &BTreeMap<String, EnumCtorInfo>,
+) -> bool {
+    patterns.iter().any(|pattern| {
+        matches!(pattern.pattern, Pattern::Int(_) | Pattern::Float(_) | Pattern::Bool(_) | Pattern::Ctor(_, _))
+            || matches!(&pattern.pattern, Pattern::Name(name) if is_pattern_constructor_name(name, enum_ctors))
+    })
+}
+
+fn build_clause_local_map(
+    patterns: &[TypedPattern],
+    locals: &mut Vec<(u32, ValType)>,
+    next_local: &mut u32,
+    shared_named_locals: &mut BTreeMap<String, (u32, Type)>,
+    enum_ctors: &BTreeMap<String, EnumCtorInfo>,
+) -> Result<BTreeMap<String, u32>> {
+    let mut map = BTreeMap::<String, u32>::new();
+    for (index, typed_pattern) in patterns.iter().enumerate() {
+        if let Pattern::Name(name) = &typed_pattern.pattern
+            && !is_pattern_constructor_name(name, enum_ctors)
+            && name != "_"
+        {
+            map.insert(name.clone(), index as u32);
+        }
+    }
+    for typed_pattern in patterns {
+        let mut bindings = Vec::<(String, Type)>::new();
+        collect_pattern_binding_types(
+            &typed_pattern.pattern,
+            &typed_pattern.ty,
+            enum_ctors,
+            &mut bindings,
+        )?;
+        for (name, ty) in bindings {
+            if map.contains_key(&name) {
+                continue;
+            }
+            if let Some((index, existing_ty)) = shared_named_locals.get(&name) {
+                if existing_ty != &ty {
+                    return Err(SimdError::new(format!(
+                        "pattern local '{}' has inconsistent types {:?} and {:?}",
+                        name, existing_ty, ty
+                    )));
+                }
+                map.insert(name, *index);
+                continue;
+            }
+            let val_type = wasm_local_val_type_for_pattern_binding(&ty)?;
+            let index = *next_local;
+            *next_local += 1;
+            locals.push((1, val_type));
+            shared_named_locals.insert(name.clone(), (index, ty));
+            map.insert(name, index);
+        }
+    }
+    Ok(map)
 }
 
 fn emit_matching_if(
     function: &mut Function,
     patterns: &[TypedPattern],
-    param_prims: &[Prim],
-    locals: Option<&BTreeMap<String, u32>>,
+    enum_ctors: &BTreeMap<String, EnumCtorInfo>,
+    enum_state: Option<EnumWasmState>,
 ) -> Result<()> {
-    emit_clause_condition(function, patterns, param_prims, locals)?;
+    emit_clause_condition(function, patterns, enum_ctors, enum_state)?;
     function.instruction(&Instruction::If(BlockType::Empty));
     Ok(())
 }
@@ -6763,75 +7288,332 @@ fn emit_matching_if(
 fn emit_clause_condition(
     function: &mut Function,
     patterns: &[TypedPattern],
-    param_prims: &[Prim],
-    locals: Option<&BTreeMap<String, u32>>,
+    enum_ctors: &BTreeMap<String, EnumCtorInfo>,
+    enum_state: Option<EnumWasmState>,
 ) -> Result<()> {
-    let mut emitted = false;
+    let mut terms = 0usize;
     for (index, pattern) in patterns.iter().enumerate() {
-        let prim = *param_prims
-            .get(index)
-            .ok_or_else(|| SimdError::new("pattern arity mismatch in Wasm codegen"))?;
-        match &pattern.pattern {
-            Pattern::Wildcard | Pattern::Name(_) => {}
-            Pattern::Int(expected) => {
-                emitted = true;
-                emit_pattern_value(function, pattern, index as u32, locals)?;
-                emit_int_const(function, prim, *expected)?;
-                emit_int_eq(function, prim);
-                if index > 0 {
-                    function.instruction(&Instruction::I32And);
-                }
+        if emit_single_pattern_condition(
+            function,
+            &pattern.pattern,
+            &pattern.ty,
+            index as u32,
+            enum_ctors,
+            enum_state,
+        )? {
+            if terms > 0 {
+                function.instruction(&Instruction::I32And);
             }
-            Pattern::Float(expected) => {
-                emitted = true;
-                emit_pattern_value(function, pattern, index as u32, locals)?;
-                emit_float_bits_eq(function, prim, *expected)?;
-                if index > 0 {
-                    function.instruction(&Instruction::I32And);
-                }
-            }
-            Pattern::Bool(_) => {
-                return Err(SimdError::new(
-                    "Wasm backend does not support bool clause patterns",
-                ));
-            }
-            Pattern::Type(_) => {
-                return Err(SimdError::new(
-                    "Wasm backend does not support type witness clause patterns",
-                ));
-            }
+            terms += 1;
         }
     }
-    if !emitted {
+    if terms == 0 {
         function.instruction(&Instruction::I32Const(1));
     }
     Ok(())
 }
 
-fn emit_pattern_value(
+fn emit_single_pattern_condition(
     function: &mut Function,
-    pattern: &TypedPattern,
-    fallback_local: u32,
-    locals: Option<&BTreeMap<String, u32>>,
-) -> Result<()> {
-    match &pattern.pattern {
+    pattern: &Pattern,
+    ty: &Type,
+    value_local: u32,
+    enum_ctors: &BTreeMap<String, EnumCtorInfo>,
+    enum_state: Option<EnumWasmState>,
+) -> Result<bool> {
+    match pattern {
+        Pattern::Wildcard => Ok(false),
         Pattern::Name(name) => {
-            let local = locals
-                .and_then(|locals| locals.get(name))
-                .copied()
-                .unwrap_or(fallback_local);
-            function.instruction(&Instruction::LocalGet(local));
+            if !is_pattern_constructor_name(name, enum_ctors) {
+                return Ok(false);
+            }
+            let ctor = enum_ctors
+                .get(name)
+                .ok_or_else(|| SimdError::new(format!("unknown constructor '{}'", name)))?;
+            if !ctor.fields.is_empty() {
+                return Err(SimdError::new(format!(
+                    "constructor '{}' with fields must use parenthesized constructor pattern",
+                    name
+                )));
+            }
+            let Type::Named(enum_name, _) = ty else {
+                return Err(SimdError::new(format!(
+                    "constructor pattern '{}' requires enum type, found {:?}",
+                    name, ty
+                )));
+            };
+            if enum_name != &ctor.enum_name {
+                return Err(SimdError::new(format!(
+                    "constructor '{}' belongs to enum '{}', not '{}'",
+                    name, ctor.enum_name, enum_name
+                )));
+            }
+            function.instruction(&Instruction::LocalGet(value_local));
+            function.instruction(&Instruction::I32Load(memarg(0, 2)));
+            function.instruction(&Instruction::I32Const(i32::from(ctor.tag)));
+            function.instruction(&Instruction::I32Eq);
+            Ok(true)
         }
-        Pattern::Wildcard | Pattern::Int(_) | Pattern::Float(_) | Pattern::Bool(_) => {
-            function.instruction(&Instruction::LocalGet(fallback_local));
+        Pattern::Int(expected) => {
+            let prim = ty.prim().ok_or_else(|| {
+                SimdError::new(format!(
+                    "integer pattern requires scalar primitive type, found {:?}",
+                    ty
+                ))
+            })?;
+            function.instruction(&Instruction::LocalGet(value_local));
+            emit_int_const(function, prim, *expected)?;
+            emit_int_eq(function, prim);
+            Ok(true)
         }
-        Pattern::Type(_) => {
-            return Err(SimdError::new(
-                "Wasm backend does not support type witness clause patterns",
-            ));
+        Pattern::Float(expected) => {
+            let prim = ty.prim().ok_or_else(|| {
+                SimdError::new(format!(
+                    "float pattern requires scalar primitive type, found {:?}",
+                    ty
+                ))
+            })?;
+            function.instruction(&Instruction::LocalGet(value_local));
+            emit_float_bits_eq(function, prim, *expected)?;
+            Ok(true)
+        }
+        Pattern::Bool(_) => Err(SimdError::new(
+            "Wasm backend does not support bool clause patterns",
+        )),
+        Pattern::Type(_) => Err(SimdError::new(
+            "Wasm backend does not support type witness clause patterns",
+        )),
+        Pattern::Ctor(name, subpatterns) => {
+            let ctor = enum_ctors
+                .get(name)
+                .ok_or_else(|| SimdError::new(format!("unknown constructor '{}'", name)))?;
+            let Type::Named(enum_name, enum_args) = ty else {
+                return Err(SimdError::new(format!(
+                    "constructor pattern '{}' requires enum type, found {:?}",
+                    name, ty
+                )));
+            };
+            if enum_name != &ctor.enum_name {
+                return Err(SimdError::new(format!(
+                    "constructor '{}' belongs to enum '{}', not '{}'",
+                    name, ctor.enum_name, enum_name
+                )));
+            }
+            if subpatterns.len() != ctor.fields.len() {
+                return Err(SimdError::new(format!(
+                    "constructor pattern '{}' expects {} fields, found {}",
+                    name,
+                    ctor.fields.len(),
+                    subpatterns.len()
+                )));
+            }
+            function.instruction(&Instruction::LocalGet(value_local));
+            function.instruction(&Instruction::I32Load(memarg(0, 2)));
+            function.instruction(&Instruction::I32Const(i32::from(ctor.tag)));
+            function.instruction(&Instruction::I32Eq);
+            let mut terms = 1usize;
+            let subst = ctor
+                .enum_params
+                .iter()
+                .cloned()
+                .zip(enum_args.iter().cloned())
+                .collect::<BTreeMap<_, _>>();
+            for (field_index, (subpattern, field_ty_template)) in
+                subpatterns.iter().zip(ctor.fields.iter()).enumerate()
+            {
+                let field_ty = apply_type_subst(field_ty_template, &subst);
+                match subpattern {
+                    Pattern::Wildcard => {}
+                    Pattern::Name(local_name)
+                        if !is_pattern_constructor_name(local_name, enum_ctors) =>
+                    {
+                        // Name bindings do not contribute to condition.
+                    }
+                    Pattern::Int(expected) => {
+                        emit_enum_field_as_condition_value(function, value_local, field_index, &field_ty)?;
+                        let prim = field_ty.prim().ok_or_else(|| {
+                            SimdError::new(format!(
+                                "integer subpattern in '{}' requires scalar field, found {:?}",
+                                name, field_ty
+                            ))
+                        })?;
+                        emit_int_const(function, prim, *expected)?;
+                        emit_int_eq(function, prim);
+                        function.instruction(&Instruction::I32And);
+                        terms += 1;
+                    }
+                    Pattern::Float(expected) => {
+                        emit_enum_field_as_condition_value(function, value_local, field_index, &field_ty)?;
+                        let prim = field_ty.prim().ok_or_else(|| {
+                            SimdError::new(format!(
+                                "float subpattern in '{}' requires scalar field, found {:?}",
+                                name, field_ty
+                            ))
+                        })?;
+                        emit_float_bits_eq(function, prim, *expected)?;
+                        function.instruction(&Instruction::I32And);
+                        terms += 1;
+                    }
+                    Pattern::Name(ctor_name) if is_pattern_constructor_name(ctor_name, enum_ctors) => {
+                        let Some(enum_state) = enum_state else {
+                            return Err(SimdError::new(
+                                "internal error: missing enum scratch local for constructor pattern",
+                            ));
+                        };
+                        emit_enum_field_load(function, value_local, field_index, &field_ty)?;
+                        function.instruction(&Instruction::LocalSet(enum_state.ptr_local));
+                        if emit_single_pattern_condition(
+                            function,
+                            subpattern,
+                            &field_ty,
+                            enum_state.ptr_local,
+                            enum_ctors,
+                            enum_state.into(),
+                        )? {
+                            function.instruction(&Instruction::I32And);
+                            terms += 1;
+                        }
+                    }
+                    Pattern::Name(_) => {}
+                    Pattern::Ctor(_, _) => {
+                        let Some(enum_state) = enum_state else {
+                            return Err(SimdError::new(
+                                "internal error: missing enum scratch local for constructor pattern",
+                            ));
+                        };
+                        emit_enum_field_load(function, value_local, field_index, &field_ty)?;
+                        function.instruction(&Instruction::LocalSet(enum_state.ptr_local));
+                        if emit_single_pattern_condition(
+                            function,
+                            subpattern,
+                            &field_ty,
+                            enum_state.ptr_local,
+                            enum_ctors,
+                            enum_state.into(),
+                        )? {
+                            function.instruction(&Instruction::I32And);
+                            terms += 1;
+                        }
+                    }
+                    Pattern::Bool(_) => {
+                        return Err(SimdError::new(
+                            "Wasm backend does not support bool clause patterns",
+                        ));
+                    }
+                    Pattern::Type(_) => {
+                        return Err(SimdError::new(
+                            "Wasm backend does not support type witness clause patterns",
+                        ));
+                    }
+                }
+            }
+            Ok(terms > 0)
         }
     }
+}
+
+fn emit_clause_bindings(
+    function: &mut Function,
+    patterns: &[TypedPattern],
+    clause_locals: &BTreeMap<String, u32>,
+    enum_ctors: &BTreeMap<String, EnumCtorInfo>,
+    enum_state: Option<EnumWasmState>,
+) -> Result<()> {
+    for (index, pattern) in patterns.iter().enumerate() {
+        emit_pattern_bindings(
+            function,
+            &pattern.pattern,
+            &pattern.ty,
+            index as u32,
+            clause_locals,
+            enum_ctors,
+            enum_state,
+        )?;
+    }
     Ok(())
+}
+
+fn emit_pattern_bindings(
+    function: &mut Function,
+    pattern: &Pattern,
+    ty: &Type,
+    value_local: u32,
+    clause_locals: &BTreeMap<String, u32>,
+    enum_ctors: &BTreeMap<String, EnumCtorInfo>,
+    enum_state: Option<EnumWasmState>,
+) -> Result<()> {
+    match pattern {
+        Pattern::Name(name) => {
+            if is_pattern_constructor_name(name, enum_ctors) || name == "_" {
+                return Ok(());
+            }
+            let Some(local) = clause_locals.get(name).copied() else {
+                return Ok(());
+            };
+            if local != value_local {
+                function.instruction(&Instruction::LocalGet(value_local));
+                function.instruction(&Instruction::LocalSet(local));
+            }
+            Ok(())
+        }
+        Pattern::Ctor(name, subpatterns) => {
+            let ctor = enum_ctors
+                .get(name)
+                .ok_or_else(|| SimdError::new(format!("unknown constructor '{}'", name)))?;
+            let Type::Named(enum_name, enum_args) = ty else {
+                return Err(SimdError::new(format!(
+                    "constructor pattern '{}' requires enum type, found {:?}",
+                    name, ty
+                )));
+            };
+            if enum_name != &ctor.enum_name {
+                return Err(SimdError::new(format!(
+                    "constructor '{}' belongs to enum '{}', not '{}'",
+                    name, ctor.enum_name, enum_name
+                )));
+            }
+            let subst = ctor
+                .enum_params
+                .iter()
+                .cloned()
+                .zip(enum_args.iter().cloned())
+                .collect::<BTreeMap<_, _>>();
+            for (field_index, (subpattern, field_ty_template)) in
+                subpatterns.iter().zip(ctor.fields.iter()).enumerate()
+            {
+                let field_ty = apply_type_subst(field_ty_template, &subst);
+                match subpattern {
+                    Pattern::Wildcard | Pattern::Int(_) | Pattern::Float(_) | Pattern::Bool(_) | Pattern::Type(_) => {}
+                    Pattern::Name(local_name) if !is_pattern_constructor_name(local_name, enum_ctors) => {
+                        if let Some(target_local) = clause_locals.get(local_name).copied() {
+                            emit_enum_field_load(function, value_local, field_index, &field_ty)?;
+                            function.instruction(&Instruction::LocalSet(target_local));
+                        }
+                    }
+                    Pattern::Name(_) | Pattern::Ctor(_, _) => {
+                        let Some(enum_state) = enum_state else {
+                            return Err(SimdError::new(
+                                "internal error: missing enum scratch local for nested constructor binding",
+                            ));
+                        };
+                        emit_enum_field_load(function, value_local, field_index, &field_ty)?;
+                        function.instruction(&Instruction::LocalSet(enum_state.ptr_local));
+                        emit_pattern_bindings(
+                            function,
+                            subpattern,
+                            &field_ty,
+                            enum_state.ptr_local,
+                            clause_locals,
+                            enum_ctors,
+                            enum_state.into(),
+                        )?;
+                    }
+                }
+            }
+            Ok(())
+        }
+        Pattern::Wildcard | Pattern::Int(_) | Pattern::Float(_) | Pattern::Bool(_) | Pattern::Type(_) => Ok(()),
+    }
 }
 
 fn emit_int_const(function: &mut Function, prim: Prim, value: i64) -> Result<()> {
@@ -6891,6 +7673,8 @@ fn compile_scalar_ir_expr(
     locals: &BTreeMap<String, u32>,
     scalar_indices: &BTreeMap<String, u32>,
     signatures: &BTreeMap<String, &CheckedFunction>,
+    enum_ctors: &BTreeMap<String, EnumCtorInfo>,
+    enum_state: Option<EnumWasmState>,
 ) -> Result<()> {
     let inline_bindings = BTreeMap::<String, IrExpr>::new();
     compile_scalar_ir_expr_with_hoists(
@@ -6899,6 +7683,8 @@ fn compile_scalar_ir_expr(
         locals,
         scalar_indices,
         signatures,
+        enum_ctors,
+        enum_state,
         &BTreeMap::new(),
         &inline_bindings,
     )
@@ -6910,6 +7696,8 @@ fn emit_tail_position_scalar_return(
     locals: &BTreeMap<String, u32>,
     scalar_indices: &BTreeMap<String, u32>,
     signatures: &BTreeMap<String, &CheckedFunction>,
+    enum_ctors: &BTreeMap<String, EnumCtorInfo>,
+    enum_state: Option<EnumWasmState>,
 ) -> Result<()> {
     let inline_bindings = BTreeMap::<String, IrExpr>::new();
     emit_tail_position_scalar_return_with_bindings(
@@ -6918,6 +7706,8 @@ fn emit_tail_position_scalar_return(
         locals,
         scalar_indices,
         signatures,
+        enum_ctors,
+        enum_state,
         &inline_bindings,
     )
 }
@@ -6928,6 +7718,8 @@ fn emit_tail_position_scalar_return_with_bindings(
     locals: &BTreeMap<String, u32>,
     scalar_indices: &BTreeMap<String, u32>,
     signatures: &BTreeMap<String, &CheckedFunction>,
+    enum_ctors: &BTreeMap<String, EnumCtorInfo>,
+    enum_state: Option<EnumWasmState>,
     inline_bindings: &BTreeMap<String, IrExpr>,
 ) -> Result<()> {
     if let IrExprKind::Let { bindings, body } = &expr.kind {
@@ -6941,6 +7733,8 @@ fn emit_tail_position_scalar_return_with_bindings(
             locals,
             scalar_indices,
             signatures,
+            enum_ctors,
+            enum_state,
             &extended,
         );
     }
@@ -6976,6 +7770,8 @@ fn emit_tail_position_scalar_return_with_bindings(
                 locals,
                 scalar_indices,
                 signatures,
+                enum_ctors,
+                enum_state,
                 &BTreeMap::new(),
                 inline_bindings,
             )?;
@@ -7000,6 +7796,8 @@ fn emit_tail_position_scalar_return_with_bindings(
         locals,
         scalar_indices,
         signatures,
+        enum_ctors,
+        enum_state,
         &BTreeMap::new(),
         inline_bindings,
     )?;
@@ -7013,6 +7811,8 @@ fn compile_scalar_ir_expr_with_hoists(
     locals: &BTreeMap<String, u32>,
     scalar_indices: &BTreeMap<String, u32>,
     signatures: &BTreeMap<String, &CheckedFunction>,
+    enum_ctors: &BTreeMap<String, EnumCtorInfo>,
+    enum_state: Option<EnumWasmState>,
     hoisted_locals: &BTreeMap<HoistExprKey, u32>,
     inline_bindings: &BTreeMap<String, IrExpr>,
 ) -> Result<()> {
@@ -7031,6 +7831,8 @@ fn compile_scalar_ir_expr_with_hoists(
                     locals,
                     scalar_indices,
                     signatures,
+                    enum_ctors,
+                    enum_state,
                     hoisted_locals,
                     inline_bindings,
                 )?;
@@ -7056,6 +7858,167 @@ fn compile_scalar_ir_expr_with_hoists(
                 )));
             }
         },
+        IrExprKind::Record(_) => {
+            return Err(SimdError::new(
+                "Wasm scalar codegen does not yet support record IR expressions",
+            ));
+        }
+        IrExprKind::EnumCtor { ctor, args } => {
+            let enum_state = enum_state.ok_or_else(|| {
+                SimdError::new("internal error: missing enum scratch local for constructor emission")
+            })?;
+            let ctor_info = enum_ctors
+                .get(ctor)
+                .ok_or_else(|| SimdError::new(format!("unknown constructor '{}'", ctor)))?;
+            if ctor_info.fields.len() != args.len() {
+                return Err(SimdError::new(format!(
+                    "constructor '{}' expects {} args, found {}",
+                    ctor,
+                    ctor_info.fields.len(),
+                    args.len()
+                )));
+            }
+            let field_count = i32::try_from(args.len()).map_err(|_| {
+                SimdError::new(format!(
+                    "constructor '{}' has too many fields for Wasm layout",
+                    ctor
+                ))
+            })?;
+            let bytes = ENUM_NODE_HEADER_BYTES
+                .checked_add(
+                    field_count
+                        .checked_mul(ENUM_FIELD_SLOT_BYTES)
+                        .ok_or_else(|| SimdError::new("enum field slot size overflow"))?,
+                )
+                .ok_or_else(|| SimdError::new("enum allocation size overflow"))?;
+            emit_enum_alloc(function, enum_state, bytes);
+            function.instruction(&Instruction::LocalGet(enum_state.ptr_local));
+            function.instruction(&Instruction::LocalSet(enum_state.base_local));
+            function.instruction(&Instruction::LocalGet(enum_state.save_sp_local));
+            function.instruction(&Instruction::LocalGet(enum_state.base_local));
+            function.instruction(&Instruction::I32Store(memarg(0, 2)));
+            function.instruction(&Instruction::LocalGet(enum_state.save_sp_local));
+            function.instruction(&Instruction::I32Const(4));
+            function.instruction(&Instruction::I32Add);
+            function.instruction(&Instruction::LocalSet(enum_state.save_sp_local));
+            function.instruction(&Instruction::LocalGet(enum_state.base_local));
+            function.instruction(&Instruction::I32Const(i32::from(ctor_info.tag)));
+            function.instruction(&Instruction::I32Store(memarg(0, 2)));
+            function.instruction(&Instruction::LocalGet(enum_state.base_local));
+            function.instruction(&Instruction::I32Const(field_count));
+            function.instruction(&Instruction::I32Store(memarg(4, 2)));
+            for (field_index, arg) in args.iter().enumerate() {
+                function.instruction(&Instruction::LocalGet(enum_state.base_local));
+                let child_state = EnumWasmState {
+                    ptr_local: enum_state.ptr_local,
+                    base_local: enum_state.ptr_local,
+                    save_sp_local: enum_state.save_sp_local,
+                };
+                compile_scalar_ir_expr_with_hoists(
+                    function,
+                    arg,
+                    locals,
+                    scalar_indices,
+                    signatures,
+                    enum_ctors,
+                    child_state.into(),
+                    hoisted_locals,
+                    inline_bindings,
+                )?;
+                emit_enum_field_store(function, field_index, &arg.ty)?;
+                function.instruction(&Instruction::LocalGet(enum_state.save_sp_local));
+                function.instruction(&Instruction::I32Const(4));
+                function.instruction(&Instruction::I32Sub);
+                function.instruction(&Instruction::I32Load(memarg(0, 2)));
+                function.instruction(&Instruction::LocalSet(enum_state.base_local));
+            }
+            function.instruction(&Instruction::LocalGet(enum_state.base_local));
+            function.instruction(&Instruction::LocalGet(enum_state.save_sp_local));
+            function.instruction(&Instruction::I32Const(4));
+            function.instruction(&Instruction::I32Sub);
+            function.instruction(&Instruction::LocalSet(enum_state.save_sp_local));
+        }
+        IrExprKind::EnumTag { value } => {
+            compile_scalar_ir_expr_with_hoists(
+                function,
+                value,
+                locals,
+                scalar_indices,
+                signatures,
+                enum_ctors,
+                enum_state,
+                hoisted_locals,
+                inline_bindings,
+            )?;
+            function.instruction(&Instruction::I32Load(memarg(0, 2)));
+            if matches!(expr.ty, Type::Scalar(Prim::I64)) {
+                function.instruction(&Instruction::I64ExtendI32U);
+            }
+        }
+        IrExprKind::EnumChildBySlot { value, ctor, slot } => {
+            let enum_state = enum_state.ok_or_else(|| {
+                SimdError::new("internal error: missing enum scratch local for enum child projection")
+            })?;
+            let ctor_info = enum_ctors
+                .get(ctor)
+                .ok_or_else(|| SimdError::new(format!("unknown constructor '{}'", ctor)))?;
+            let recursive_fields = enum_ctor_recursive_field_indices(ctor_info);
+            let source_field = *recursive_fields.get(*slot).ok_or_else(|| {
+                SimdError::new(format!(
+                    "enum child slot {} is out of bounds for constructor '{}'",
+                    slot, ctor
+                ))
+            })?;
+            let field_ty = ctor_info.fields.get(source_field).ok_or_else(|| {
+                SimdError::new(format!(
+                    "constructor '{}' is missing recursive field {}",
+                    ctor, source_field
+                ))
+            })?;
+            compile_scalar_ir_expr_with_hoists(
+                function,
+                value,
+                locals,
+                scalar_indices,
+                signatures,
+                enum_ctors,
+                enum_state.into(),
+                hoisted_locals,
+                inline_bindings,
+            )?;
+            function.instruction(&Instruction::LocalSet(enum_state.ptr_local));
+            emit_enum_field_load(function, enum_state.ptr_local, source_field, field_ty)?;
+        }
+        IrExprKind::EnumNonRecField { value, ctor, field } => {
+            let enum_state = enum_state.ok_or_else(|| {
+                SimdError::new(
+                    "internal error: missing enum scratch local for enum non-recursive projection",
+                )
+            })?;
+            let ctor_info = enum_ctors
+                .get(ctor)
+                .ok_or_else(|| SimdError::new(format!("unknown constructor '{}'", ctor)))?;
+            let non_recursive_fields = enum_ctor_non_recursive_field_indices(ctor_info);
+            let source_field = *non_recursive_fields.get(*field).ok_or_else(|| {
+                SimdError::new(format!(
+                    "enum non-rec field {} is out of bounds for constructor '{}'",
+                    field, ctor
+                ))
+            })?;
+            compile_scalar_ir_expr_with_hoists(
+                function,
+                value,
+                locals,
+                scalar_indices,
+                signatures,
+                enum_ctors,
+                enum_state.into(),
+                hoisted_locals,
+                inline_bindings,
+            )?;
+            function.instruction(&Instruction::LocalSet(enum_state.ptr_local));
+            emit_enum_field_load(function, enum_state.ptr_local, source_field, &expr.ty)?;
+        }
         IrExprKind::Let { bindings, body } => {
             let mut extended = inline_bindings.clone();
             for binding in bindings {
@@ -7067,6 +8030,8 @@ fn compile_scalar_ir_expr_with_hoists(
                 locals,
                 scalar_indices,
                 signatures,
+                enum_ctors,
+                enum_state,
                 hoisted_locals,
                 &extended,
             )?;
@@ -7079,6 +8044,8 @@ fn compile_scalar_ir_expr_with_hoists(
                     locals,
                     scalar_indices,
                     signatures,
+                    enum_ctors,
+                    enum_state,
                     hoisted_locals,
                     inline_bindings,
                 )?;
@@ -7088,6 +8055,8 @@ fn compile_scalar_ir_expr_with_hoists(
                     locals,
                     scalar_indices,
                     signatures,
+                    enum_ctors,
+                    enum_state,
                     hoisted_locals,
                     inline_bindings,
                 )?;
@@ -7105,6 +8074,8 @@ fn compile_scalar_ir_expr_with_hoists(
                         locals,
                         scalar_indices,
                         signatures,
+                        enum_ctors,
+                        enum_state,
                         hoisted_locals,
                         inline_bindings,
                     )?;
@@ -7302,10 +8273,11 @@ fn vectorizable_kernel_clause<'a>(
     params: &'a [KernelParam],
     result_prim: Prim,
 ) -> Option<VectorizableKernel<'a>> {
+    let empty_enum_ctors = BTreeMap::<String, EnumCtorInfo>::new();
     if clauses.is_empty() {
         return None;
     }
-    if clause_has_condition(&clauses.last()?.patterns) {
+    if clause_has_condition(&clauses.last()?.patterns, &empty_enum_ctors) {
         return None;
     }
 
@@ -7367,6 +8339,7 @@ fn patterns_are_vectorizable(
             }
             Pattern::Bool(_) => return false,
             Pattern::Type(_) => return false,
+            Pattern::Ctor(_, _) => return false,
             Pattern::Name(_) | Pattern::Wildcard => {}
         }
     }
@@ -7382,6 +8355,11 @@ fn is_vectorizable_expr(
         IrExprKind::Local(name) => locals.contains_key(name),
         IrExprKind::Int(_, prim) => prim.is_int(),
         IrExprKind::Float(_, prim) => prim.is_float(),
+        IrExprKind::Record(_) => false,
+        IrExprKind::EnumCtor { .. }
+        | IrExprKind::EnumTag { .. }
+        | IrExprKind::EnumChildBySlot { .. }
+        | IrExprKind::EnumNonRecField { .. } => false,
         IrExprKind::Let { bindings, body } => {
             bindings
                 .iter()
@@ -7449,6 +8427,11 @@ fn emit_vector_clause_mask(
             Pattern::Bool(_) => {
                 return Err(SimdError::new(
                     "Wasm backend does not support bool clause patterns",
+                ));
+            }
+            Pattern::Ctor(_, _) => {
+                return Err(SimdError::new(
+                    "Wasm backend does not support enum constructor clause patterns yet",
                 ));
             }
             Pattern::Type(_) => {
@@ -7526,6 +8509,7 @@ fn compile_vectorized_clause_chain(
     hoisted_locals: Option<&BTreeMap<HoistExprKey, u32>>,
     acc_local: u32,
 ) -> Result<()> {
+    let empty_enum_ctors = BTreeMap::<String, EnumCtorInfo>::new();
     let last = clauses
         .last()
         .ok_or_else(|| SimdError::new("vectorized kernel missing clauses"))?;
@@ -7541,7 +8525,7 @@ fn compile_vectorized_clause_chain(
     function.instruction(&Instruction::LocalSet(acc_local));
 
     for clause in clauses.iter().rev().skip(1) {
-        if !clause_has_condition(clause.patterns) {
+        if !clause_has_condition(clause.patterns, &empty_enum_ctors) {
             compile_vector_ir_expr(
                 function,
                 clause.body,
@@ -7583,6 +8567,7 @@ fn compile_grouped_vectorized_clause_chain(
     hoisted_locals: Option<&BTreeMap<HoistExprKey, u32>>,
     acc_local: u32,
 ) -> Result<()> {
+    let empty_enum_ctors = BTreeMap::<String, EnumCtorInfo>::new();
     let last = clauses
         .last()
         .ok_or_else(|| SimdError::new("vectorized grouped kernel missing clauses"))?;
@@ -7602,7 +8587,7 @@ fn compile_grouped_vectorized_clause_chain(
     function.instruction(&Instruction::LocalSet(acc_local));
 
     for clause in clauses.iter().rev().skip(1) {
-        if !clause_has_condition(clause.patterns) {
+        if !clause_has_condition(clause.patterns, &empty_enum_ctors) {
             let body = clause
                 .bodies
                 .get(output_index)
@@ -7708,6 +8693,19 @@ fn compile_vector_ir_expr_with_hoists(
         }
         IrExprKind::Int(value, prim) => emit_vector_splat_int(function, *prim, *value)?,
         IrExprKind::Float(value, prim) => emit_vector_splat_float(function, *prim, *value)?,
+        IrExprKind::Record(_) => {
+            return Err(SimdError::new(
+                "Wasm vector codegen does not yet support record IR expressions",
+            ));
+        }
+        IrExprKind::EnumCtor { .. }
+        | IrExprKind::EnumTag { .. }
+        | IrExprKind::EnumChildBySlot { .. }
+        | IrExprKind::EnumNonRecField { .. } => {
+            return Err(SimdError::new(
+                "Wasm vector codegen does not yet support enum IR expressions",
+            ));
+        }
         IrExprKind::Let { bindings, body } => {
             let mut extended = inline_bindings.clone();
             for binding in bindings {
@@ -8108,6 +9106,9 @@ fn build_wasm_plan(checked_program: &CheckedProgram, main: &str) -> Result<WasmP
 
     Ok(WasmPlan {
         checked: CheckedProgram {
+            enum_names: checked_program.enum_names.clone(),
+            enum_ctors: checked_program.enum_ctors.clone(),
+            enum_layouts: checked_program.enum_layouts.clone(),
             functions: leaf_functions,
         },
         params,
@@ -8195,6 +9196,12 @@ fn flatten_clause_patterns(
                 pattern: pattern.pattern.clone(),
                 ty: ty.clone(),
             }),
+            Type::Named(name, args) if is_wasm_enum_named_type(name, args) => {
+                flattened.push(TypedPattern {
+                    pattern: pattern.pattern.clone(),
+                    ty: ty.clone(),
+                });
+            }
             Type::TypeToken(_) => {
                 return Err(SimdError::new(
                     "Wasm backend does not support type witness parameters in flattened clauses",
@@ -8208,7 +9215,8 @@ fn flatten_clause_patterns(
                         Pattern::Int(_)
                         | Pattern::Float(_)
                         | Pattern::Bool(_)
-                        | Pattern::Type(_) => {
+                        | Pattern::Type(_)
+                        | Pattern::Ctor(_, _) => {
                             return Err(SimdError::new(
                                 "record parameters cannot use literal patterns",
                             ));
@@ -8243,20 +9251,31 @@ fn normalize_expr_for_leaf(
     checked_map: &BTreeMap<String, &CheckedFunction>,
     result_leaf_names: &BTreeMap<String, BTreeMap<LeafPath, String>>,
 ) -> Result<TypedExpr> {
-    let leaf_ty = type_at_leaf_path(&expr.ty, leaf_path)?;
+    let leaf_ty = match (&expr.ty, leaf_path.is_root()) {
+        (Type::Fun(_, _), true) => expr.ty.clone(),
+        _ => type_at_leaf_path(&expr.ty, leaf_path)?,
+    };
     match &expr.kind {
         TypedExprKind::Local(name) => {
-            let local_ty = local_types.get(name).ok_or_else(|| {
-                let keys = local_types
-                    .keys()
-                    .map(std::string::ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                SimdError::new(format!(
-                    "unknown local '{}' in Wasm normalization (leaf_path={leaf_path:?}, locals=[{keys}] )",
-                    name
-                ))
-            })?;
+            let Some(local_ty) = local_types.get(name) else {
+                let synthesized = leaf_symbol_name(name, leaf_path);
+                if local_types.contains_key(&synthesized) {
+                    return Ok(TypedExpr {
+                        ty: leaf_ty,
+                        kind: TypedExprKind::Local(synthesized),
+                    });
+                }
+                if !leaf_path.is_root() {
+                    return Err(SimdError::new(format!(
+                        "unknown local '{}' in Wasm normalization for non-root leaf {:?}",
+                        name, leaf_path
+                    )));
+                }
+                return Ok(TypedExpr {
+                    ty: leaf_ty,
+                    kind: TypedExprKind::Local(name.clone()),
+                });
+            };
             let local_name = local_leaf_names
                 .get(name)
                 .and_then(|names| names.get(leaf_path))
@@ -8322,6 +9341,17 @@ fn normalize_expr_for_leaf(
         TypedExprKind::TypeToken(_) => Err(SimdError::new(
             "Wasm record normalization does not support type witness expressions",
         )),
+        TypedExprKind::ConstructorRef { name } => {
+            if !leaf_path.is_root() {
+                return Err(SimdError::new(
+                    "enum constructor reference cannot be projected into a record leaf",
+                ));
+            }
+            Ok(TypedExpr {
+                ty: leaf_ty,
+                kind: TypedExprKind::ConstructorRef { name: name.clone() },
+            })
+        }
         TypedExprKind::FunctionRef { name } => {
             let function = checked_map.get(name).ok_or_else(|| {
                 SimdError::new(format!("unknown function '{}' in Wasm record normalization", name))
@@ -8360,9 +9390,45 @@ fn normalize_expr_for_leaf(
                 result_leaf_names,
             )
         }
-        TypedExprKind::Lambda { .. } | TypedExprKind::Apply { .. } => Err(SimdError::new(
+        TypedExprKind::Lambda { .. } => Err(SimdError::new(
             "Wasm record normalization does not support higher-order expressions",
         )),
+        TypedExprKind::Apply { callee, arg } => {
+            let (head, _) = typed_expr_apply_chain_root(expr);
+            if !matches!(head.kind, TypedExprKind::ConstructorRef { .. }) {
+                return Err(SimdError::new(
+                    "Wasm record normalization does not support higher-order expressions",
+                ));
+            }
+            if !leaf_path.is_root() {
+                return Err(SimdError::new(
+                    "constructor application cannot be projected into a record leaf",
+                ));
+            }
+            let normalized_callee = normalize_expr_for_leaf(
+                callee,
+                &LeafPath::root(),
+                local_types,
+                local_leaf_names,
+                checked_map,
+                result_leaf_names,
+            )?;
+            let normalized_arg = normalize_expr_for_leaf(
+                arg,
+                &LeafPath::root(),
+                local_types,
+                local_leaf_names,
+                checked_map,
+                result_leaf_names,
+            )?;
+            Ok(TypedExpr {
+                ty: leaf_ty,
+                kind: TypedExprKind::Apply {
+                    callee: Box::new(normalized_callee),
+                    arg: Box::new(normalized_arg),
+                },
+            })
+        }
         TypedExprKind::Record(fields) => {
             let (field, tail) = leaf_path.split_first().ok_or_else(|| {
                 SimdError::new("record expression requires a non-empty leaf path")
@@ -8631,6 +9697,9 @@ fn wasm_param_abi_from_single_type(ty: &Type) -> Result<WasmParamAbi> {
         Type::Fun(_, _) => Err(SimdError::new(
             "Wasm backend does not support higher-order entry parameters",
         )),
+        Type::Named(name, args) if is_wasm_enum_named_type(name, args) => {
+            Ok(WasmParamAbi::Scalar { prim: Prim::I32 })
+        }
         Type::Named(_, _) | Type::Var(_) | Type::Infer(_) => Err(SimdError::new(
             "Wasm backend does not support unresolved polymorphic entry parameters",
         )),
@@ -8668,6 +9737,9 @@ fn wasm_result_abi_from_type(ty: &Type, param_types: &[Type]) -> Result<WasmResu
         Type::Fun(_, _) => Err(SimdError::new(
             "Wasm backend does not support higher-order entry results",
         )),
+        Type::Named(name, args) if is_wasm_enum_named_type(name, args) => {
+            Ok(WasmResultAbi::Scalar { prim: Prim::I32 })
+        }
         Type::Named(_, _) | Type::Var(_) | Type::Infer(_) => Err(SimdError::new(
             "Wasm backend does not support unresolved polymorphic entry results",
         )),
@@ -8696,6 +9768,9 @@ fn wasm_leaf_result_abi_from_type(ty: &Type) -> Result<WasmLeafResultAbi> {
         )),
         Type::Record(_) => Err(SimdError::new("leaf result ABI cannot contain records")),
         Type::Fun(_, _) => Err(SimdError::new("leaf result ABI cannot contain functions")),
+        Type::Named(name, args) if is_wasm_enum_named_type(name, args) => {
+            Ok(WasmLeafResultAbi::Scalar { prim: Prim::I32 })
+        }
         Type::Named(_, _) | Type::Var(_) | Type::Infer(_) => Err(SimdError::new(
             "leaf result ABI cannot contain unresolved polymorphic types",
         )),
@@ -8735,6 +9810,7 @@ fn type_at_leaf_path(ty: &Type, leaf_path: &LeafPath) -> Result<Type> {
             Type::Fun(_, _) => Err(SimdError::new(
                 "function types cannot be used as leaf values",
             )),
+            Type::Named(name, args) if is_wasm_enum_named_type(name, args) => Ok(ty.clone()),
             Type::Named(_, _) | Type::Var(_) | Type::Infer(_) => Err(SimdError::new(
                 "unresolved polymorphic types cannot be used as leaf values",
             )),
@@ -8755,6 +9831,10 @@ fn type_at_leaf_path(ty: &Type, leaf_path: &LeafPath) -> Result<Type> {
             head, ty
         ))),
     }
+}
+
+fn is_wasm_enum_named_type(name: &str, args: &[Type]) -> bool {
+    !(args.is_empty() && (name == "string" || name == "bool"))
 }
 
 fn build_engine() -> Result<Engine> {
@@ -8875,6 +9955,49 @@ fn summarize_ir_param_uses_with_lets(
             }
         }
         IrExprKind::Int(_, _) | IrExprKind::Float(_, _) => vec![UsageCount::Zero; arity],
+        IrExprKind::Record(fields) => {
+            let mut summary = vec![UsageCount::Zero; arity];
+            for field in fields.values() {
+                let field_summary = summarize_ir_param_uses_with_lets(
+                    field,
+                    arity,
+                    locals,
+                    let_bindings,
+                    functions,
+                    memo,
+                    visiting,
+                );
+                add_usage_vec(&mut summary, &field_summary);
+            }
+            summary
+        }
+        IrExprKind::EnumCtor { args, .. } => {
+            let mut summary = vec![UsageCount::Zero; arity];
+            for arg in args {
+                let arg_summary = summarize_ir_param_uses_with_lets(
+                    arg,
+                    arity,
+                    locals,
+                    let_bindings,
+                    functions,
+                    memo,
+                    visiting,
+                );
+                add_usage_vec(&mut summary, &arg_summary);
+            }
+            summary
+        }
+        IrExprKind::EnumTag { value }
+        | IrExprKind::EnumChildBySlot { value, .. }
+        | IrExprKind::EnumNonRecField { value, .. } => summarize_ir_param_uses_with_lets(
+            value,
+            arity,
+            locals,
+            let_bindings,
+            functions,
+            memo,
+            visiting,
+        ),
         IrExprKind::Let { bindings, body } => {
             let mut extended = let_bindings.clone();
             for binding in bindings {
@@ -9505,6 +10628,18 @@ fn flatten_wasm_value(
                 "Wasm backend does not support runtime type witness arguments",
             ));
         }
+        (Value::Enum(_), WasmParamAbi::Scalar { prim }) => {
+            return Err(SimdError::new(format!(
+                "Wasm scalar argument expected {:?}, found enum",
+                prim
+            )));
+        }
+        (Value::Enum(_), WasmParamAbi::Bulk { prim }) => {
+            return Err(SimdError::new(format!(
+                "Wasm bulk argument expected {:?}, found enum",
+                prim
+            )));
+        }
         (value, WasmParamAbi::Record { .. }) => {
             return Err(SimdError::new(format!(
                 "record Wasm ABI expected a record value, found {:?}",
@@ -9904,31 +11039,7 @@ mod tests {
     }
 
     fn typed_expr_has_lambda_or_apply(expr: &TypedExpr) -> bool {
-        match &expr.kind {
-            TypedExprKind::Lambda { .. } | TypedExprKind::Apply { .. } => true,
-            TypedExprKind::Let { bindings, body } => {
-                bindings
-                    .iter()
-                    .any(|binding| typed_expr_has_lambda_or_apply(&binding.expr))
-                    || typed_expr_has_lambda_or_apply(body)
-            }
-            TypedExprKind::Record(fields) => fields.values().any(typed_expr_has_lambda_or_apply),
-            TypedExprKind::Project { base, .. } => typed_expr_has_lambda_or_apply(base),
-            TypedExprKind::RecordUpdate { base, fields } => {
-                typed_expr_has_lambda_or_apply(base)
-                    || fields.values().any(typed_expr_has_lambda_or_apply)
-            }
-            TypedExprKind::Call { args, .. } => args
-                .iter()
-                .any(|arg| typed_expr_has_lambda_or_apply(&arg.expr)),
-            TypedExprKind::Local(_)
-            | TypedExprKind::FunctionRef { .. }
-            | TypedExprKind::Int(_, _)
-            | TypedExprKind::Float(_, _)
-            | TypedExprKind::Bool(_)
-            | TypedExprKind::String(_)
-            | TypedExprKind::TypeToken(_) => false,
-        }
+        typed_expr_contains_lambda_or_apply(expr)
     }
 
     #[test]
@@ -10653,6 +11764,18 @@ mod tests {
     fn wasm_matches_scalar_entry() {
         let src = "pow2 : i64 -> i64 -> i64\npow2 0 x = x\npow2 n x = pow2 (n - 1) (x * 2)\nmain : i64 -> i64\nmain x = pow2 3 x\n";
         assert_eq!(wasm_run(src, "main", "[7]"), "56");
+    }
+
+    #[test]
+    fn wasm_matches_recursive_enum_list_length() {
+        let src = "enum List a =\n  | Nil\n  | Cons a (List a)\n\nlen : List i64 -> i64\nlen Nil = 0\nlen (Cons _ xs) = 1 + len xs\n\nmain : i64\nmain = len (Cons 1 (Cons 2 Nil))\n";
+        assert_eq!(wasm_run(src, "main", "[]"), "2");
+    }
+
+    #[test]
+    fn wasm_matches_recursive_enum_tree_sum() {
+        let src = "enum Tree a =\n  | Leaf a\n  | Bin (Tree a) (Tree a)\n\nsum : Tree i64 -> i64\nsum (Leaf x) = x\nsum (Bin l r) = sum l + sum r\n\nmain : i64\nmain = sum (Bin (Leaf 2) (Bin (Leaf 3) (Leaf 4)))\n";
+        assert_eq!(wasm_run(src, "main", "[]"), "9");
     }
 
     #[test]

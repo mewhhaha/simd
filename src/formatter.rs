@@ -78,9 +78,31 @@ fn format_decl(decl: &Decl) -> String {
         Decl::Import(import_decl) => format_import(import_decl),
         Decl::Family(family) => format_family_decl(family),
         Decl::TypeAlias(alias) => format_type_alias(alias),
+        Decl::Enum(enum_decl) => format_enum_decl(enum_decl),
         Decl::Signature(signature) => format_signature(signature),
         Decl::Clause(clause) => format_clause(clause),
     }
+}
+
+fn format_enum_decl(enum_decl: &crate::EnumDecl) -> String {
+    let mut out = String::new();
+    out.push_str("enum ");
+    out.push_str(&enum_decl.name);
+    if !enum_decl.params.is_empty() {
+        out.push(' ');
+        out.push_str(&enum_decl.params.join(" "));
+    }
+    out.push_str(" =\n");
+    for ctor in &enum_decl.ctors {
+        out.push_str("  | ");
+        out.push_str(&ctor.name);
+        for field in &ctor.fields {
+            out.push(' ');
+            out.push_str(&format_type(field));
+        }
+        out.push('\n');
+    }
+    out
 }
 
 fn format_import(import_decl: &ImportDecl) -> String {
@@ -222,6 +244,17 @@ fn format_pattern(pattern: &Pattern) -> String {
         Pattern::Float(value) => super::format_float(*value),
         Pattern::Bool(value) => value.to_string(),
         Pattern::Type(prim) => format_prim(*prim).to_string(),
+        Pattern::Ctor(name, subpatterns) => {
+            let mut out = name.to_string();
+            for subpattern in subpatterns {
+                out.push(' ');
+                out.push_str(&format_pattern(subpattern));
+            }
+            if subpatterns.is_empty() {
+                return out;
+            }
+            format!("({})", out)
+        }
         Pattern::Name(name) => name.clone(),
         Pattern::Wildcard => "_".to_string(),
     }

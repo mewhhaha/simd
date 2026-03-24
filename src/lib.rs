@@ -52,6 +52,7 @@ pub enum Decl {
     Import(ImportDecl),
     Family(FamilyDecl),
     TypeAlias(TypeAliasDecl),
+    Enum(EnumDecl),
     Signature(Signature),
     Clause(Clause),
 }
@@ -75,6 +76,19 @@ pub struct FamilyDecl {
     pub params: Vec<String>,
     pub ty: Type,
     pub op: Option<PrimOp>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EnumDecl {
+    pub name: String,
+    pub params: Vec<String>,
+    pub ctors: Vec<EnumCtorDecl>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EnumCtorDecl {
+    pub name: String,
+    pub fields: Vec<Type>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,6 +148,7 @@ pub enum Pattern {
     Type(Prim),
     Name(String),
     Wildcard,
+    Ctor(String, Vec<Pattern>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -235,6 +250,7 @@ pub struct Module {
     pub imports: Vec<ImportDecl>,
     pub families: Vec<FamilyDecl>,
     pub type_aliases: Vec<TypeAliasDecl>,
+    pub enums: Vec<EnumDecl>,
     pub operator_instances: Vec<OperatorInstanceDecl>,
     pub family_instances: Vec<FamilyInstanceDecl>,
     pub functions: Vec<FunctionDef>,
@@ -261,6 +277,9 @@ pub struct FunctionDef {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CheckedProgram {
+    pub enum_names: BTreeSet<String>,
+    pub enum_ctors: BTreeMap<String, EnumCtorInfo>,
+    pub enum_layouts: BTreeMap<String, EnumLayout>,
     pub functions: Vec<CheckedFunction>,
 }
 
@@ -337,6 +356,9 @@ pub struct TypedExpr {
 pub enum TypedExprKind {
     Local(String),
     FunctionRef {
+        name: String,
+    },
+    ConstructorRef {
         name: String,
     },
     Int(i64, Prim),
@@ -540,6 +562,24 @@ pub enum IrExprKind {
     Local(String),
     Int(i64, Prim),
     Float(f64, Prim),
+    Record(BTreeMap<String, IrExpr>),
+    EnumCtor {
+        ctor: String,
+        args: Vec<IrExpr>,
+    },
+    EnumTag {
+        value: Box<IrExpr>,
+    },
+    EnumChildBySlot {
+        value: Box<IrExpr>,
+        ctor: String,
+        slot: usize,
+    },
+    EnumNonRecField {
+        value: Box<IrExpr>,
+        ctor: String,
+        field: usize,
+    },
     Let {
         bindings: Vec<IrLetBinding>,
         body: Box<IrExpr>,
@@ -569,6 +609,53 @@ pub enum Value {
     String(String),
     TypeToken(Prim),
     Record(BTreeMap<String, Value>),
+    Enum(EnumValue),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EnumValue {
+    pub enum_name: String,
+    pub tape: Rc<EnumTape>,
+    pub root: u32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EnumTape {
+    pub enum_name: String,
+    pub tags: Vec<u16>,
+    pub ends: Vec<u32>,
+    pub slots: Vec<u32>,
+    pub tag_names: BTreeMap<u16, String>,
+    pub ctor_recursive_mask: BTreeMap<String, Vec<bool>>,
+    pub ctor_rows: BTreeMap<String, Vec<EnumCtorRow>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EnumCtorRow {
+    pub fields: Vec<Value>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EnumCtorInfo {
+    pub enum_name: String,
+    pub enum_params: Vec<String>,
+    pub fields: Vec<Type>,
+    pub tag: u16,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EnumLayout {
+    pub enum_name: String,
+    pub ctors: BTreeMap<String, EnumCtorLayout>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EnumCtorLayout {
+    pub ctor_name: String,
+    pub tag: u16,
+    pub field_types: Vec<Type>,
+    pub recursive_slots: Vec<Vec<String>>,
+    pub non_recursive_fields: Vec<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -725,6 +812,7 @@ impl Value {
                     .map(|(name, value)| (name.clone(), value.ty()))
                     .collect(),
             ),
+            Self::Enum(value) => Type::Named(value.enum_name.clone(), Vec::new()),
         }
     }
 
@@ -736,6 +824,7 @@ impl Value {
             Self::String(value) => json_string(value),
             Self::TypeToken(prim) => format!("\"{}\"", format_prim(*prim)),
             Self::Record(fields) => render_record_json(fields),
+            Self::Enum(value) => render_enum_json(value),
         }
     }
 }
@@ -795,6 +884,65 @@ fn render_record_json(fields: &BTreeMap<String, Value>) -> String {
     format!("{{{}}}", parts.join(","))
 }
 
+fn render_enum_json(value: &EnumValue) -> String {
+    let Some(tag) = value.tape.tags.get(value.root as usize).copied() else {
+        return "{\"$enum\":\"<invalid>\",\"fields\":[]}".to_string();
+    };
+    let ctor_name = value
+        .tape
+        .tag_names
+        .get(&tag)
+        .cloned()
+        .unwrap_or_else(|| "<invalid>".to_string());
+    let fields = enum_value_fields_for_render(value, &ctor_name);
+    let rendered_fields = fields
+        .iter()
+        .map(Value::to_json_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "{{\"$enum\":{},\"fields\":[{}]}}",
+        json_string(&ctor_name),
+        rendered_fields
+    )
+}
+
+fn enum_value_fields_for_render(value: &EnumValue, ctor_name: &str) -> Vec<Value> {
+    let Some(mask) = value.tape.ctor_recursive_mask.get(ctor_name) else {
+        return Vec::new();
+    };
+    let Some(rows) = value.tape.ctor_rows.get(ctor_name) else {
+        return Vec::new();
+    };
+    let Some(slot) = value.tape.slots.get(value.root as usize) else {
+        return Vec::new();
+    };
+    let Some(row) = rows.get(*slot as usize) else {
+        return Vec::new();
+    };
+    let mut non_recursive = row.fields.iter();
+    let mut child = value.root + 1;
+    let mut out = Vec::with_capacity(mask.len());
+    for is_recursive in mask {
+        if *is_recursive {
+            out.push(Value::Enum(EnumValue {
+                enum_name: value.enum_name.clone(),
+                tape: Rc::clone(&value.tape),
+                root: child,
+            }));
+            let Some(next_child) = value.tape.ends.get(child as usize).copied() else {
+                return Vec::new();
+            };
+            child = next_child;
+        } else if let Some(field) = non_recursive.next() {
+            out.push(field.clone());
+        } else {
+            return Vec::new();
+        }
+    }
+    out
+}
+
 fn render_lifted_value_json(value: &Value, shape: &[usize], offset: usize) -> String {
     if shape.len() == 1 {
         let mut parts = Vec::with_capacity(shape[0]);
@@ -835,6 +983,7 @@ fn value_lift_shape(value: &Value) -> Option<Vec<usize>> {
             }
             shape
         }
+        Value::Enum(_) => None,
     }
 }
 
@@ -844,6 +993,7 @@ fn value_leaf_prim(value: &Value) -> Option<Prim> {
         Value::Bulk(value) => Some(value.prim),
         Value::Bool(_) | Value::String(_) | Value::TypeToken(_) => None,
         Value::Record(fields) => fields.values().find_map(value_leaf_prim),
+        Value::Enum(_) => None,
     }
 }
 
@@ -861,6 +1011,9 @@ fn extract_lifted_lane(value: &Value, index: usize) -> Result<Value> {
         )),
         Value::Scalar(_) | Value::Bool(_) | Value::String(_) => Err(SimdError::new(
             "cannot extract a lifted lane from a scalar value",
+        )),
+        Value::Enum(_) => Err(SimdError::new(
+            "cannot extract a lifted lane from an enum value",
         )),
     }
 }
@@ -932,19 +1085,17 @@ fn collect_type_leaves(ty: &Type, prefix: &LeafPath, leaves: &mut Vec<TypeLeaf>)
             path: prefix.clone(),
             ty: ty.clone(),
         }),
-        Type::Named(name, args) if args.is_empty() && (name == "string" || name == "bool") => {
-            leaves.push(TypeLeaf {
-                path: prefix.clone(),
-                ty: ty.clone(),
-            })
-        }
+        Type::Named(_, _) => leaves.push(TypeLeaf {
+            path: prefix.clone(),
+            ty: ty.clone(),
+        }),
         Type::TypeToken(_) => {}
         Type::Record(fields) => {
             for (name, field_ty) in fields {
                 collect_type_leaves(field_ty, &prefix.child(name), leaves);
             }
         }
-        Type::Named(_, _) | Type::Var(_) | Type::Infer(_) | Type::Fun(_, _) => {}
+        Type::Var(_) | Type::Infer(_) | Type::Fun(_, _) => {}
     }
 }
 
@@ -959,6 +1110,7 @@ pub fn flatten_value_leaves(value: &Value, ty: &Type) -> Result<Vec<(LeafPath, V
         (Value::Bool(_), Type::Named(name, args)) if name == "bool" && args.is_empty() => {
             Ok(vec![(LeafPath::root(), value.clone())])
         }
+        (Value::Enum(_), Type::Named(_, _)) => Ok(vec![(LeafPath::root(), value.clone())]),
         (Value::TypeToken(_), Type::TypeToken(_)) => Ok(Vec::new()),
         (Value::Record(fields), Type::Record(field_types)) => {
             let mut leaves = Vec::new();
@@ -996,6 +1148,10 @@ pub fn rebuild_value_from_leaves(ty: &Type, leaves: &BTreeMap<LeafPath, Value>) 
             .get(&LeafPath::root())
             .cloned()
             .ok_or_else(|| SimdError::new(format!("missing root leaf for type {:?}", ty))),
+        Type::Named(_, _) => leaves
+            .get(&LeafPath::root())
+            .cloned()
+            .ok_or_else(|| SimdError::new(format!("missing root leaf for type {:?}", ty))),
         Type::TypeToken(_) => Err(SimdError::new(
             "cannot rebuild type witness values from flattened leaves",
         )),
@@ -1017,7 +1173,7 @@ pub fn rebuild_value_from_leaves(ty: &Type, leaves: &BTreeMap<LeafPath, Value>) 
             }
             Ok(Value::Record(record))
         }
-        Type::Named(_, _) | Type::Var(_) | Type::Infer(_) => {
+        Type::Var(_) | Type::Infer(_) => {
             Err(SimdError::new("cannot rebuild values for unresolved types"))
         }
         Type::Fun(_, _) => Err(SimdError::new(
@@ -1054,6 +1210,7 @@ enum TokenKind {
     Import,
     As,
     Family,
+    Enum,
     TypeDecl,
     Let,
     In,
@@ -1072,6 +1229,7 @@ enum TokenKind {
     Slash,
     Percent,
     AmpAmp,
+    Pipe,
     PipePipe,
     Lt,
     Gt,
@@ -1152,6 +1310,7 @@ fn lex(source: &str) -> Result<Vec<Token>> {
                 "import" => TokenKind::Import,
                 "as" => TokenKind::As,
                 "family" => TokenKind::Family,
+                "enum" => TokenKind::Enum,
                 "type" => TokenKind::TypeDecl,
                 "let" => TokenKind::Let,
                 "in" => TokenKind::In,
@@ -1274,7 +1433,7 @@ fn lex(source: &str) -> Result<Vec<Token>> {
                 if chars.get(index + 1) == Some(&'|') {
                     (TokenKind::PipePipe, 2)
                 } else {
-                    return Err(SimdError::new("unexpected character '|' in input"));
+                    (TokenKind::Pipe, 1)
                 }
             }
             '<' => {
@@ -1365,6 +1524,10 @@ impl Parser {
         if self.peek_is(TokenKind::Family) {
             self.saw_non_import_decl = true;
             return self.parse_family_decl();
+        }
+        if self.peek_is(TokenKind::Enum) {
+            self.saw_non_import_decl = true;
+            return self.parse_enum_decl();
         }
         if self.peek_is(TokenKind::TypeDecl) {
             self.saw_non_import_decl = true;
@@ -1472,6 +1635,52 @@ impl Parser {
         }))
     }
 
+    fn parse_enum_decl(&mut self) -> Result<Decl> {
+        self.expect(TokenKind::Enum)?;
+        let name = self.expect_ident()?;
+        let mut params = Vec::new();
+        while self.peek_is(TokenKind::Ident) && !self.peek_is(TokenKind::Eq) {
+            params.push(self.expect_ident()?);
+        }
+        self.expect(TokenKind::Eq)?;
+        self.skip_newlines();
+        let mut ctors = Vec::new();
+        loop {
+            self.expect(TokenKind::Pipe)?;
+            let ctor_name = self.expect_ident()?;
+            let mut fields = Vec::new();
+            while !self.peek_is(TokenKind::Newline)
+                && !self.peek_is(TokenKind::Semicolon)
+                && !self.is_eof()
+            {
+                fields.push(self.parse_type_atom()?);
+            }
+            ctors.push(EnumCtorDecl {
+                name: ctor_name,
+                fields,
+            });
+            if self.eat(TokenKind::Semicolon) || self.peek_is(TokenKind::Newline) {
+                self.skip_newlines();
+                if !self.peek_is(TokenKind::Pipe) {
+                    break;
+                }
+                continue;
+            }
+            break;
+        }
+        if ctors.is_empty() {
+            return Err(SimdError::new(format!(
+                "enum '{}' must declare at least one constructor",
+                name
+            )));
+        }
+        Ok(Decl::Enum(EnumDecl {
+            name,
+            params,
+            ctors,
+        }))
+    }
+
     fn parse_decl_head(&mut self) -> Result<DeclHead> {
         if self.peek_is(TokenKind::LParen) {
             let (op, segments) = self.parse_operator_decl_head()?;
@@ -1541,6 +1750,30 @@ impl Parser {
             .cloned()
             .ok_or_else(|| SimdError::new("unexpected end of input in pattern"))?;
         match token.kind {
+            TokenKind::LParen => {
+                self.expect(TokenKind::LParen)?;
+                if self.peek_is(TokenKind::Ident)
+                    && self
+                        .peek()
+                        .is_some_and(|token| is_constructor_name(&token.text))
+                {
+                    let ctor_name = self.expect_ident()?;
+                    let mut subpatterns = Vec::new();
+                    while !self.peek_is(TokenKind::RParen) {
+                        subpatterns.push(self.parse_pattern()?);
+                    }
+                    self.expect(TokenKind::RParen)?;
+                    if subpatterns.is_empty() {
+                        Ok(Pattern::Name(ctor_name))
+                    } else {
+                        Ok(Pattern::Ctor(ctor_name, subpatterns))
+                    }
+                } else {
+                    let inner = self.parse_pattern()?;
+                    self.expect(TokenKind::RParen)?;
+                    Ok(inner)
+                }
+            }
             TokenKind::Ident => {
                 self.pos += 1;
                 if token.text == "_" {
@@ -1818,9 +2051,15 @@ impl Parser {
             return Ok(Expr::Project(Box::new(lhs), self.expect_ident()?));
         }
         if self.eat(TokenKind::LBrace) {
+            let fields = self.parse_record_expr_fields()?;
+            if let Expr::Ref(reference) = &lhs
+                && is_constructor_name(&reference.name)
+            {
+                return Ok(Expr::App(Box::new(lhs), Box::new(Expr::Record(fields))));
+            }
             return Ok(Expr::RecordUpdate {
                 base: Box::new(lhs),
-                fields: self.parse_record_expr_fields()?,
+                fields,
             });
         }
         Ok(lhs)
@@ -2193,6 +2432,164 @@ fn is_implicit_type_var_name(name: &str) -> bool {
             .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
 }
 
+fn is_constructor_name(name: &str) -> bool {
+    name.chars()
+        .next()
+        .is_some_and(|ch| ch.is_ascii_uppercase())
+}
+
+fn is_direct_self_recursive_field(ty: &Type, enum_decl: &EnumDecl) -> bool {
+    let Type::Named(name, args) = ty else {
+        return false;
+    };
+    if name != &enum_decl.name || args.len() != enum_decl.params.len() {
+        return false;
+    }
+    args.iter().zip(&enum_decl.params).all(|(arg, param)| {
+        matches!(arg, Type::Var(name) if name == param)
+    })
+}
+
+fn recursive_slot_paths_in_type(
+    ty: &Type,
+    enum_decl: &EnumDecl,
+    enum_names: &BTreeSet<String>,
+    prefix: &[String],
+    out: &mut Vec<Vec<String>>,
+) -> Result<()> {
+    if is_direct_self_recursive_field(ty, enum_decl) {
+        out.push(prefix.to_vec());
+        return Ok(());
+    }
+    match ty {
+        Type::Record(fields) => {
+            for (name, field_ty) in fields {
+                let mut next = prefix.to_vec();
+                next.push(name.clone());
+                recursive_slot_paths_in_type(field_ty, enum_decl, enum_names, &next, out)?;
+            }
+            Ok(())
+        }
+        Type::Named(name, args) => {
+            if enum_names.contains(name) {
+                if name != &enum_decl.name {
+                    return Err(SimdError::new(format!(
+                        "mutual recursion is not supported in v1: enum '{}' references enum '{}'",
+                        enum_decl.name, name
+                    )));
+                }
+                return Err(SimdError::new(format!(
+                    "constructor field '{:?}' of enum '{}' must use direct self recursion '{} {}' when recursive",
+                    ty,
+                    enum_decl.name,
+                    enum_decl.name,
+                    enum_decl.params.join(" ")
+                )));
+            }
+            if args.iter().any(|arg| type_contains_named_enum(arg, enum_names)) {
+                return Err(SimdError::new(format!(
+                    "constructor field '{:?}' of enum '{}' nests recursive enum occurrences through '{}'; only direct self recursion or record-contained direct recursion is supported",
+                    ty, enum_decl.name, name
+                )));
+            }
+            Ok(())
+        }
+        Type::TypeToken(inner) => {
+            recursive_slot_paths_in_type(inner, enum_decl, enum_names, prefix, out)
+        }
+        Type::Fun(args, ret) => {
+            for arg in args {
+                recursive_slot_paths_in_type(arg, enum_decl, enum_names, prefix, out)?;
+            }
+            recursive_slot_paths_in_type(ret, enum_decl, enum_names, prefix, out)
+        }
+        Type::Scalar(_) | Type::Bulk(_, _) | Type::Var(_) | Type::Infer(_) => Ok(()),
+    }
+}
+
+fn type_contains_named_enum(ty: &Type, enum_names: &BTreeSet<String>) -> bool {
+    match ty {
+        Type::Named(name, args) => {
+            enum_names.contains(name) || args.iter().any(|arg| type_contains_named_enum(arg, enum_names))
+        }
+        Type::TypeToken(inner) => type_contains_named_enum(inner, enum_names),
+        Type::Record(fields) => fields
+            .values()
+            .any(|field_ty| type_contains_named_enum(field_ty, enum_names)),
+        Type::Fun(args, ret) => {
+            args.iter().any(|arg| type_contains_named_enum(arg, enum_names))
+                || type_contains_named_enum(ret, enum_names)
+        }
+        Type::Scalar(_) | Type::Bulk(_, _) | Type::Var(_) | Type::Infer(_) => false,
+    }
+}
+
+fn validate_enum_recursive_constraints(enums: &[EnumDecl], enum_names: &BTreeSet<String>) -> Result<()> {
+    for enum_decl in enums {
+        for ctor in &enum_decl.ctors {
+            for field in &ctor.fields {
+                let mut slots = Vec::new();
+                recursive_slot_paths_in_type(field, enum_decl, enum_names, &[], &mut slots)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn build_enum_layouts(
+    enums: &[EnumDecl],
+    enum_ctors: &BTreeMap<String, EnumCtorInfo>,
+    enum_names: &BTreeSet<String>,
+) -> Result<BTreeMap<String, EnumLayout>> {
+    let mut layouts = BTreeMap::<String, EnumLayout>::new();
+    for enum_decl in enums {
+        let mut ctors = BTreeMap::<String, EnumCtorLayout>::new();
+        for ctor_decl in &enum_decl.ctors {
+            let ctor = enum_ctors.get(&ctor_decl.name).ok_or_else(|| {
+                SimdError::new(format!(
+                    "missing constructor metadata for '{}.{}'",
+                    enum_decl.name, ctor_decl.name
+                ))
+            })?;
+            let mut recursive_slots = Vec::<Vec<String>>::new();
+            let mut non_recursive_fields = Vec::<usize>::new();
+            for (field_index, field_ty) in ctor_decl.fields.iter().enumerate() {
+                let mut prefix = Vec::new();
+                prefix.push(field_index.to_string());
+                let before = recursive_slots.len();
+                recursive_slot_paths_in_type(
+                    field_ty,
+                    enum_decl,
+                    enum_names,
+                    &prefix,
+                    &mut recursive_slots,
+                )?;
+                if recursive_slots.len() == before {
+                    non_recursive_fields.push(field_index);
+                }
+            }
+            ctors.insert(
+                ctor_decl.name.clone(),
+                EnumCtorLayout {
+                    ctor_name: ctor_decl.name.clone(),
+                    tag: ctor.tag,
+                    field_types: ctor_decl.fields.clone(),
+                    recursive_slots,
+                    non_recursive_fields,
+                },
+            );
+        }
+        layouts.insert(
+            enum_decl.name.clone(),
+            EnumLayout {
+                enum_name: enum_decl.name.clone(),
+                ctors,
+            },
+        );
+    }
+    Ok(layouts)
+}
+
 fn parse_type_arg(segment: &str) -> Result<TypeArg> {
     match Prim::parse(segment) {
         Some(prim) => Ok(TypeArg::Prim(prim)),
@@ -2435,6 +2832,7 @@ fn group_program(surface: &SurfaceProgram) -> Result<Module> {
     let mut order = Vec::<String>::new();
     let mut family_order = Vec::<String>::new();
     let mut type_alias_order = Vec::<String>::new();
+    let mut enum_order = Vec::<String>::new();
     let builtin_families = builtin_family_declarations();
     let builtin_family_names = builtin_families
         .iter()
@@ -2447,6 +2845,7 @@ fn group_program(surface: &SurfaceProgram) -> Result<Module> {
         .map(|family| (family.name.clone(), family))
         .collect::<BTreeMap<_, _>>();
     let mut type_aliases = BTreeMap::<String, TypeAliasDecl>::new();
+    let mut enum_decls = BTreeMap::<String, EnumDecl>::new();
     let mut signatures = BTreeMap::<String, Signature>::new();
     let mut clauses = BTreeMap::<String, Vec<Clause>>::new();
 
@@ -2530,6 +2929,41 @@ fn group_program(surface: &SurfaceProgram) -> Result<Module> {
                     )));
                 }
             }
+            Decl::Enum(enum_decl) => {
+                if !enum_order.contains(&enum_decl.name) {
+                    enum_order.push(enum_decl.name.clone());
+                }
+                if enum_decl.params.iter().any(|param| param == "_") {
+                    return Err(SimdError::new(format!(
+                        "enum '{}' cannot use '_' as a type parameter",
+                        enum_decl.name
+                    )));
+                }
+                let mut seen_params = BTreeSet::new();
+                for param in &enum_decl.params {
+                    if !is_implicit_type_var_name(param) {
+                        return Err(SimdError::new(format!(
+                            "enum '{}' has invalid type parameter '{}'",
+                            enum_decl.name, param
+                        )));
+                    }
+                    if !seen_params.insert(param.clone()) {
+                        return Err(SimdError::new(format!(
+                            "enum '{}' repeats type parameter '{}'",
+                            enum_decl.name, param
+                        )));
+                    }
+                }
+                if enum_decls
+                    .insert(enum_decl.name.clone(), enum_decl.clone())
+                    .is_some()
+                {
+                    return Err(SimdError::new(format!(
+                        "enum '{}' is declared more than once",
+                        enum_decl.name
+                    )));
+                }
+            }
             Decl::Signature(signature) => {
                 if !order.contains(&signature.name) {
                     order.push(signature.name.clone());
@@ -2556,6 +2990,8 @@ fn group_program(surface: &SurfaceProgram) -> Result<Module> {
         }
     }
 
+    let enum_names = enum_decls.keys().cloned().collect::<BTreeSet<_>>();
+
     let mut resolved_aliases = Vec::new();
     let mut resolved_aliases_by_name = BTreeMap::new();
     for name in type_alias_order {
@@ -2564,7 +3000,13 @@ fn group_program(surface: &SurfaceProgram) -> Result<Module> {
             .ok_or_else(|| SimdError::new(format!("missing type alias '{}'", name)))?;
         let params = alias.params.iter().cloned().collect::<BTreeSet<_>>();
         let mut stack = Vec::new();
-        let body = resolve_type_aliases_in_type(&alias.body, &type_aliases, &params, &mut stack)?;
+        let body = resolve_type_aliases_in_type(
+            &alias.body,
+            &type_aliases,
+            &enum_names,
+            &params,
+            &mut stack,
+        )?;
         let alias = TypeAliasDecl {
             name: alias.name.clone(),
             params: alias.params.clone(),
@@ -2573,6 +3015,58 @@ fn group_program(surface: &SurfaceProgram) -> Result<Module> {
         resolved_aliases_by_name.insert(alias.name.clone(), alias.clone());
         resolved_aliases.push(alias);
     }
+
+    let mut resolved_enums = Vec::new();
+    let mut ctor_owner = BTreeMap::<String, String>::new();
+    for enum_name in &enum_order {
+        let decl = enum_decls
+            .get(enum_name)
+            .ok_or_else(|| SimdError::new(format!("missing enum declaration '{}'", enum_name)))?;
+        let params = decl.params.iter().cloned().collect::<BTreeSet<_>>();
+        let mut ctors = Vec::new();
+        for ctor in &decl.ctors {
+            if !is_constructor_name(&ctor.name) {
+                return Err(SimdError::new(format!(
+                    "constructor '{}' in enum '{}' must start with an uppercase letter",
+                    ctor.name, decl.name
+                )));
+            }
+            if let Some(owner) = ctor_owner.insert(ctor.name.clone(), decl.name.clone()) {
+                return Err(SimdError::new(format!(
+                    "constructor '{}' is declared in both '{}' and '{}'; constructor names must be globally unique",
+                    ctor.name, owner, decl.name
+                )));
+            }
+            let mut fields = Vec::new();
+            for field in &ctor.fields {
+                let mut stack = Vec::new();
+                fields.push(resolve_type_aliases_in_type(
+                    field,
+                    &resolved_aliases_by_name,
+                    &enum_names,
+                    &params,
+                    &mut stack,
+                )?);
+            }
+            ctors.push(EnumCtorDecl {
+                name: ctor.name.clone(),
+                fields,
+            });
+        }
+        if ctors.is_empty() {
+            return Err(SimdError::new(format!(
+                "enum '{}' must declare at least one constructor",
+                decl.name
+            )));
+        }
+        resolved_enums.push(EnumDecl {
+            name: decl.name.clone(),
+            params: decl.params.clone(),
+            ctors,
+        });
+    }
+
+    validate_enum_recursive_constraints(&resolved_enums, &enum_names)?;
 
     let mut functions = Vec::new();
     for name in order {
@@ -2587,7 +3081,8 @@ fn group_program(surface: &SurfaceProgram) -> Result<Module> {
         let mut stack = Vec::new();
         signature.ty = resolve_type_aliases_in_type(
             &signature.ty,
-            &type_aliases,
+            &resolved_aliases_by_name,
+            &enum_names,
             &BTreeSet::new(),
             &mut stack,
         )?;
@@ -2639,6 +3134,7 @@ fn group_program(surface: &SurfaceProgram) -> Result<Module> {
         family.ty = resolve_type_aliases_in_type(
             &family.ty,
             &resolved_aliases_by_name,
+            &enum_names,
             &params,
             &mut stack,
         )?;
@@ -2655,11 +3151,20 @@ fn group_program(surface: &SurfaceProgram) -> Result<Module> {
     validate_operator_coherence(&operator_instances, &alias_names)?;
     validate_family_instance_targets(&operator_instances, &family_instances, &family_names)?;
     validate_family_coherence(&family_instances, &alias_names)?;
+    for function in &functions {
+        if ctor_owner.contains_key(&function.name) {
+            return Err(SimdError::new(format!(
+                "function '{}' collides with constructor name '{}'",
+                function.name, function.name
+            )));
+        }
+    }
 
     Ok(Module {
         imports,
         families: resolved_families,
         type_aliases: resolved_aliases,
+        enums: resolved_enums,
         operator_instances,
         family_instances,
         functions,
@@ -2782,7 +3287,7 @@ fn inferred_pattern_type(pattern: &Pattern) -> Result<Option<Type>> {
         Pattern::Float(_) => Ok(Some(Type::Scalar(Prim::F64))),
         Pattern::Bool(_) => Ok(Some(builtin_bool_type())),
         Pattern::Type(prim) => Ok(Some(Type::TypeToken(Box::new(Type::Scalar(*prim))))),
-        Pattern::Name(_) | Pattern::Wildcard => Ok(None),
+        Pattern::Name(_) | Pattern::Wildcard | Pattern::Ctor(_, _) => Ok(None),
     }
 }
 
@@ -2951,13 +3456,14 @@ fn operator_segment_compatible(a: &str, b: &str, alias_names: &BTreeSet<String>)
 fn resolve_type_aliases_in_type(
     ty: &Type,
     aliases: &BTreeMap<String, TypeAliasDecl>,
+    enum_names: &BTreeSet<String>,
     bound_vars: &BTreeSet<String>,
     stack: &mut Vec<String>,
 ) -> Result<Type> {
     match ty {
         Type::Scalar(_) | Type::Bulk(_, _) | Type::Infer(_) | Type::Var(_) => Ok(ty.clone()),
         Type::TypeToken(inner) => Ok(Type::TypeToken(Box::new(resolve_type_aliases_in_type(
-            inner, aliases, bound_vars, stack,
+            inner, aliases, enum_names, bound_vars, stack,
         )?))),
         Type::Record(fields) => Ok(Type::Record(
             fields
@@ -2965,23 +3471,33 @@ fn resolve_type_aliases_in_type(
                 .map(|(name, field_ty)| {
                     Ok((
                         name.clone(),
-                        resolve_type_aliases_in_type(field_ty, aliases, bound_vars, stack)?,
+                        resolve_type_aliases_in_type(
+                            field_ty,
+                            aliases,
+                            enum_names,
+                            bound_vars,
+                            stack,
+                        )?,
                     ))
                 })
                 .collect::<Result<BTreeMap<_, _>>>()?,
         )),
         Type::Fun(args, ret) => Ok(Type::Fun(
             args.iter()
-                .map(|arg| resolve_type_aliases_in_type(arg, aliases, bound_vars, stack))
+                .map(|arg| {
+                    resolve_type_aliases_in_type(arg, aliases, enum_names, bound_vars, stack)
+                })
                 .collect::<Result<Vec<_>>>()?,
             Box::new(resolve_type_aliases_in_type(
-                ret, aliases, bound_vars, stack,
+                ret, aliases, enum_names, bound_vars, stack,
             )?),
         )),
         Type::Named(name, args) => {
             let resolved_args = args
                 .iter()
-                .map(|arg| resolve_type_aliases_in_type(arg, aliases, bound_vars, stack))
+                .map(|arg| {
+                    resolve_type_aliases_in_type(arg, aliases, enum_names, bound_vars, stack)
+                })
                 .collect::<Result<Vec<_>>>()?;
             if bound_vars.contains(name) {
                 if !resolved_args.is_empty() {
@@ -3012,7 +3528,13 @@ fn resolve_type_aliases_in_type(
                 stack.push(name.clone());
                 let alias_scope = alias.params.iter().cloned().collect::<BTreeSet<_>>();
                 let alias_body =
-                    resolve_type_aliases_in_type(&alias.body, aliases, &alias_scope, stack)?;
+                    resolve_type_aliases_in_type(
+                        &alias.body,
+                        aliases,
+                        enum_names,
+                        &alias_scope,
+                        stack,
+                    )?;
                 stack.pop();
                 let subst = alias
                     .params
@@ -3021,6 +3543,8 @@ fn resolve_type_aliases_in_type(
                     .zip(resolved_args)
                     .collect::<BTreeMap<_, _>>();
                 Ok(apply_type_subst(&alias_body, &subst))
+            } else if enum_names.contains(name) {
+                Ok(Type::Named(name.clone(), resolved_args))
             } else if resolved_args.is_empty() {
                 if name == "string" || name == "bool" {
                     Ok(Type::Named(name.clone(), Vec::new()))
@@ -3166,6 +3690,13 @@ fn check_program(module: &Module, pointwise: &BTreeMap<String, bool>) -> Result<
         .collect::<BTreeMap<_, _>>();
     let operator_index = build_operator_index(&module.operator_instances);
     let family_index = build_family_index(&module.family_instances);
+    let enum_ctor_env = build_enum_ctor_env(&module.enums)?;
+    let enum_names = module
+        .enums
+        .iter()
+        .map(|decl| decl.name.clone())
+        .collect::<BTreeSet<_>>();
+    let enum_layouts = build_enum_layouts(&module.enums, &enum_ctor_env, &enum_names)?;
 
     let mut checked_functions = Vec::new();
     for function in &module.functions {
@@ -3180,7 +3711,7 @@ fn check_program(module: &Module, pointwise: &BTreeMap<String, bool>) -> Result<
             let mut locals = BTreeMap::<String, Type>::new();
             let mut patterns = Vec::new();
             for (pattern, ty) in clause.patterns.iter().zip(&arg_types) {
-                check_pattern(pattern, ty, &mut locals)?;
+                check_pattern(pattern, ty, &mut locals, &enum_ctor_env)?;
                 patterns.push(TypedPattern {
                     pattern: pattern.clone(),
                     ty: ty.clone(),
@@ -3194,6 +3725,7 @@ fn check_program(module: &Module, pointwise: &BTreeMap<String, bool>) -> Result<
                 operator_instances: &operator_index,
                 family_instances: &family_index,
                 families: &family_types,
+                enum_ctors: &enum_ctor_env,
             };
             let body = infer_expr(
                 &clause.body,
@@ -3226,6 +3758,9 @@ fn check_program(module: &Module, pointwise: &BTreeMap<String, bool>) -> Result<
         });
     }
     Ok(CheckedProgram {
+        enum_names,
+        enum_ctors: enum_ctor_env,
+        enum_layouts,
         functions: checked_functions,
     })
 }
@@ -3369,6 +3904,7 @@ fn apply_infer_bindings_expr(expr: &mut TypedExpr, infer_bindings: &BTreeMap<u32
             }
         }
         TypedExprKind::FunctionRef { .. }
+        | TypedExprKind::ConstructorRef { .. }
         | TypedExprKind::Local(_)
         | TypedExprKind::Int(_, _)
         | TypedExprKind::Float(_, _)
@@ -3421,6 +3957,7 @@ fn collect_local_usage_types<'a>(expr: &'a TypedExpr, name: &str, out: &mut Vec<
             }
         }
         TypedExprKind::FunctionRef { .. }
+        | TypedExprKind::ConstructorRef { .. }
         | TypedExprKind::Int(_, _)
         | TypedExprKind::Float(_, _)
         | TypedExprKind::Bool(_)
@@ -3484,10 +4021,39 @@ fn apply_infer_bindings(ty: &Type, infer_bindings: &BTreeMap<u32, Type>) -> Type
     }
 }
 
-fn check_pattern(pattern: &Pattern, ty: &Type, locals: &mut BTreeMap<String, Type>) -> Result<()> {
+fn check_pattern(
+    pattern: &Pattern,
+    ty: &Type,
+    locals: &mut BTreeMap<String, Type>,
+    enum_ctors: &BTreeMap<String, EnumCtorInfo>,
+) -> Result<()> {
     match pattern {
         Pattern::Wildcard => Ok(()),
         Pattern::Name(name) => {
+            if is_constructor_name(name) && enum_ctors.contains_key(name) {
+                let ctor = enum_ctors.get(name).ok_or_else(|| {
+                    SimdError::new(format!("unknown constructor pattern '{}'", name))
+                })?;
+                if !ctor.fields.is_empty() {
+                    return Err(SimdError::new(format!(
+                        "constructor pattern '{}' with arguments must be parenthesized, e.g. ({} ...)",
+                        name, name
+                    )));
+                }
+                let Type::Named(enum_name, _args) = ty else {
+                    return Err(SimdError::new(format!(
+                        "constructor '{}' pattern requires enum type, found {:?}",
+                        name, ty
+                    )));
+                };
+                if enum_name != &ctor.enum_name {
+                    return Err(SimdError::new(format!(
+                        "constructor '{}' belongs to enum '{}', not '{}'",
+                        name, ctor.enum_name, enum_name
+                    )));
+                }
+                return Ok(());
+            }
             if matches!(ty, Type::TypeToken(_)) {
                 return Err(SimdError::new(
                     "type witness parameters cannot bind local names; use a primitive witness pattern or '_'",
@@ -3501,6 +4067,50 @@ fn check_pattern(pattern: &Pattern, ty: &Type, locals: &mut BTreeMap<String, Typ
                     "pattern name '{}' is bound more than once in one clause",
                     name
                 )));
+            }
+            Ok(())
+        }
+        Pattern::Ctor(name, subpatterns) => {
+            let ctor = enum_ctors
+                .get(name)
+                .ok_or_else(|| SimdError::new(format!("unknown constructor '{}'", name)))?;
+            let Type::Named(enum_name, enum_args) = ty else {
+                return Err(SimdError::new(format!(
+                    "constructor pattern '{}' is only valid against enum types, found {:?}",
+                    name, ty
+                )));
+            };
+            if enum_name != &ctor.enum_name {
+                return Err(SimdError::new(format!(
+                    "constructor '{}' belongs to enum '{}', not '{}'",
+                    name, ctor.enum_name, enum_name
+                )));
+            }
+            if subpatterns.len() != ctor.fields.len() {
+                return Err(SimdError::new(format!(
+                    "constructor pattern '{}' expects {} fields, found {}",
+                    name,
+                    ctor.fields.len(),
+                    subpatterns.len()
+                )));
+            }
+            if enum_args.len() != ctor.enum_params.len() {
+                return Err(SimdError::new(format!(
+                    "constructor '{}' expects {} enum type arguments, found {}",
+                    name,
+                    ctor.enum_params.len(),
+                    enum_args.len()
+                )));
+            }
+            let subst = ctor
+                .enum_params
+                .iter()
+                .cloned()
+                .zip(enum_args.iter().cloned())
+                .collect::<BTreeMap<_, _>>();
+            for (subpattern, field_ty) in subpatterns.iter().zip(&ctor.fields) {
+                let instantiated = apply_type_subst(field_ty, &subst);
+                check_pattern(subpattern, &instantiated, locals, enum_ctors)?;
             }
             Ok(())
         }
@@ -3555,6 +4165,7 @@ struct TypeContext<'a> {
     operator_instances: &'a BTreeMap<PrimOp, Vec<String>>,
     family_instances: &'a BTreeMap<String, Vec<String>>,
     families: &'a BTreeMap<String, FamilyDecl>,
+    enum_ctors: &'a BTreeMap<String, EnumCtorInfo>,
 }
 
 fn build_operator_index(instances: &[OperatorInstanceDecl]) -> BTreeMap<PrimOp, Vec<String>> {
@@ -3577,6 +4188,36 @@ fn build_family_index(instances: &[FamilyInstanceDecl]) -> BTreeMap<String, Vec<
             .push(instance.function_name.clone());
     }
     index
+}
+
+fn build_enum_ctor_env(enums: &[EnumDecl]) -> Result<BTreeMap<String, EnumCtorInfo>> {
+    let mut ctors = BTreeMap::<String, EnumCtorInfo>::new();
+    for enum_decl in enums {
+        for (tag_index, ctor) in enum_decl.ctors.iter().enumerate() {
+            let tag = u16::try_from(tag_index).map_err(|_| {
+                SimdError::new(format!(
+                    "enum '{}' has too many constructors for u16 tags",
+                    enum_decl.name
+                ))
+            })?;
+            let previous = ctors.insert(
+                ctor.name.clone(),
+                EnumCtorInfo {
+                    enum_name: enum_decl.name.clone(),
+                    enum_params: enum_decl.params.clone(),
+                    fields: ctor.fields.clone(),
+                    tag,
+                },
+            );
+            if let Some(previous) = previous {
+                return Err(SimdError::new(format!(
+                    "constructor '{}' is declared in both '{}' and '{}'",
+                    ctor.name, previous.enum_name, enum_decl.name
+                )));
+            }
+        }
+    }
+    Ok(ctors)
 }
 
 fn infer_expr(
@@ -3720,6 +4361,49 @@ fn infer_ref_expr(
             kind: TypedExprKind::TypeToken(prim),
         });
     }
+    if reference.alias.is_none()
+        && let Some(ctor) = context.enum_ctors.get(&reference.name)
+    {
+        let mut subst = constructor_subst_from_type_args(reference, ctor)?;
+        if let Some(Type::Named(name, args)) = expected
+            && name == &ctor.enum_name
+            && args.len() == ctor.enum_params.len()
+        {
+            for (param, arg) in ctor.enum_params.iter().zip(args.iter()) {
+                unify_type_template(&Type::Var(param.clone()), arg, &mut subst)?;
+            }
+        }
+        let ret_template = Type::Named(
+            ctor.enum_name.clone(),
+            ctor.enum_params
+                .iter()
+                .map(|param| Type::Var(param.clone()))
+                .collect(),
+        );
+        let mut ty = constructor_apply_result_type(ctor, &ret_template, 0, &subst);
+        if let Some(expected_ty) = expected
+            && &ty != expected_ty
+            && !matches!(expected_ty, Type::Var(_) | Type::Infer(_))
+        {
+            let mut trial = subst.clone();
+            if unify_type_template(&ty, expected_ty, &mut trial).is_ok() {
+                ty = apply_type_subst(&ty, &trial);
+            } else {
+                return Err(SimdError::new(format!(
+                    "constructor reference '{}' has type {:?}, expected {:?}",
+                    render_ref_expr(reference),
+                    ty,
+                    expected_ty
+                )));
+            }
+        }
+        return Ok(TypedExpr {
+            ty,
+            kind: TypedExprKind::ConstructorRef {
+                name: reference.name.clone(),
+            },
+        });
+    }
     let resolved_name = resolve_ref_name(reference, context).ok_or_else(|| {
         SimdError::new(format!(
             "unknown function reference '{}'{}",
@@ -3781,6 +4465,7 @@ fn infer_lambda_expr(
         operator_instances: context.operator_instances,
         family_instances: context.family_instances,
         families: context.families,
+        enum_ctors: context.enum_ctors,
     };
     let typed_body = infer_expr(body, &body_context, Some(&ret_ty))?;
     if typed_body.ty != ret_ty {
@@ -3819,6 +4504,7 @@ fn infer_let_expr(
             operator_instances: context.operator_instances,
             family_instances: context.family_instances,
             families: context.families,
+            enum_ctors: context.enum_ctors,
         };
         let typed = infer_expr(&binding.expr, &binding_context, None)?;
         if binding.name != "_" {
@@ -3839,6 +4525,7 @@ fn infer_let_expr(
         operator_instances: context.operator_instances,
         family_instances: context.family_instances,
         families: context.families,
+        enum_ctors: context.enum_ctors,
     };
     let typed_body = infer_expr(body, &body_context, expected)?;
     Ok(TypedExpr {
@@ -4354,6 +5041,11 @@ fn infer_apply_expr(
     if let Some(direct_call) = infer_direct_function_call(head, &args_exprs, context, expected)? {
         return Ok(direct_call);
     }
+    if let Expr::Ref(reference) = head
+        && let Some(typed) = infer_direct_constructor_apply(reference, &args_exprs, context, expected)?
+    {
+        return Ok(typed);
+    }
     let mut typed = infer_expr(head, context, None)?;
     for arg_expr in args_exprs {
         let (param_ty, rest_ty) = match &typed.ty {
@@ -4397,6 +5089,128 @@ fn infer_apply_expr(
         }
     }
     Ok(typed)
+}
+
+fn infer_direct_constructor_apply(
+    reference: &RefExpr,
+    args_exprs: &[&Expr],
+    context: &TypeContext<'_>,
+    expected: Option<&Type>,
+) -> Result<Option<TypedExpr>> {
+    if reference.alias.is_some() {
+        return Ok(None);
+    }
+    let Some(ctor) = context.enum_ctors.get(&reference.name) else {
+        return Ok(None);
+    };
+    if args_exprs.len() > ctor.fields.len() {
+        return Err(SimdError::new(format!(
+            "constructor '{}' expects {} arguments, found {}",
+            reference.name,
+            ctor.fields.len(),
+            args_exprs.len()
+        )));
+    }
+    let mut subst = constructor_subst_from_type_args(reference, ctor)?;
+    if let Some(Type::Named(name, args)) = expected
+        && name == &ctor.enum_name
+        && args.len() == ctor.enum_params.len()
+    {
+        for (param, arg) in ctor.enum_params.iter().zip(args.iter()) {
+            unify_type_template(&Type::Var(param.clone()), arg, &mut subst)?;
+        }
+    }
+    let ret_template = Type::Named(
+        ctor.enum_name.clone(),
+        ctor.enum_params
+            .iter()
+            .map(|param| Type::Var(param.clone()))
+            .collect(),
+    );
+    let mut typed = TypedExpr {
+        ty: constructor_apply_result_type(ctor, &ret_template, 0, &subst),
+        kind: TypedExprKind::ConstructorRef {
+            name: reference.name.clone(),
+        },
+    };
+    for (index, expr_arg) in args_exprs.iter().enumerate() {
+        let param_template = apply_type_subst(&ctor.fields[index], &subst);
+        let typed_arg = if matches!(param_template, Type::Var(_) | Type::Infer(_)) {
+            infer_expr(expr_arg, context, None)?
+        } else {
+            infer_expr(expr_arg, context, Some(&param_template))?
+        };
+        unify_type_template(&param_template, &typed_arg.ty, &mut subst)?;
+        typed = TypedExpr {
+            ty: constructor_apply_result_type(ctor, &ret_template, index + 1, &subst),
+            kind: TypedExprKind::Apply {
+                callee: Box::new(typed),
+                arg: Box::new(typed_arg),
+            },
+        };
+    }
+    if let Some(expected_ty) = expected
+        && &typed.ty != expected_ty
+        && !matches!(expected_ty, Type::Var(_) | Type::Infer(_))
+    {
+        let mut trial = subst.clone();
+        if unify_type_template(&typed.ty, expected_ty, &mut trial).is_ok() {
+            typed.ty = apply_type_subst(&typed.ty, &trial);
+        } else {
+            return Err(SimdError::new(format!(
+                "constructor application '{}' has type {:?}, expected {:?}",
+                reference.name, typed.ty, expected_ty
+            )));
+        }
+    }
+    Ok(Some(typed))
+}
+
+fn constructor_apply_result_type(
+    ctor: &EnumCtorInfo,
+    ret_template: &Type,
+    consumed_args: usize,
+    subst: &BTreeMap<String, Type>,
+) -> Type {
+    let remaining = ctor
+        .fields
+        .iter()
+        .skip(consumed_args)
+        .map(|ty| apply_type_subst(ty, subst))
+        .collect::<Vec<_>>();
+    let ret = apply_type_subst(ret_template, subst);
+    if remaining.is_empty() {
+        ret
+    } else {
+        Type::Fun(remaining, Box::new(ret))
+    }
+}
+
+fn constructor_subst_from_type_args(
+    reference: &RefExpr,
+    ctor: &EnumCtorInfo,
+) -> Result<BTreeMap<String, Type>> {
+    if reference.type_args.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    if reference.type_args.len() != ctor.enum_params.len() {
+        return Err(SimdError::new(format!(
+            "constructor '{}' expects {} type arguments, found {}",
+            reference.name,
+            ctor.enum_params.len(),
+            reference.type_args.len()
+        )));
+    }
+    let mut subst = BTreeMap::new();
+    for (param, type_arg) in ctor.enum_params.iter().zip(reference.type_args.iter()) {
+        let ty = match type_arg {
+            TypeArg::Prim(prim) => Type::Scalar(*prim),
+            TypeArg::Name(name) if is_implicit_type_var_name(name) => Type::Var(name.clone()),
+            TypeArg::Name(name) => Type::Named(name.clone(), Vec::new()),
+        };
+        subst.insert(param.clone(), ty);
+    }
+    Ok(subst)
 }
 
 fn infer_direct_function_call(
@@ -5443,6 +6257,7 @@ fn visit_tail_calls(
     match &expr.kind {
         TypedExprKind::Local(_)
         | TypedExprKind::FunctionRef { .. }
+        | TypedExprKind::ConstructorRef { .. }
         | TypedExprKind::Int(_, _)
         | TypedExprKind::Float(_, _)
         | TypedExprKind::Bool(_)
@@ -5546,6 +6361,7 @@ fn normalize_records(checked: &CheckedProgram) -> Result<NormalizedProgram> {
                 entry,
                 &entry_map,
                 result_leaf,
+                &checked.enum_ctors,
             )?);
         }
     }
@@ -5566,11 +6382,67 @@ fn checked_uses_type_witness(checked: &CheckedProgram) -> bool {
     })
 }
 
+fn checked_uses_enum(checked: &CheckedProgram, enum_names: &BTreeSet<String>) -> bool {
+    if enum_names.is_empty() {
+        return false;
+    }
+    checked.functions.iter().any(|function| {
+        type_contains_named_enum(&function.signature.ty, enum_names)
+            || function.clauses.iter().any(|clause| {
+                clause
+                    .patterns
+                    .iter()
+                    .any(|pattern| pattern_uses_enum(&pattern.pattern))
+                    || typed_expr_uses_enum(&clause.body)
+            })
+    })
+}
+
+fn pattern_uses_enum(pattern: &Pattern) -> bool {
+    match pattern {
+        Pattern::Ctor(_, _) => true,
+        Pattern::Int(_)
+        | Pattern::Float(_)
+        | Pattern::Bool(_)
+        | Pattern::Type(_)
+        | Pattern::Name(_)
+        | Pattern::Wildcard => false,
+    }
+}
+
+fn typed_expr_uses_enum(expr: &TypedExpr) -> bool {
+    match &expr.kind {
+        TypedExprKind::ConstructorRef { .. } => true,
+        TypedExprKind::Local(_)
+        | TypedExprKind::FunctionRef { .. }
+        | TypedExprKind::Int(_, _)
+        | TypedExprKind::Float(_, _)
+        | TypedExprKind::Bool(_)
+        | TypedExprKind::String(_)
+        | TypedExprKind::TypeToken(_) => false,
+        TypedExprKind::Lambda { body, .. } => typed_expr_uses_enum(body),
+        TypedExprKind::Let { bindings, body } => {
+            bindings.iter().any(|binding| typed_expr_uses_enum(&binding.expr))
+                || typed_expr_uses_enum(body)
+        }
+        TypedExprKind::Record(fields) => fields.values().any(typed_expr_uses_enum),
+        TypedExprKind::Project { base, .. } => typed_expr_uses_enum(base),
+        TypedExprKind::RecordUpdate { base, fields } => {
+            typed_expr_uses_enum(base) || fields.values().any(typed_expr_uses_enum)
+        }
+        TypedExprKind::Call { args, .. } => args.iter().any(|arg| typed_expr_uses_enum(&arg.expr)),
+        TypedExprKind::Apply { callee, arg } => {
+            typed_expr_uses_enum(callee) || typed_expr_uses_enum(arg)
+        }
+    }
+}
+
 fn typed_expr_uses_type_witness(expr: &TypedExpr) -> bool {
     match &expr.kind {
         TypedExprKind::TypeToken(_) => true,
         TypedExprKind::Local(_)
         | TypedExprKind::FunctionRef { .. }
+        | TypedExprKind::ConstructorRef { .. }
         | TypedExprKind::Int(_, _)
         | TypedExprKind::Float(_, _)
         | TypedExprKind::Bool(_)
@@ -5601,6 +6473,7 @@ fn normalize_function_leaf(
     entry: &NormalizedEntry,
     entry_map: &BTreeMap<String, NormalizedEntry>,
     result_leaf: &TypeLeaf,
+    enum_ctors: &BTreeMap<String, EnumCtorInfo>,
 ) -> Result<NormalizedFunction> {
     let mut param_types = Vec::new();
     for leaves in &entry.param_leaves {
@@ -5622,15 +6495,13 @@ fn normalize_function_leaf(
                             pattern: Pattern::Name(local_name.clone()),
                             ty: leaf.ty.clone(),
                         });
-                        locals
-                            .entry(name.clone())
-                            .or_default()
-                            .push(LocalLeafBinding {
-                                path: leaf.path.clone(),
-                                local_name,
-                                ty: leaf.ty.clone(),
-                            });
                     }
+                    collect_pattern_local_leaf_bindings(
+                        &typed_pattern.pattern,
+                        &typed_pattern.ty,
+                        enum_ctors,
+                        &mut locals,
+                    )?;
                 }
                 Pattern::Wildcard => {
                     for leaf in leaves {
@@ -5685,6 +6556,24 @@ fn normalize_function_leaf(
                         )));
                     }
                 }
+                Pattern::Ctor(_, _) => {
+                    if leaves.len() != 1 {
+                        return Err(SimdError::new(format!(
+                            "constructor pattern in '{}' must normalize to exactly one leaf",
+                            function.name
+                        )));
+                    }
+                    patterns.push(TypedPattern {
+                        pattern: typed_pattern.pattern.clone(),
+                        ty: leaves[0].ty.clone(),
+                    });
+                    collect_pattern_local_leaf_bindings(
+                        &typed_pattern.pattern,
+                        &typed_pattern.ty,
+                        enum_ctors,
+                        &mut locals,
+                    )?;
+                }
             }
         }
 
@@ -5720,6 +6609,63 @@ fn normalize_function_leaf(
     })
 }
 
+fn collect_pattern_local_leaf_bindings(
+    pattern: &Pattern,
+    ty: &Type,
+    enum_ctors: &BTreeMap<String, EnumCtorInfo>,
+    locals: &mut BTreeMap<String, Vec<LocalLeafBinding>>,
+) -> Result<()> {
+    match pattern {
+        Pattern::Name(name) => {
+            if name == "_" || (is_constructor_name(name) && enum_ctors.contains_key(name)) {
+                return Ok(());
+            }
+            for leaf in flatten_type_leaves(ty) {
+                locals
+                    .entry(name.clone())
+                    .or_default()
+                    .push(LocalLeafBinding {
+                        path: leaf.path.clone(),
+                        local_name: normalized_local_name(name, &leaf.path),
+                        ty: leaf.ty.clone(),
+                    });
+            }
+            Ok(())
+        }
+        Pattern::Ctor(name, subpatterns) => {
+            let ctor = enum_ctors
+                .get(name)
+                .ok_or_else(|| SimdError::new(format!("unknown constructor '{}'", name)))?;
+            let Type::Named(enum_name, enum_args) = ty else {
+                return Err(SimdError::new(format!(
+                    "constructor pattern '{}' expected enum type, found {:?}",
+                    name, ty
+                )));
+            };
+            if enum_name != &ctor.enum_name {
+                return Err(SimdError::new(format!(
+                    "constructor '{}' belongs to enum '{}', not '{}'",
+                    name, ctor.enum_name, enum_name
+                )));
+            }
+            let subst = ctor
+                .enum_params
+                .iter()
+                .cloned()
+                .zip(enum_args.iter().cloned())
+                .collect::<BTreeMap<_, _>>();
+            for (subpattern, field_ty) in subpatterns.iter().zip(&ctor.fields) {
+                let instantiated = apply_type_subst(field_ty, &subst);
+                collect_pattern_local_leaf_bindings(subpattern, &instantiated, enum_ctors, locals)?;
+            }
+            Ok(())
+        }
+        Pattern::Wildcard | Pattern::Int(_) | Pattern::Float(_) | Pattern::Bool(_) | Pattern::Type(_) => {
+            Ok(())
+        }
+    }
+}
+
 fn normalize_expr_to_leaf(
     expr: &TypedExpr,
     requested: &LeafPath,
@@ -5729,12 +6675,18 @@ fn normalize_expr_to_leaf(
     let leaf_ty = lookup_leaf_type(&expr.ty, requested)?;
     match &expr.kind {
         TypedExprKind::Local(name) => {
-            let leaves = locals.get(name).ok_or_else(|| {
-                SimdError::new(format!("unknown local '{}' during normalization", name))
-            })?;
+            let leaves = if let Some(leaves) = locals.get(name) {
+                leaves
+            } else {
+                let synthesized = normalized_local_name(name, requested);
+                locals.get(&synthesized).ok_or_else(|| {
+                    SimdError::new(format!("unknown local '{}' during normalization", name))
+                })?
+            };
             let binding = leaves
                 .iter()
                 .find(|leaf| leaf.path == *requested)
+                .or_else(|| leaves.iter().find(|leaf| leaf.path.is_root()))
                 .ok_or_else(|| {
                     SimdError::new(format!(
                         "local '{}' does not contain leaf path {:?}",
@@ -5793,12 +6745,47 @@ fn normalize_expr_to_leaf(
         TypedExprKind::TypeToken(_) => Err(SimdError::new(
             "type witness expressions are compile-time only and cannot appear in normalized leaves",
         )),
-        TypedExprKind::FunctionRef { .. }
-        | TypedExprKind::Lambda { .. }
-        | TypedExprKind::Apply { .. } => {
+        TypedExprKind::FunctionRef { .. } | TypedExprKind::Lambda { .. } => {
             return Err(SimdError::new(
                 "record normalization does not yet support higher-order expressions",
             ));
+        }
+        TypedExprKind::ConstructorRef { name } => {
+            if !requested.is_root() {
+                return Err(SimdError::new(format!(
+                    "constructor '{}' cannot normalize to non-root leaf {:?}",
+                    name, requested
+                )));
+            }
+            Ok(TypedExpr {
+                ty: leaf_ty,
+                kind: TypedExprKind::ConstructorRef { name: name.clone() },
+            })
+        },
+        TypedExprKind::Apply { callee, arg } => {
+            if !requested.is_root() {
+                return Err(SimdError::new(format!(
+                    "application cannot normalize to non-root leaf {:?}",
+                    requested
+                )));
+            }
+            Ok(TypedExpr {
+                ty: leaf_ty,
+                kind: TypedExprKind::Apply {
+                    callee: Box::new(normalize_expr_to_leaf(
+                        callee,
+                        &LeafPath::root(),
+                        locals,
+                        entries,
+                    )?),
+                    arg: Box::new(normalize_expr_to_leaf(
+                        arg,
+                        &LeafPath::root(),
+                        locals,
+                        entries,
+                    )?),
+                },
+            })
         }
         TypedExprKind::Let { bindings, body } => {
             let mut normalized_bindings = Vec::<TypedLetBinding>::new();
@@ -5842,6 +6829,26 @@ fn normalize_expr_to_leaf(
             }
         }
         TypedExprKind::Record(fields) => {
+            if requested.is_root() {
+                let normalized_fields = fields
+                    .iter()
+                    .map(|(name, field_expr)| {
+                        Ok((
+                            name.clone(),
+                            normalize_expr_to_leaf(
+                                field_expr,
+                                &LeafPath::root(),
+                                locals,
+                                entries,
+                            )?,
+                        ))
+                    })
+                    .collect::<Result<BTreeMap<_, _>>>()?;
+                return Ok(TypedExpr {
+                    ty: leaf_ty,
+                    kind: TypedExprKind::Record(normalized_fields),
+                });
+            }
             let (field, rest) = requested.split_first().ok_or_else(|| {
                 SimdError::new("record expression must normalize to a concrete leaf path")
             })?;
@@ -5985,16 +6992,12 @@ fn lookup_leaf_type(ty: &Type, path: &LeafPath) -> Result<Type> {
             Type::TypeToken(_) => Err(SimdError::new(
                 "type witness values cannot appear as normalized leaf results",
             )),
-            Type::Record(_) => Err(SimdError::new(format!(
-                "record type {:?} requires a concrete leaf path",
-                ty
-            ))),
-            Type::Named(_, _) | Type::Var(_) | Type::Infer(_) => Err(SimdError::new(
+            Type::Record(_) => Ok(ty.clone()),
+            Type::Named(_, _) => Ok(ty.clone()),
+            Type::Var(_) | Type::Infer(_) => Err(SimdError::new(
                 "unresolved type variables cannot appear as normalized leaves",
             )),
-            Type::Fun(_, _) => Err(SimdError::new(
-                "function type cannot appear as a normalized leaf",
-            )),
+            Type::Fun(_, _) => Ok(ty.clone()),
         };
     }
     let (field, rest) = path
@@ -6029,6 +7032,7 @@ fn collect_typed_local_names(expr: &TypedExpr, names: &mut BTreeSet<String>) {
             names.insert(name.clone());
         }
         TypedExprKind::FunctionRef { .. }
+        | TypedExprKind::ConstructorRef { .. }
         | TypedExprKind::Int(_, _)
         | TypedExprKind::Float(_, _)
         | TypedExprKind::Bool(_)
@@ -6333,6 +7337,29 @@ fn optimize_ir_expr(expr: &IrExpr) -> IrExpr {
         IrExprKind::Local(name) => IrExprKind::Local(name.clone()),
         IrExprKind::Int(value, prim) => IrExprKind::Int(*value, *prim),
         IrExprKind::Float(value, prim) => IrExprKind::Float(*value, *prim),
+        IrExprKind::Record(fields) => IrExprKind::Record(
+            fields
+                .iter()
+                .map(|(name, field)| (name.clone(), optimize_ir_expr(field)))
+                .collect(),
+        ),
+        IrExprKind::EnumCtor { ctor, args } => IrExprKind::EnumCtor {
+            ctor: ctor.clone(),
+            args: args.iter().map(optimize_ir_expr).collect(),
+        },
+        IrExprKind::EnumTag { value } => IrExprKind::EnumTag {
+            value: Box::new(optimize_ir_expr(value)),
+        },
+        IrExprKind::EnumChildBySlot { value, ctor, slot } => IrExprKind::EnumChildBySlot {
+            value: Box::new(optimize_ir_expr(value)),
+            ctor: ctor.clone(),
+            slot: *slot,
+        },
+        IrExprKind::EnumNonRecField { value, ctor, field } => IrExprKind::EnumNonRecField {
+            value: Box::new(optimize_ir_expr(value)),
+            ctor: ctor.clone(),
+            field: *field,
+        },
         IrExprKind::Call { callee, args } => {
             let args = args.iter().map(optimize_ir_expr).collect::<Vec<_>>();
             fold_int_prim_call(expr.ty.clone(), callee.clone(), args)
@@ -6452,6 +7479,19 @@ fn rewrite_locals(expr: &mut IrExpr, alias: &BTreeMap<String, String>) {
                 rewrite_locals(arg, alias);
             }
         }
+        IrExprKind::Record(fields) => {
+            for field in fields.values_mut() {
+                rewrite_locals(field, alias);
+            }
+        }
+        IrExprKind::EnumCtor { args, .. } => {
+            for arg in args {
+                rewrite_locals(arg, alias);
+            }
+        }
+        IrExprKind::EnumTag { value }
+        | IrExprKind::EnumChildBySlot { value, .. }
+        | IrExprKind::EnumNonRecField { value, .. } => rewrite_locals(value, alias),
         IrExprKind::Int(_, _) | IrExprKind::Float(_, _) => {}
     }
 }
@@ -6491,6 +7531,19 @@ fn collect_ir_local_names_into(expr: &IrExpr, names: &mut BTreeSet<String>) {
                 collect_ir_local_names_into(arg, names);
             }
         }
+        IrExprKind::Record(fields) => {
+            for field in fields.values() {
+                collect_ir_local_names_into(field, names);
+            }
+        }
+        IrExprKind::EnumCtor { args, .. } => {
+            for arg in args {
+                collect_ir_local_names_into(arg, names);
+            }
+        }
+        IrExprKind::EnumTag { value }
+        | IrExprKind::EnumChildBySlot { value, .. }
+        | IrExprKind::EnumNonRecField { value, .. } => collect_ir_local_names_into(value, names),
         IrExprKind::Int(_, _) | IrExprKind::Float(_, _) => {}
     }
 }
@@ -6589,6 +7642,7 @@ fn count_primitive_ops(expr: &IrExpr) -> usize {
             callee: Callee::Function(_) | Callee::Builtin(_),
             args,
         } => args.iter().map(count_primitive_ops).sum(),
+        IrExprKind::Record(fields) => fields.values().map(count_primitive_ops).sum(),
         IrExprKind::Let { bindings, body } => {
             bindings
                 .iter()
@@ -6596,6 +7650,10 @@ fn count_primitive_ops(expr: &IrExpr) -> usize {
                 .sum::<usize>()
                 + count_primitive_ops(body)
         }
+        IrExprKind::EnumCtor { args, .. } => args.iter().map(count_primitive_ops).sum(),
+        IrExprKind::EnumTag { value }
+        | IrExprKind::EnumChildBySlot { value, .. }
+        | IrExprKind::EnumNonRecField { value, .. } => count_primitive_ops(value),
         IrExprKind::Local(_) | IrExprKind::Int(_, _) | IrExprKind::Float(_, _) => 0,
     }
 }
@@ -6631,15 +7689,7 @@ fn lower_function(function: &NormalizedFunction) -> Result<LoweredFunction> {
                 clauses,
             }
         }
-        Type::Scalar(_) => {
-            let clauses = function
-                .clauses
-                .iter()
-                .map(|clause| lower_clause(clause, &param_access, None))
-                .collect::<Result<Vec<_>>>()?;
-            LoweredKind::Scalar { clauses }
-        }
-        Type::Named(name, args) if args.is_empty() && (name == "string" || name == "bool") => {
+        Type::Scalar(_) | Type::Named(_, _) => {
             let clauses = function
                 .clauses
                 .iter()
@@ -6657,7 +7707,7 @@ fn lower_function(function: &NormalizedFunction) -> Result<LoweredFunction> {
                 "normalized lowering encountered an unexpected type witness result",
             ));
         }
-        Type::Named(_, _) | Type::Var(_) | Type::Infer(_) => {
+        Type::Var(_) | Type::Infer(_) => {
             return Err(SimdError::new(format!(
                 "function '{}' has unsupported return type '{:?}' for loop lowering",
                 function.name, function.signature.ty
@@ -6767,8 +7817,11 @@ fn collect_scalar_locals(clause: &TypedClause) -> BTreeMap<String, Type> {
 fn lower_expr_to_ir(
     expr: &TypedExpr,
     kernel_shape: Option<&Shape>,
-    locals: &BTreeMap<String, Type>,
+    _locals: &BTreeMap<String, Type>,
 ) -> Result<IrExpr> {
+    if let Some(lowered) = try_lower_constructor_apply(expr, kernel_shape, _locals)? {
+        return Ok(lowered);
+    }
     match &expr.kind {
         TypedExprKind::Local(name) => {
             let lowered_ty = match (&expr.ty, kernel_shape) {
@@ -6780,12 +7833,6 @@ fn lower_expr_to_ir(
             if matches!(lowered_ty, Type::Bulk(_, _)) {
                 return Err(SimdError::new(format!(
                     "cannot lower bulk local '{}' into scalar loop IR directly",
-                    name
-                )));
-            }
-            if !locals.contains_key(name) {
-                return Err(SimdError::new(format!(
-                    "unknown local '{}' during lowering",
                     name
                 )));
             }
@@ -6802,6 +7849,17 @@ fn lower_expr_to_ir(
             ty: Type::Scalar(*prim),
             kind: IrExprKind::Float(*value, *prim),
         }),
+        TypedExprKind::Record(fields) => Ok(IrExpr {
+            ty: expr.ty.clone(),
+            kind: IrExprKind::Record(
+                fields
+                    .iter()
+                    .map(|(name, field)| {
+                        Ok((name.clone(), lower_expr_to_ir(field, kernel_shape, _locals)?))
+                    })
+                    .collect::<Result<BTreeMap<_, _>>>()?,
+            ),
+        }),
         TypedExprKind::Bool(_) => Err(SimdError::new(
             "bool expressions are currently evaluator-only and are not supported by loop lowering",
         )),
@@ -6811,14 +7869,27 @@ fn lower_expr_to_ir(
         TypedExprKind::TypeToken(_) => Err(SimdError::new(
             "type witness expressions are not supported by loop lowering",
         )),
-        TypedExprKind::FunctionRef { .. }
-        | TypedExprKind::Lambda { .. }
-        | TypedExprKind::Apply { .. } => Err(SimdError::new(
+        TypedExprKind::ConstructorRef { name } => {
+            let Type::Named(_, _) = &expr.ty else {
+                return Err(SimdError::new(format!(
+                    "unsaturated constructor '{}' cannot be lowered",
+                    name
+                )));
+            };
+            Ok(IrExpr {
+                ty: expr.ty.clone(),
+                kind: IrExprKind::EnumCtor {
+                    ctor: name.clone(),
+                    args: Vec::new(),
+                },
+            })
+        },
+        TypedExprKind::FunctionRef { .. } | TypedExprKind::Lambda { .. } | TypedExprKind::Apply { .. } => Err(SimdError::new(
             "higher-order expressions are not supported by loop lowering",
         )),
         TypedExprKind::Let { bindings, body } => {
             let mut lowered_bindings = Vec::new();
-            let mut extended_locals = locals.clone();
+            let mut extended_locals = _locals.clone();
             for binding in bindings {
                 let expr = lower_expr_to_ir(&binding.expr, kernel_shape, &extended_locals)?;
                 extended_locals.insert(binding.name.clone(), expr.ty.clone());
@@ -6836,8 +7907,7 @@ fn lower_expr_to_ir(
                 },
             })
         }
-        TypedExprKind::Record(_)
-        | TypedExprKind::Project { .. }
+        TypedExprKind::Project { .. }
         | TypedExprKind::RecordUpdate { .. } => Err(SimdError::new(
             "record expressions are not yet supported by loop lowering",
         )),
@@ -6855,7 +7925,7 @@ fn lower_expr_to_ir(
             }
             let mut lowered_args = Vec::new();
             for arg in args {
-                lowered_args.push(lower_expr_to_ir(&arg.expr, kernel_shape, locals)?);
+                lowered_args.push(lower_expr_to_ir(&arg.expr, kernel_shape, _locals)?);
             }
             let lowered_ty = match (&expr.ty, kernel_shape) {
                 (Type::Bulk(prim, shape), Some(kernel_shape)) if shape == kernel_shape => {
@@ -6872,6 +7942,60 @@ fn lower_expr_to_ir(
             })
         }
     }
+}
+
+fn flatten_typed_apply_chain<'a>(expr: &'a TypedExpr) -> (&'a TypedExpr, Vec<&'a TypedExpr>) {
+    let mut args = Vec::new();
+    let mut head = expr;
+    while let TypedExprKind::Apply { callee, arg } = &head.kind {
+        args.push(arg.as_ref());
+        head = callee.as_ref();
+    }
+    args.reverse();
+    (head, args)
+}
+
+fn try_lower_constructor_apply(
+    expr: &TypedExpr,
+    kernel_shape: Option<&Shape>,
+    locals: &BTreeMap<String, Type>,
+) -> Result<Option<IrExpr>> {
+    let TypedExprKind::Apply { .. } = &expr.kind else {
+        return Ok(None);
+    };
+    let (head, args) = flatten_typed_apply_chain(expr);
+    let TypedExprKind::ConstructorRef { name } = &head.kind else {
+        return Ok(None);
+    };
+    let Type::Fun(params, ret) = &head.ty else {
+        return Err(SimdError::new(format!(
+            "constructor '{}' application head is not a function type",
+            name
+        )));
+    };
+    if params.len() != args.len() {
+        return Err(SimdError::new(format!(
+            "unsaturated constructor '{}' application is not supported by loop lowering",
+            name
+        )));
+    }
+    let Type::Named(_, _) = ret.as_ref() else {
+        return Err(SimdError::new(format!(
+            "constructor '{}' does not produce enum type",
+            name
+        )));
+    };
+    let mut lowered_args = Vec::new();
+    for arg in args {
+        lowered_args.push(lower_expr_to_ir(arg, kernel_shape, locals)?);
+    }
+    Ok(Some(IrExpr {
+        ty: expr.ty.clone(),
+        kind: IrExprKind::EnumCtor {
+            ctor: name.clone(),
+            args: lowered_args,
+        },
+    }))
 }
 
 #[derive(Clone)]
@@ -6892,6 +8016,10 @@ enum EvalValue<'a> {
 #[derive(Clone)]
 enum Closure<'a> {
     Function {
+        name: String,
+        bound_args: Vec<Binding<'a>>,
+    },
+    Constructor {
         name: String,
         bound_args: Vec<Binding<'a>>,
     },
@@ -6947,7 +8075,12 @@ fn parse_host_args(args_json: &str, checked: &CheckedProgram, main: &str) -> Res
         .map(|ty| apply_type_subst(ty, &type_subst))
         .collect::<Vec<_>>();
     for (item, ty) in items.iter().zip(&concrete_params) {
-        values.push(value_from_json(item, ty, &mut shape_env)?);
+        values.push(value_from_json(
+            item,
+            ty,
+            &mut shape_env,
+            &checked.enum_names,
+        )?);
     }
     Ok(values)
 }
@@ -6968,6 +8101,7 @@ fn parse_json_type_witness_prim(json: &JsonValue) -> Result<Prim> {
 
 struct Evaluator<'a> {
     functions: BTreeMap<String, &'a CheckedFunction>,
+    enum_ctors: BTreeMap<String, EnumCtorInfo>,
 }
 
 impl<'a> Evaluator<'a> {
@@ -6977,7 +8111,11 @@ impl<'a> Evaluator<'a> {
             .iter()
             .map(|function| (function.name.clone(), function))
             .collect();
-        Self { functions }
+        let enum_ctors = program.enum_ctors.clone();
+        Self {
+            functions,
+            enum_ctors,
+        }
     }
 
     fn run_function(&self, name: &str, args: Vec<Value>) -> Result<Value> {
@@ -7041,8 +8179,25 @@ impl<'a> Evaluator<'a> {
         match &pattern.pattern {
             Pattern::Wildcard => Ok(true),
             Pattern::Name(name) => {
+                if is_constructor_name(name) && self.enum_ctors.contains_key(name) {
+                    let ctor = self.enum_ctors.get(name).ok_or_else(|| {
+                        SimdError::new(format!("unknown constructor '{}'", name))
+                    })?;
+                    if !ctor.fields.is_empty() {
+                        return Err(SimdError::new(format!(
+                            "constructor pattern '{}' with arguments must use parenthesized form",
+                            name
+                        )));
+                    }
+                    let value = self.expect_host_value(self.force_binding(binding)?)?;
+                    return self.match_enum_ctor_pattern(name, &[], value, env);
+                }
                 env.insert(name.clone(), binding.clone());
                 Ok(true)
+            }
+            Pattern::Ctor(name, subpatterns) => {
+                let value = self.expect_host_value(self.force_binding(binding)?)?;
+                self.match_enum_ctor_pattern(name, subpatterns, value, env)
             }
             Pattern::Type(expected) => {
                 let Value::TypeToken(actual) =
@@ -7078,6 +8233,76 @@ impl<'a> Evaluator<'a> {
         }
     }
 
+    fn match_enum_ctor_pattern(
+        &self,
+        ctor_name: &str,
+        subpatterns: &[Pattern],
+        value: Value,
+        env: &mut Env<'a>,
+    ) -> Result<bool> {
+        let Value::Enum(enum_value) = value else {
+            return Ok(false);
+        };
+        let ctor = self
+            .enum_ctors
+            .get(ctor_name)
+            .ok_or_else(|| SimdError::new(format!("unknown constructor '{}'", ctor_name)))?;
+        if ctor.enum_name != enum_value.enum_name {
+            return Ok(false);
+        }
+        let Some(tag) = enum_value.tape.tags.get(enum_value.root as usize) else {
+            return Err(SimdError::new("enum tape root is out of bounds"));
+        };
+        if *tag != ctor.tag {
+            return Ok(false);
+        }
+        if subpatterns.len() != ctor.fields.len() {
+            return Err(SimdError::new(format!(
+                "constructor pattern '{}' expects {} fields, found {}",
+                ctor_name,
+                ctor.fields.len(),
+                subpatterns.len()
+            )));
+        }
+        let row = enum_ctor_row(&enum_value, ctor_name)?;
+        let recursive_roots = enum_child_roots(&enum_value, ctor)?;
+        let mut non_recursive_index = 0usize;
+        let mut recursive_index = 0usize;
+        for (subpattern, field_ty) in subpatterns.iter().zip(&ctor.fields) {
+            let field_value = if enum_field_is_recursive(field_ty, ctor) {
+                let root = *recursive_roots.get(recursive_index).ok_or_else(|| {
+                    SimdError::new(format!(
+                        "constructor '{}' recursive child index {} is out of bounds",
+                        ctor_name, recursive_index
+                    ))
+                })?;
+                recursive_index += 1;
+                Value::Enum(EnumValue {
+                    enum_name: enum_value.enum_name.clone(),
+                    tape: Rc::clone(&enum_value.tape),
+                    root,
+                })
+            } else {
+                let value = row.fields.get(non_recursive_index).cloned().ok_or_else(|| {
+                    SimdError::new(format!(
+                        "constructor '{}' payload row is missing non-recursive field {}",
+                        ctor_name, non_recursive_index
+                    ))
+                })?;
+                non_recursive_index += 1;
+                value
+            };
+            let typed = TypedPattern {
+                pattern: subpattern.clone(),
+                ty: field_ty.clone(),
+            };
+            if !self.match_pattern(&typed, &Binding::Ready(EvalValue::Host(field_value)), env)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     fn force_binding(&self, binding: &Binding<'a>) -> Result<EvalValue<'a>> {
         match binding {
             Binding::Ready(value) => Ok(value.clone()),
@@ -7106,6 +8331,24 @@ impl<'a> Evaluator<'a> {
                 name: name.clone(),
                 bound_args: Vec::new(),
             })),
+            TypedExprKind::ConstructorRef { name } => {
+                let ctor = self
+                    .enum_ctors
+                    .get(name)
+                    .ok_or_else(|| SimdError::new(format!("unknown constructor '{}'", name)))?;
+                if ctor.fields.is_empty() {
+                    Ok(EvalValue::Host(build_enum_value(
+                        &self.enum_ctors,
+                        name,
+                        Vec::new(),
+                    )?))
+                } else {
+                    Ok(EvalValue::Closure(Closure::Constructor {
+                        name: name.clone(),
+                        bound_args: Vec::new(),
+                    }))
+                }
+            },
             TypedExprKind::Int(value, prim) => Ok(EvalValue::Host(Value::Scalar(make_int_value(
                 *value, *prim,
             )?))),
@@ -7222,6 +8465,29 @@ impl<'a> Evaluator<'a> {
                     self.call_function(function, bound_args)
                 } else {
                     Ok(EvalValue::Closure(Closure::Function { name, bound_args }))
+                }
+            }
+            Closure::Constructor {
+                name,
+                mut bound_args,
+            } => {
+                bound_args.push(arg);
+                let ctor = self
+                    .enum_ctors
+                    .get(&name)
+                    .ok_or_else(|| SimdError::new(format!("unknown constructor '{}'", name)))?;
+                if bound_args.len() == ctor.fields.len() {
+                    let mut values = Vec::with_capacity(bound_args.len());
+                    for bound in &bound_args {
+                        values.push(self.expect_host_value(self.force_binding(bound)?)?);
+                    }
+                    Ok(EvalValue::Host(build_enum_value(
+                        &self.enum_ctors,
+                        &name,
+                        values,
+                    )?))
+                } else {
+                    Ok(EvalValue::Closure(Closure::Constructor { name, bound_args }))
                 }
             }
             Closure::Lambda { param, body, env } => {
@@ -7397,6 +8663,229 @@ impl<'a> Evaluator<'a> {
             &scalar_result_ty,
             &shape,
         )?))
+    }
+}
+
+fn enum_field_is_recursive(field_ty: &Type, ctor: &EnumCtorInfo) -> bool {
+    let Type::Named(name, args) = field_ty else {
+        return false;
+    };
+    if name != &ctor.enum_name || args.len() != ctor.enum_params.len() {
+        return false;
+    }
+    args.iter().zip(&ctor.enum_params).all(|(arg, param)| {
+        matches!(arg, Type::Var(name) if name == param)
+    })
+}
+
+fn enum_child_roots(value: &EnumValue, ctor: &EnumCtorInfo) -> Result<Vec<u32>> {
+    let mut roots = Vec::new();
+    let mut child = value.root + 1;
+    for field in &ctor.fields {
+        if enum_field_is_recursive(field, ctor) {
+            let end = *value
+                .tape
+                .ends
+                .get(child as usize)
+                .ok_or_else(|| SimdError::new("enum tape child root out of bounds"))?;
+            roots.push(child);
+            child = end;
+        }
+    }
+    Ok(roots)
+}
+
+fn enum_ctor_row<'a>(value: &'a EnumValue, ctor_name: &str) -> Result<&'a EnumCtorRow> {
+    let slot = *value
+        .tape
+        .slots
+        .get(value.root as usize)
+        .ok_or_else(|| SimdError::new("enum tape root slot out of bounds"))?;
+    let rows = value
+        .tape
+        .ctor_rows
+        .get(ctor_name)
+        .ok_or_else(|| SimdError::new(format!("enum tape missing ctor row slab '{}'", ctor_name)))?;
+    rows.get(slot as usize).ok_or_else(|| {
+        SimdError::new(format!(
+            "enum tape row slot {} out of bounds for constructor '{}'",
+            slot, ctor_name
+        ))
+    })
+}
+
+fn build_enum_value(
+    ctor_env: &BTreeMap<String, EnumCtorInfo>,
+    ctor_name: &str,
+    args: Vec<Value>,
+) -> Result<Value> {
+    let ctor = ctor_env
+        .get(ctor_name)
+        .ok_or_else(|| SimdError::new(format!("unknown constructor '{}'", ctor_name)))?;
+    if args.len() != ctor.fields.len() {
+        return Err(SimdError::new(format!(
+            "constructor '{}' expects {} arguments, found {}",
+            ctor_name,
+            ctor.fields.len(),
+            args.len()
+        )));
+    }
+    let tag_names = ctor_env
+        .iter()
+        .filter(|(_, info)| info.enum_name == ctor.enum_name)
+        .map(|(name, info)| (info.tag, name.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let ctor_recursive_mask = ctor_env
+        .iter()
+        .filter(|(_, info)| info.enum_name == ctor.enum_name)
+        .map(|(name, info)| {
+            (
+                name.clone(),
+                info.fields
+                    .iter()
+                    .map(|field| enum_field_is_recursive(field, info))
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut builder = EnumTapeBuilder {
+        enum_name: ctor.enum_name.clone(),
+        tags: Vec::new(),
+        ends: Vec::new(),
+        slots: Vec::new(),
+        tag_names,
+        ctor_recursive_mask,
+        ctor_rows: BTreeMap::new(),
+        ctor_env,
+    };
+    let root = builder.append_ctor(ctor_name, args)?;
+    Ok(Value::Enum(EnumValue {
+        enum_name: ctor.enum_name.clone(),
+        tape: Rc::new(builder.finish()),
+        root,
+    }))
+}
+
+struct EnumTapeBuilder<'a> {
+    enum_name: String,
+    tags: Vec<u16>,
+    ends: Vec<u32>,
+    slots: Vec<u32>,
+    tag_names: BTreeMap<u16, String>,
+    ctor_recursive_mask: BTreeMap<String, Vec<bool>>,
+    ctor_rows: BTreeMap<String, Vec<EnumCtorRow>>,
+    ctor_env: &'a BTreeMap<String, EnumCtorInfo>,
+}
+
+impl<'a> EnumTapeBuilder<'a> {
+    fn append_ctor(&mut self, ctor_name: &str, args: Vec<Value>) -> Result<u32> {
+        let ctor = self
+            .ctor_env
+            .get(ctor_name)
+            .ok_or_else(|| SimdError::new(format!("unknown constructor '{}'", ctor_name)))?;
+        if ctor.enum_name != self.enum_name {
+            return Err(SimdError::new(format!(
+                "constructor '{}' belongs to enum '{}', not '{}'",
+                ctor_name, ctor.enum_name, self.enum_name
+            )));
+        }
+        if args.len() != ctor.fields.len() {
+            return Err(SimdError::new(format!(
+                "constructor '{}' expects {} arguments, found {}",
+                ctor_name,
+                ctor.fields.len(),
+                args.len()
+            )));
+        }
+        let node = self.tags.len() as u32;
+        self.tags.push(0);
+        self.ends.push(0);
+        self.slots.push(0);
+        let mut payload_fields = Vec::new();
+        for (field_ty, value) in ctor.fields.iter().zip(args.into_iter()) {
+            if enum_field_is_recursive(field_ty, ctor) {
+                let Value::Enum(child) = value else {
+                    return Err(SimdError::new(format!(
+                        "constructor '{}' recursive field expects enum value '{}'",
+                        ctor_name, ctor.enum_name
+                    )));
+                };
+                if child.enum_name != ctor.enum_name {
+                    return Err(SimdError::new(format!(
+                        "constructor '{}' recursive field expected enum '{}', found '{}'",
+                        ctor_name, ctor.enum_name, child.enum_name
+                    )));
+                }
+                self.append_existing_subtree(&child)?;
+            } else {
+                payload_fields.push(value);
+            }
+        }
+        let rows = self.ctor_rows.entry(ctor_name.to_string()).or_default();
+        let slot = rows.len() as u32;
+        rows.push(EnumCtorRow {
+            fields: payload_fields,
+        });
+        self.tags[node as usize] = ctor.tag;
+        self.slots[node as usize] = slot;
+        self.ends[node as usize] = self.tags.len() as u32;
+        Ok(node)
+    }
+
+    fn append_existing_subtree(&mut self, child: &EnumValue) -> Result<u32> {
+        let start = child.root as usize;
+        let end = *child
+            .tape
+            .ends
+            .get(start)
+            .ok_or_else(|| SimdError::new("enum tape child root out of bounds"))?
+            as usize;
+        if end <= start || end > child.tape.tags.len() {
+            return Err(SimdError::new("enum tape child subtree interval is invalid"));
+        }
+        let base = self.tags.len() as u32;
+        for index in start..end {
+            let tag = child.tape.tags[index];
+            let ctor_name = child.tape.tag_names.get(&tag).ok_or_else(|| {
+                SimdError::new(format!("enum tape missing constructor name for tag {}", tag))
+            })?;
+            let old_slot = child.tape.slots[index] as usize;
+            let old_row = child
+                .tape
+                .ctor_rows
+                .get(ctor_name)
+                .and_then(|rows| rows.get(old_slot))
+                .ok_or_else(|| {
+                    SimdError::new(format!(
+                        "enum tape missing payload row {} for constructor '{}'",
+                        old_slot, ctor_name
+                    ))
+                })?
+                .clone();
+            let new_rows = self.ctor_rows.entry(ctor_name.clone()).or_default();
+            let new_slot = new_rows.len() as u32;
+            new_rows.push(old_row);
+            self.tags.push(tag);
+            self.slots.push(new_slot);
+            let old_end = child.tape.ends[index];
+            let rel_end = old_end.checked_sub(start as u32).ok_or_else(|| {
+                SimdError::new("enum tape child subtree end underflow")
+            })?;
+            self.ends.push(base + rel_end);
+        }
+        Ok(base)
+    }
+
+    fn finish(self) -> EnumTape {
+        EnumTape {
+            enum_name: self.enum_name,
+            tags: self.tags,
+            ends: self.ends,
+            slots: self.slots,
+            tag_names: self.tag_names,
+            ctor_recursive_mask: self.ctor_recursive_mask,
+            ctor_rows: self.ctor_rows,
+        }
     }
 }
 
@@ -7734,7 +9223,7 @@ pub fn run_compiled_lowered_main(
         }
     }
 
-    let evaluator = LoweredEvaluator::new(&compiled.lowered);
+    let evaluator = LoweredEvaluator::new(&compiled.lowered, &compiled.checked.enum_ctors);
     let mut result_leaves = BTreeMap::new();
     for result_leaf in &entry.result_leaves {
         let leaf_function = entry.leaf_functions.get(&result_leaf.path).ok_or_else(|| {
@@ -7748,16 +9237,20 @@ pub fn run_compiled_lowered_main(
 
 struct LoweredEvaluator<'a> {
     functions: BTreeMap<String, &'a LoweredFunction>,
+    enum_ctors: BTreeMap<String, EnumCtorInfo>,
 }
 
 impl<'a> LoweredEvaluator<'a> {
-    fn new(program: &'a LoweredProgram) -> Self {
+    fn new(program: &'a LoweredProgram, enum_ctors: &BTreeMap<String, EnumCtorInfo>) -> Self {
         let functions = program
             .functions
             .iter()
             .map(|function| (function.name.clone(), function))
             .collect();
-        Self { functions }
+        Self {
+            functions,
+            enum_ctors: enum_ctors.clone(),
+        }
     }
 
     fn run_function(&self, name: &str, args: Vec<Value>) -> Result<Value> {
@@ -7767,35 +9260,7 @@ impl<'a> LoweredEvaluator<'a> {
             .copied()
             .ok_or_else(|| SimdError::new(format!("unknown lowered function '{}'", name)))?;
         match &function.kind {
-            LoweredKind::Scalar { clauses } => {
-                let scalar_args = args
-                    .into_iter()
-                    .map(|value| match value {
-                        Value::Scalar(value) => Ok(value),
-                        Value::Bulk(_) => Err(SimdError::new(format!(
-                            "scalar lowered function '{}' received bulk input",
-                            name
-                        ))),
-                        Value::TypeToken(_) => Err(SimdError::new(format!(
-                            "scalar lowered function '{}' received type witness input",
-                            name
-                        ))),
-                        Value::Bool(_) => Err(SimdError::new(format!(
-                            "scalar lowered function '{}' received bool input",
-                            name
-                        ))),
-                        Value::String(_) => Err(SimdError::new(format!(
-                            "scalar lowered function '{}' received string input",
-                            name
-                        ))),
-                        Value::Record(_) => Err(SimdError::new(format!(
-                            "scalar lowered function '{}' received record input",
-                            name
-                        ))),
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                self.run_scalar(function, clauses, scalar_args)
-            }
+            LoweredKind::Scalar { clauses } => self.run_scalar(function, clauses, args),
             LoweredKind::Kernel {
                 shape: _,
                 vector_width: _,
@@ -7809,14 +9274,14 @@ impl<'a> LoweredEvaluator<'a> {
         &self,
         function: &LoweredFunction,
         clauses: &[LoweredClause],
-        args: Vec<ScalarValue>,
+        args: Vec<Value>,
     ) -> Result<Value> {
         if let Some(tail_loop) = &function.tail_loop {
             return self.run_tail_loop(tail_loop, args);
         }
         for clause in clauses {
             if let Some(env) = self.match_lowered_clause(&clause.patterns, &args)? {
-                return Ok(Value::Scalar(self.eval_ir_expr(&clause.body, &env)?));
+                return self.eval_ir_expr(&clause.body, &env);
             }
         }
         Err(SimdError::new(format!(
@@ -7825,7 +9290,7 @@ impl<'a> LoweredEvaluator<'a> {
         )))
     }
 
-    fn run_tail_loop(&self, tail_loop: &TailLoop, mut state: Vec<ScalarValue>) -> Result<Value> {
+    fn run_tail_loop(&self, tail_loop: &TailLoop, mut state: Vec<Value>) -> Result<Value> {
         loop {
             let mut advanced = false;
             for clause in &tail_loop.clauses {
@@ -7840,7 +9305,7 @@ impl<'a> LoweredEvaluator<'a> {
                             break;
                         }
                         TailAction::Return { expr } => {
-                            return Ok(Value::Scalar(self.eval_ir_expr(expr, &env)?));
+                            return self.eval_ir_expr(expr, &env);
                         }
                     }
                 }
@@ -7875,8 +9340,12 @@ impl<'a> LoweredEvaluator<'a> {
             let mut lane_args = Vec::new();
             for (value, access) in args.iter().zip(&function.param_access) {
                 match (value, access) {
-                    (Value::Scalar(value), AccessKind::Same) => lane_args.push(value.clone()),
-                    (Value::Bulk(bulk), AccessKind::Lane) => lane_args.push(bulk.scalar_at(index)),
+                    (Value::Scalar(value), AccessKind::Same) => {
+                        lane_args.push(Value::Scalar(value.clone()))
+                    }
+                    (Value::Bulk(bulk), AccessKind::Lane) => {
+                        lane_args.push(Value::Scalar(bulk.scalar_at(index)))
+                    }
                     (Value::TypeToken(_), _) => {
                         return Err(SimdError::new(
                             "kernel lowering does not support type witness runtime values",
@@ -7905,11 +9374,14 @@ impl<'a> LoweredEvaluator<'a> {
                             "kernel lowering does not yet support record runtime values",
                         ));
                     }
+                    (Value::Enum(_), _) => {
+                        return Err(SimdError::new(
+                            "kernel lowering does not yet support enum runtime values",
+                        ));
+                    }
                 }
             }
-            let value = self
-                .run_scalar(function, clauses, lane_args)?
-                .expect_scalar()?;
+            let value = self.run_scalar(function, clauses, lane_args)?.expect_scalar()?;
             elements.push(value);
         }
         Ok(Value::Bulk(BulkValue {
@@ -7922,13 +9394,28 @@ impl<'a> LoweredEvaluator<'a> {
     fn match_lowered_clause(
         &self,
         patterns: &[TypedPattern],
-        args: &[ScalarValue],
-    ) -> Result<Option<BTreeMap<String, ScalarValue>>> {
+        args: &[Value],
+    ) -> Result<Option<BTreeMap<String, Value>>> {
         let mut env = BTreeMap::new();
         for (pattern, value) in patterns.iter().zip(args) {
             match &pattern.pattern {
                 Pattern::Wildcard => {}
                 Pattern::Name(name) => {
+                    if is_constructor_name(name) && self.enum_ctors.contains_key(name) {
+                        let ctor = self.enum_ctors.get(name).ok_or_else(|| {
+                            SimdError::new(format!("unknown constructor '{}'", name))
+                        })?;
+                        if !ctor.fields.is_empty() {
+                            return Err(SimdError::new(format!(
+                                "constructor pattern '{}' with arguments must be parenthesized",
+                                name
+                            )));
+                        }
+                        if !self.match_lowered_ctor_pattern(name, &[], value, &mut env)? {
+                            return Ok(None);
+                        }
+                        continue;
+                    }
                     env.insert(name.clone(), value.clone());
                 }
                 Pattern::Type(_) => {
@@ -7936,31 +9423,235 @@ impl<'a> LoweredEvaluator<'a> {
                         "lowered clauses cannot contain type witness patterns",
                     ));
                 }
-                Pattern::Bool(_) => {
-                    return Err(SimdError::new(
-                        "lowered clauses cannot contain bool patterns yet",
-                    ));
+                Pattern::Ctor(_, _) => {
+                    let Pattern::Ctor(name, subpatterns) = &pattern.pattern else {
+                        unreachable!();
+                    };
+                    if !self.match_lowered_ctor_pattern(name, subpatterns, value, &mut env)? {
+                        return Ok(None);
+                    }
                 }
-                Pattern::Int(expected) if matches_int_pattern(*expected, value) => {}
-                Pattern::Float(expected) if matches_float_pattern(*expected, value) => {}
-                Pattern::Int(_) | Pattern::Float(_) => return Ok(None),
+                Pattern::Bool(expected) => match value {
+                    Value::Bool(actual) if expected == actual => {}
+                    Value::Bool(_) => return Ok(None),
+                    _ => {
+                        return Err(SimdError::new(
+                            "bool pattern can only match bool runtime values",
+                        ));
+                    }
+                },
+                Pattern::Int(expected) => {
+                    let Value::Scalar(actual) = value else {
+                        return Err(SimdError::new(
+                            "integer pattern can only match scalar runtime values",
+                        ));
+                    };
+                    if !matches_int_pattern(*expected, actual) {
+                        return Ok(None);
+                    }
+                }
+                Pattern::Float(expected) => {
+                    let Value::Scalar(actual) = value else {
+                        return Err(SimdError::new(
+                            "float pattern can only match scalar runtime values",
+                        ));
+                    };
+                    if !matches_float_pattern(*expected, actual) {
+                        return Ok(None);
+                    }
+                }
             }
         }
         Ok(Some(env))
     }
 
+    fn match_lowered_ctor_pattern(
+        &self,
+        ctor_name: &str,
+        subpatterns: &[Pattern],
+        value: &Value,
+        env: &mut BTreeMap<String, Value>,
+    ) -> Result<bool> {
+        let Value::Enum(enum_value) = value else {
+            return Ok(false);
+        };
+        let ctor = self
+            .enum_ctors
+            .get(ctor_name)
+            .ok_or_else(|| SimdError::new(format!("unknown constructor '{}'", ctor_name)))?;
+        if ctor.enum_name != enum_value.enum_name {
+            return Ok(false);
+        }
+        let Some(tag) = enum_value.tape.tags.get(enum_value.root as usize) else {
+            return Err(SimdError::new("enum tape root is out of bounds"));
+        };
+        if *tag != ctor.tag {
+            return Ok(false);
+        }
+        if subpatterns.len() != ctor.fields.len() {
+            return Err(SimdError::new(format!(
+                "constructor pattern '{}' expects {} fields, found {}",
+                ctor_name,
+                ctor.fields.len(),
+                subpatterns.len()
+            )));
+        }
+        let row = enum_ctor_row(enum_value, ctor_name)?;
+        let recursive_roots = enum_child_roots(enum_value, ctor)?;
+        let mut non_recursive_index = 0usize;
+        let mut recursive_index = 0usize;
+        for (subpattern, field_ty) in subpatterns.iter().zip(&ctor.fields) {
+            let field_value = if enum_field_is_recursive(field_ty, ctor) {
+                let root = *recursive_roots.get(recursive_index).ok_or_else(|| {
+                    SimdError::new(format!(
+                        "constructor '{}' recursive child index {} is out of bounds",
+                        ctor_name, recursive_index
+                    ))
+                })?;
+                recursive_index += 1;
+                Value::Enum(EnumValue {
+                    enum_name: enum_value.enum_name.clone(),
+                    tape: Rc::clone(&enum_value.tape),
+                    root,
+                })
+            } else {
+                let value = row.fields.get(non_recursive_index).cloned().ok_or_else(|| {
+                    SimdError::new(format!(
+                        "constructor '{}' payload row is missing non-recursive field {}",
+                        ctor_name, non_recursive_index
+                    ))
+                })?;
+                non_recursive_index += 1;
+                value
+            };
+            if !self.match_lowered_pattern(subpattern, &field_value, env)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn match_lowered_pattern(
+        &self,
+        pattern: &Pattern,
+        value: &Value,
+        env: &mut BTreeMap<String, Value>,
+    ) -> Result<bool> {
+        match pattern {
+            Pattern::Wildcard => Ok(true),
+            Pattern::Name(name) => {
+                if is_constructor_name(name) && self.enum_ctors.contains_key(name) {
+                    return self.match_lowered_ctor_pattern(name, &[], value, env);
+                }
+                env.insert(name.clone(), value.clone());
+                Ok(true)
+            }
+            Pattern::Ctor(name, subpatterns) => {
+                self.match_lowered_ctor_pattern(name, subpatterns, value, env)
+            }
+            Pattern::Int(expected) => {
+                let Value::Scalar(actual) = value else {
+                    return Err(SimdError::new(
+                        "integer pattern can only match scalar runtime values",
+                    ));
+                };
+                Ok(matches_int_pattern(*expected, actual))
+            }
+            Pattern::Float(expected) => {
+                let Value::Scalar(actual) = value else {
+                    return Err(SimdError::new(
+                        "float pattern can only match scalar runtime values",
+                    ));
+                };
+                Ok(matches_float_pattern(*expected, actual))
+            }
+            Pattern::Bool(expected) => {
+                let Value::Bool(actual) = value else {
+                    return Err(SimdError::new("bool pattern can only match bool values"));
+                };
+                Ok(expected == actual)
+            }
+            Pattern::Type(prim) => {
+                let Value::TypeToken(actual) = value else {
+                    return Err(SimdError::new(
+                        "type witness pattern can only match type witness values",
+                    ));
+                };
+                Ok(actual == prim)
+            }
+        }
+    }
+
     fn eval_ir_expr(
         &self,
         expr: &IrExpr,
-        env: &BTreeMap<String, ScalarValue>,
-    ) -> Result<ScalarValue> {
+        env: &BTreeMap<String, Value>,
+    ) -> Result<Value> {
         match &expr.kind {
             IrExprKind::Local(name) => env
                 .get(name)
                 .cloned()
                 .ok_or_else(|| SimdError::new(format!("unknown lowered local '{}'", name))),
-            IrExprKind::Int(value, prim) => make_int_value(*value, *prim),
-            IrExprKind::Float(value, prim) => Ok(make_float_value(*value, *prim)),
+            IrExprKind::Int(value, prim) => Ok(Value::Scalar(make_int_value(*value, *prim)?)),
+            IrExprKind::Float(value, prim) => Ok(Value::Scalar(make_float_value(*value, *prim))),
+            IrExprKind::Record(fields) => Ok(Value::Record(
+                fields
+                    .iter()
+                    .map(|(name, field_expr)| {
+                        Ok((name.clone(), self.eval_ir_expr(field_expr, env)?))
+                    })
+                    .collect::<Result<BTreeMap<_, _>>>()?,
+            )),
+            IrExprKind::EnumCtor { ctor, args } => {
+                let values = args
+                    .iter()
+                    .map(|arg| self.eval_ir_expr(arg, env))
+                    .collect::<Result<Vec<_>>>()?;
+                build_enum_value(&self.enum_ctors, ctor, values)
+            }
+            IrExprKind::EnumTag { value } => {
+                let Value::Enum(value) = self.eval_ir_expr(value, env)? else {
+                    return Err(SimdError::new("enum tag operator requires enum input"));
+                };
+                let tag = *value
+                    .tape
+                    .tags
+                    .get(value.root as usize)
+                    .ok_or_else(|| SimdError::new("enum tape root tag out of bounds"))?;
+                Ok(Value::Scalar(ScalarValue::I64(i64::from(tag))))
+            }
+            IrExprKind::EnumChildBySlot { value, ctor, slot } => {
+                let Value::Enum(value) = self.eval_ir_expr(value, env)? else {
+                    return Err(SimdError::new("enum child operator requires enum input"));
+                };
+                let ctor_info = self.enum_ctors.get(ctor).ok_or_else(|| {
+                    SimdError::new(format!("unknown constructor '{}'", ctor))
+                })?;
+                let roots = enum_child_roots(&value, ctor_info)?;
+                let root = *roots.get(*slot).ok_or_else(|| {
+                    SimdError::new(format!(
+                        "enum child slot {} is out of bounds for constructor '{}'",
+                        slot, ctor
+                    ))
+                })?;
+                Ok(Value::Enum(EnumValue {
+                    enum_name: value.enum_name.clone(),
+                    tape: Rc::clone(&value.tape),
+                    root,
+                }))
+            }
+            IrExprKind::EnumNonRecField { value, ctor, field } => {
+                let Value::Enum(value) = self.eval_ir_expr(value, env)? else {
+                    return Err(SimdError::new("enum field operator requires enum input"));
+                };
+                let row = enum_ctor_row(&value, ctor)?;
+                row.fields.get(*field).cloned().ok_or_else(|| {
+                    SimdError::new(format!(
+                        "enum non-recursive field {} out of bounds for constructor '{}'",
+                        field, ctor
+                    ))
+                })
+            }
             IrExprKind::Let { bindings, body } => {
                 let mut scope = env.clone();
                 for binding in bindings {
@@ -7975,13 +9666,29 @@ impl<'a> LoweredEvaluator<'a> {
                     .map(|arg| self.eval_ir_expr(arg, env))
                     .collect::<Result<Vec<_>>>()?;
                 match callee {
-                    Callee::Prim(op) => apply_primitive(*op, &values[0], &values[1]),
+                    Callee::Prim(op) => {
+                        let lhs = values
+                            .first()
+                            .and_then(|value| match value {
+                                Value::Scalar(value) => Some(value),
+                                _ => None,
+                            })
+                            .ok_or_else(|| {
+                                SimdError::new("primitive call expected scalar left argument")
+                            })?;
+                        let rhs = values
+                            .get(1)
+                            .and_then(|value| match value {
+                                Value::Scalar(value) => Some(value),
+                                _ => None,
+                            })
+                            .ok_or_else(|| {
+                                SimdError::new("primitive call expected scalar right argument")
+                            })?;
+                        Ok(Value::Scalar(apply_primitive(*op, lhs, rhs)?))
+                    }
                     Callee::Function(name) => self
-                        .run_function(
-                            name,
-                            values.into_iter().map(Value::Scalar).collect::<Vec<_>>(),
-                        )?
-                        .expect_scalar(),
+                        .run_function(name, values),
                     Callee::Builtin(_) => Err(SimdError::new(
                         "lowered evaluator does not support builtin family calls",
                     )),
@@ -8004,6 +9711,7 @@ impl ValueExt for Value {
             Value::Record(_) => Err(SimdError::new("expected scalar value, found record")),
             Value::Bool(_) => Err(SimdError::new("expected scalar value, found bool")),
             Value::String(_) => Err(SimdError::new("expected scalar value, found string")),
+            Value::Enum(_) => Err(SimdError::new("expected scalar value, found enum")),
         }
     }
 }
@@ -8207,6 +9915,7 @@ fn value_from_json(
     json: &JsonValue,
     ty: &Type,
     shape_env: &mut BTreeMap<String, usize>,
+    enum_names: &BTreeSet<String>,
 ) -> Result<Value> {
     match ty {
         Type::Scalar(prim) => Ok(Value::Scalar(scalar_from_json_number(json, *prim)?)),
@@ -8301,7 +10010,7 @@ fn value_from_json(
                         name
                     ))
                 })?;
-                record.insert(name.clone(), value_from_json(value, ty, shape_env)?);
+                record.insert(name.clone(), value_from_json(value, ty, shape_env, enum_names)?);
             }
             if values.len() != fields.len() || values.keys().any(|name| !fields.contains_key(name))
             {
@@ -8323,6 +10032,10 @@ fn value_from_json(
                 "bool runtime argument must be a JSON boolean",
             )),
         },
+        Type::Named(name, _) if enum_names.contains(name) => Err(SimdError::new(format!(
+            "host JSON cannot provide enum parameter '{}' yet; enum values are evaluator-only output for now",
+            name
+        ))),
         Type::Named(_, _) | Type::Var(_) | Type::Infer(_) => Err(SimdError::new(
             "host JSON cannot provide values for unresolved polymorphic types",
         )),
@@ -8847,6 +10560,25 @@ mod tests {
     }
 
     #[test]
+    fn parses_recursive_enum_declaration() {
+        let program = parse_source(
+            "enum List a =\n  | Nil\n  | Cons a (List a)\n",
+        )
+        .unwrap();
+        assert_eq!(program.decls.len(), 1);
+        match &program.decls[0] {
+            Decl::Enum(enum_decl) => {
+                assert_eq!(enum_decl.name, "List");
+                assert_eq!(enum_decl.params, vec!["a".to_string()]);
+                assert_eq!(enum_decl.ctors.len(), 2);
+                assert_eq!(enum_decl.ctors[0].name, "Nil");
+                assert_eq!(enum_decl.ctors[1].name, "Cons");
+            }
+            _ => panic!("expected enum declaration"),
+        }
+    }
+
+    #[test]
     fn parses_type_alias_and_operator_instance_heads() {
         let program = parse_source(
             "type v3 a = {x:a,y:a,z:a}\n(*)\\v3\\a : v3 a -> v3 a -> v3 a\n(*)\\v3\\a lhs rhs = lhs\n",
@@ -9303,6 +11035,83 @@ mod tests {
                 .to_string()
                 .contains("Type witness parameters are currently evaluator-only")
         );
+    }
+
+    #[test]
+    fn evaluates_recursive_list_length() {
+        let src = "enum List a =\n  | Nil\n  | Cons a (List a)\n\nlen : List i64 -> i64\nlen Nil = 0\nlen (Cons _ xs) = 1 + len xs\n\nmain : i64\nmain = len (Cons 1 (Cons 2 Nil))\n";
+        assert_eq!(run(src, "main", "[]"), "2");
+    }
+
+    #[test]
+    fn evaluates_recursive_tree_sum() {
+        let src = "enum Tree a =\n  | Leaf a\n  | Bin (Tree a) (Tree a)\n\nsum : Tree i64 -> i64\nsum (Leaf x) = x\nsum (Bin l r) = sum l + sum r\n\nmain : i64\nmain = sum (Bin (Leaf 2) (Bin (Leaf 3) (Leaf 4)))\n";
+        assert_eq!(run(src, "main", "[]"), "9");
+    }
+
+    #[test]
+    fn renders_enum_output_with_enum_and_fields_markers() {
+        let src = "enum List a =\n  | Nil\n  | Cons a (List a)\n\nmain : List i64\nmain = Cons 7 Nil\n";
+        let out = run(src, "main", "[]");
+        assert!(out.contains("\"$enum\""));
+        assert!(out.contains("\"fields\""));
+        assert!(out.contains("\"Cons\""));
+        assert!(out.contains("\"Nil\""));
+    }
+
+    #[test]
+    fn lowering_accepts_enum_programs() {
+        let src = "enum List a =\n  | Nil\n  | Cons a (List a)\n\nlen : List i64 -> i64\nlen Nil = 0\nlen (Cons _ xs) = 1 + len xs\n\nmain : i64\nmain = len (Cons 1 (Cons 2 Nil))\n";
+        compile_source(src).expect("enum program should now normalize/lower");
+    }
+
+    #[test]
+    fn lowered_execution_matches_recursive_list_length() {
+        let src = "enum List a =\n  | Nil\n  | Cons a (List a)\n\nlen : List i64 -> i64\nlen Nil = 0\nlen (Cons _ xs) = 1 + len xs\n\nmain : i64\nmain = len (Cons 1 (Cons 2 Nil))\n";
+        let checked = run_main(src, "main", "[]").unwrap().to_json_string();
+        let lowered = run_lowered_main(src, "main", "[]").unwrap().to_json_string();
+        assert_eq!(checked, lowered);
+    }
+
+    #[test]
+    fn lowered_execution_matches_recursive_tree_sum() {
+        let src = "enum Tree a =\n  | Leaf a\n  | Bin (Tree a) (Tree a)\n\nsum : Tree i64 -> i64\nsum (Leaf x) = x\nsum (Bin l r) = sum l + sum r\n\nmain : i64\nmain = sum (Bin (Leaf 2) (Bin (Leaf 3) (Leaf 4)))\n";
+        let checked = run_main(src, "main", "[]").unwrap().to_json_string();
+        let lowered = run_lowered_main(src, "main", "[]").unwrap().to_json_string();
+        assert_eq!(checked, lowered);
+    }
+
+    #[test]
+    fn evaluator_and_lowering_support_record_nested_recursive_enum_field() {
+        let src = "enum BoxedList a =\n  | End\n  | Node { head: a, tail: BoxedList a }\n\nscore : BoxedList i64 -> i64\nscore End = 0\nscore (Node _) = 1\n\nmain : i64\nmain = score (Node { head = 1, tail = End })\n";
+        let checked = run_main(src, "main", "[]").unwrap().to_json_string();
+        let lowered = run_lowered_main(src, "main", "[]").unwrap().to_json_string();
+        assert_eq!(checked, lowered);
+    }
+
+    #[test]
+    fn enum_tape_uses_preorder_end_jumps_for_children() {
+        let list_src = "enum List a =\n  | Nil\n  | Cons a (List a)\n\nmain : List i64\nmain = Cons 1 (Cons 2 Nil)\n";
+        let list_value = run_main(list_src, "main", "[]").unwrap();
+        let Value::Enum(list) = list_value else {
+            panic!("expected enum result");
+        };
+        let (_, list_module, _) = compile_frontend(list_src).unwrap();
+        let list_ctors = build_enum_ctor_env(&list_module.enums).unwrap();
+        let cons = list_ctors.get("Cons").unwrap();
+        let list_children = enum_child_roots(&list, cons).unwrap();
+        assert_eq!(list_children, vec![list.root + 1]);
+
+        let tree_src = "enum Tree a =\n  | Leaf a\n  | Bin (Tree a) (Tree a)\n\nmain : Tree i64\nmain = Bin (Leaf 2) (Bin (Leaf 3) (Leaf 4))\n";
+        let tree_value = run_main(tree_src, "main", "[]").unwrap();
+        let Value::Enum(tree) = tree_value else {
+            panic!("expected enum result");
+        };
+        let (_, tree_module, _) = compile_frontend(tree_src).unwrap();
+        let tree_ctors = build_enum_ctor_env(&tree_module.enums).unwrap();
+        let bin = tree_ctors.get("Bin").unwrap();
+        let tree_children = enum_child_roots(&tree, bin).unwrap();
+        assert_eq!(tree_children[1], tree.tape.ends[tree_children[0] as usize]);
     }
 
     #[test]
