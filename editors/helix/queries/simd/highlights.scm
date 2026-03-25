@@ -10,7 +10,9 @@
 
 (enum_decl
   "enum" @keyword
-  name: (identifier) @type
+  name: (identifier) @type)
+
+(enum_decl
   param: (identifier) @type.parameter)
 
 (enum_ctor
@@ -67,9 +69,15 @@
     (prim_operator) @operator
     (identifier) @type.parameter))
 
-(clause
+((clause
+  head: (decl_head
+    (identifier) @type))
+  (#match? @type "^[A-Z]"))
+
+((clause
   head: (decl_head
     (identifier) @function))
+  (#match? @function "^[_a-z]"))
 
 ((clause
   pattern: (pattern (identifier) @variable.parameter))

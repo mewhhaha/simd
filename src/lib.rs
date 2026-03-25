@@ -6664,64 +6664,6 @@ fn checked_uses_type_witness(checked: &CheckedProgram) -> bool {
     })
 }
 
-fn checked_uses_enum(checked: &CheckedProgram, enum_names: &BTreeSet<String>) -> bool {
-    if enum_names.is_empty() {
-        return false;
-    }
-    checked.functions.iter().any(|function| {
-        type_contains_named_enum(&function.signature.ty, enum_names)
-            || function.clauses.iter().any(|clause| {
-                clause
-                    .patterns
-                    .iter()
-                    .any(|pattern| pattern_uses_enum(&pattern.pattern))
-                    || typed_expr_uses_enum(&clause.body)
-            })
-    })
-}
-
-fn pattern_uses_enum(pattern: &Pattern) -> bool {
-    match pattern {
-        Pattern::Ctor(_, _) => true,
-        Pattern::Int(_)
-        | Pattern::Float(_)
-        | Pattern::Bool(_)
-        | Pattern::Char(_)
-        | Pattern::Type(_)
-        | Pattern::Name(_)
-        | Pattern::Wildcard
-        | Pattern::Slice { .. } => false,
-    }
-}
-
-fn typed_expr_uses_enum(expr: &TypedExpr) -> bool {
-    match &expr.kind {
-        TypedExprKind::ConstructorRef { .. } => true,
-        TypedExprKind::Local(_)
-        | TypedExprKind::FunctionRef { .. }
-        | TypedExprKind::Int(_, _)
-        | TypedExprKind::Float(_, _)
-        | TypedExprKind::Bool(_)
-        | TypedExprKind::Char(_)
-        | TypedExprKind::String(_)
-        | TypedExprKind::TypeToken(_) => false,
-        TypedExprKind::Lambda { body, .. } => typed_expr_uses_enum(body),
-        TypedExprKind::Let { bindings, body } => {
-            bindings.iter().any(|binding| typed_expr_uses_enum(&binding.expr))
-                || typed_expr_uses_enum(body)
-        }
-        TypedExprKind::Record(fields) => fields.values().any(typed_expr_uses_enum),
-        TypedExprKind::Project { base, .. } => typed_expr_uses_enum(base),
-        TypedExprKind::RecordUpdate { base, fields } => {
-            typed_expr_uses_enum(base) || fields.values().any(typed_expr_uses_enum)
-        }
-        TypedExprKind::Call { args, .. } => args.iter().any(|arg| typed_expr_uses_enum(&arg.expr)),
-        TypedExprKind::Apply { callee, arg } => {
-            typed_expr_uses_enum(callee) || typed_expr_uses_enum(arg)
-        }
-    }
-}
-
 fn typed_expr_uses_type_witness(expr: &TypedExpr) -> bool {
     match &expr.kind {
         TypedExprKind::TypeToken(_) => true,

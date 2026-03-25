@@ -202,59 +202,52 @@
       ]
     },
     "enum_decl": {
-      "type": "PREC_LEFT",
-      "value": 0,
-      "content": {
-        "type": "SEQ",
-        "members": [
-          {
-            "type": "STRING",
-            "value": "enum"
-          },
-          {
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "STRING",
+          "value": "enum"
+        },
+        {
+          "type": "FIELD",
+          "name": "name",
+          "content": {
+            "type": "SYMBOL",
+            "name": "identifier"
+          }
+        },
+        {
+          "type": "REPEAT",
+          "content": {
             "type": "FIELD",
-            "name": "name",
+            "name": "param",
             "content": {
               "type": "SYMBOL",
               "name": "identifier"
             }
-          },
-          {
-            "type": "REPEAT",
-            "content": {
-              "type": "FIELD",
-              "name": "param",
-              "content": {
-                "type": "SYMBOL",
-                "name": "identifier"
-              }
-            }
-          },
-          {
-            "type": "STRING",
-            "value": "="
-          },
-          {
-            "type": "REPEAT1",
-            "content": {
-              "type": "SEQ",
-              "members": [
-                {
-                  "type": "REPEAT1",
-                  "content": {
-                    "type": "SYMBOL",
-                    "name": "_newline"
-                  }
-                },
-                {
-                  "type": "SYMBOL",
-                  "name": "enum_ctor"
-                }
-              ]
-            }
           }
-        ]
-      }
+        },
+        {
+          "type": "STRING",
+          "value": "="
+        },
+        {
+          "type": "REPEAT1",
+          "content": {
+            "type": "SEQ",
+            "members": [
+              {
+                "type": "SYMBOL",
+                "name": "_newline"
+              },
+              {
+                "type": "SYMBOL",
+                "name": "enum_ctor"
+              }
+            ]
+          }
+        }
+      ]
     },
     "enum_ctor": {
       "type": "SEQ",
@@ -1998,7 +1991,11 @@
       "name": "comment"
     }
   ],
-  "conflicts": [],
+  "conflicts": [
+    [
+      "enum_decl"
+    ]
+  ],
   "precedences": [],
   "externals": [],
   "inline": [],

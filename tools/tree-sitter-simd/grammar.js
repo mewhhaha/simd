@@ -15,6 +15,8 @@ module.exports = grammar({
 
   word: ($) => $.identifier,
 
+  conflicts: ($) => [[$.enum_decl]],
+
   rules: {
     source_file: ($) =>
       seq(
@@ -57,14 +59,12 @@ module.exports = grammar({
       ),
 
     enum_decl: ($) =>
-      prec.left(
-        seq(
-          "enum",
-          field("name", $.identifier),
-          repeat(field("param", $.identifier)),
-          "=",
-          repeat1(seq(repeat1($._newline), $.enum_ctor)),
-        ),
+      seq(
+        "enum",
+        field("name", $.identifier),
+        repeat(field("param", $.identifier)),
+        "=",
+        repeat1(seq($._newline, $.enum_ctor)),
       ),
 
     enum_ctor: ($) =>
