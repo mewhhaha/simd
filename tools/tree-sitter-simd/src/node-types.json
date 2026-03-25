@@ -244,6 +244,32 @@
     }
   },
   {
+    "type": "ctor_pattern",
+    "named": true,
+    "fields": {
+      "argument": {
+        "multiple": true,
+        "required": true,
+        "types": [
+          {
+            "type": "pattern",
+            "named": true
+          }
+        ]
+      },
+      "constructor": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "identifier",
+            "named": true
+          }
+        ]
+      }
+    }
+  },
+  {
     "type": "decl_head",
     "named": true,
     "fields": {},
@@ -279,6 +305,10 @@
           "named": true
         },
         {
+          "type": "enum_decl",
+          "named": true
+        },
+        {
           "type": "family_decl",
           "named": true
         },
@@ -311,6 +341,68 @@
         },
         {
           "type": "nat",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "enum_ctor",
+    "named": true,
+    "fields": {
+      "field": {
+        "multiple": true,
+        "required": false,
+        "types": [
+          {
+            "type": "type_atom",
+            "named": true
+          }
+        ]
+      },
+      "name": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "identifier",
+            "named": true
+          }
+        ]
+      }
+    }
+  },
+  {
+    "type": "enum_decl",
+    "named": true,
+    "fields": {
+      "name": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "identifier",
+            "named": true
+          }
+        ]
+      },
+      "param": {
+        "multiple": true,
+        "required": false,
+        "types": [
+          {
+            "type": "identifier",
+            "named": true
+          }
+        ]
+      }
+    },
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "enum_ctor",
           "named": true
         }
       ]
@@ -751,6 +843,14 @@
           "named": true
         },
         {
+          "type": "char",
+          "named": true
+        },
+        {
+          "type": "ctor_pattern",
+          "named": true
+        },
+        {
           "type": "float",
           "named": true
         },
@@ -763,7 +863,19 @@
           "named": true
         },
         {
+          "type": "pattern",
+          "named": true
+        },
+        {
           "type": "prim_type",
+          "named": true
+        },
+        {
+          "type": "slice_pattern",
+          "named": true
+        },
+        {
+          "type": "string",
           "named": true
         },
         {
@@ -979,6 +1091,56 @@
         "types": [
           {
             "type": "type",
+            "named": true
+          }
+        ]
+      }
+    }
+  },
+  {
+    "type": "slice_item",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": false,
+      "required": true,
+      "types": [
+        {
+          "type": "pattern",
+          "named": true
+        },
+        {
+          "type": "slice_rest",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "slice_pattern",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": false,
+      "types": [
+        {
+          "type": "slice_item",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "slice_rest",
+    "named": true,
+    "fields": {
+      "name": {
+        "multiple": false,
+        "required": false,
+        "types": [
+          {
+            "type": "identifier",
             "named": true
           }
         ]
@@ -1261,6 +1423,10 @@
     "named": false
   },
   {
+    "type": "...",
+    "named": false
+  },
+  {
     "type": "/",
     "named": false
   },
@@ -1329,9 +1495,17 @@
     "named": true
   },
   {
+    "type": "char",
+    "named": true
+  },
+  {
     "type": "comment",
     "named": true,
     "extra": true
+  },
+  {
+    "type": "enum",
+    "named": false
   },
   {
     "type": "f32",
@@ -1407,6 +1581,10 @@
   },
   {
     "type": "{",
+    "named": false
+  },
+  {
+    "type": "|",
     "named": false
   },
   {

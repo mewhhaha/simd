@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use tokio::sync::RwLock;
@@ -235,6 +235,50 @@ fn hover_for_position(source: &str, position: Position) -> Option<Hover> {
         });
     }
 
+    if let Some(enum_decl) = module.enums.iter().find(|enum_decl| enum_decl.name == ident.name) {
+        let params = if enum_decl.params.is_empty() {
+            String::new()
+        } else {
+            format!(" {}", enum_decl.params.join(" "))
+        };
+        let rendered = format!("```simd\nenum {}{}\n```", enum_decl.name, params);
+        return Some(Hover {
+            contents: HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: rendered,
+            }),
+            range: Some(ident.range),
+        });
+    }
+
+    if let Some((enum_decl, ctor)) = module.enums.iter().find_map(|enum_decl| {
+        enum_decl
+            .ctors
+            .iter()
+            .find(|ctor| ctor.name == ident.name)
+            .map(|ctor| (enum_decl, ctor))
+    }) {
+        let enum_result = if enum_decl.params.is_empty() {
+            enum_decl.name.clone()
+        } else {
+            format!("{} {}", enum_decl.name, enum_decl.params.join(" "))
+        };
+        let mut parts = ctor
+            .fields
+            .iter()
+            .map(format_type_for_display)
+            .collect::<Vec<_>>();
+        parts.push(enum_result);
+        let rendered = format!("```simd\n{} : {}\n```", ctor.name, parts.join(" -> "));
+        return Some(Hover {
+            contents: HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: rendered,
+            }),
+            range: Some(ident.range),
+        });
+    }
+
     if let Some(family) = module
         .families
         .iter()
@@ -303,7 +347,8 @@ fn hover_for_position(source: &str, position: Position) -> Option<Hover> {
         .functions
         .iter()
         .find(|function| function.name == context_function)?;
-    let local_types = collect_local_types(function);
+    let constructor_names = checked.enum_ctors.keys().cloned().collect::<BTreeSet<_>>();
+    let local_types = collect_local_types(function, &constructor_names);
     let candidates = local_types.get(&ident.name)?;
     if candidates.is_empty() {
         return None;
@@ -470,6 +515,9 @@ fn function_name_at_line(source: &str, line: usize) -> Option<String> {
         if trimmed.is_empty() || trimmed.starts_with("--") || trimmed.starts_with('#') {
             continue;
         }
+        if trimmed.starts_with("enum ") || trimmed.starts_with('|') {
+            continue;
+        }
         let Some((name, rest)) = parse_decl_head_and_rest(trimmed) else {
             continue;
         };
@@ -579,13 +627,17 @@ fn format_prim_op(op: PrimOp) -> &'static str {
     }
 }
 
-fn collect_local_types(function: &crate::CheckedFunction) -> BTreeMap<String, Vec<Type>> {
+fn collect_local_types(
+    function: &crate::CheckedFunction,
+    constructor_names: &BTreeSet<String>,
+) -> BTreeMap<String, Vec<Type>> {
     let mut map = BTreeMap::<String, Vec<Type>>::new();
     let (args, _) = function.signature.ty.fun_parts();
     for clause in &function.clauses {
         for (pattern, arg_ty) in clause.patterns.iter().zip(&args) {
             if let Pattern::Name(name) = &pattern.pattern
                 && name != "_"
+                && !constructor_names.contains(name)
             {
                 insert_type(&mut map, name, arg_ty.clone());
             }
@@ -607,6 +659,7 @@ fn collect_expr_local_types(expr: &TypedExpr, map: &mut BTreeMap<String, Vec<Typ
         | TypedExprKind::Int(_, _)
         | TypedExprKind::Float(_, _)
         | TypedExprKind::Bool(_)
+        | TypedExprKind::Char(_)
         | TypedExprKind::String(_)
         | TypedExprKind::TypeToken(_) => {}
         TypedExprKind::Lambda { body, .. } => collect_expr_local_types(body, map),

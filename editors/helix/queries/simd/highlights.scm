@@ -6,6 +6,16 @@
 (prim_type) @type.builtin
 (bool_type) @type.builtin
 (bool_literal) @constant.builtin
+(char) @string
+
+(enum_decl
+  "enum" @keyword
+  name: (identifier) @type
+  param: (identifier) @type.parameter)
+
+(enum_ctor
+  "|" @punctuation.delimiter
+  name: (identifier) @type)
 
 (type_witness
   "Type" @keyword)
@@ -61,8 +71,18 @@
   head: (decl_head
     (identifier) @function))
 
-(clause
+((clause
   pattern: (pattern (identifier) @variable.parameter))
+  (#match? @variable.parameter "^[_a-z]"))
+
+((pattern (identifier) @type)
+  (#match? @type "^[A-Z]"))
+
+(ctor_pattern
+  constructor: (identifier) @type)
+
+(slice_rest
+  "..." @punctuation.delimiter)
 
 (clause
   head: (decl_head
@@ -125,7 +145,9 @@
   ":"
   "->"
   "="
+  "|"
   "."
+  "..."
   ","
   ";"
   "`"

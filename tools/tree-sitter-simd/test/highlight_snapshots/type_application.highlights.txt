@@ -1,23 +1,23 @@
 /home/mewhhaha/src/simd/tools/tree-sitter-simd/test/highlight_snapshots/type_application.simd
-    pattern:  9, capture: 4 - function, start: (0, 0), end: (0, 4), text: `wrap`
-    pattern: 30, capture: 13 - punctuation.delimiter, start: (0, 5), end: (0, 6), text: `:`
-    pattern:  9, capture: 5 - type, start: (0, 7), end: (0, 23), text: `Type t -> t -> t`
-    pattern:  4, capture: 3 - keyword, start: (0, 7), end: (0, 11), text: `Type`
-    pattern: 30, capture: 13 - punctuation.delimiter, start: (0, 14), end: (0, 16), text: `->`
-    pattern: 30, capture: 13 - punctuation.delimiter, start: (0, 19), end: (0, 21), text: `->`
-    pattern: 15, capture: 4 - function, start: (1, 0), end: (1, 4), text: `wrap`
+    pattern: 12, capture: 8 - function, start: (0, 0), end: (0, 4), text: `wrap`
+    pattern: 36, capture: 7 - punctuation.delimiter, start: (0, 5), end: (0, 6), text: `:`
+    pattern: 12, capture: 5 - type, start: (0, 7), end: (0, 23), text: `Type t -> t -> t`
+    pattern:  7, capture: 4 - keyword, start: (0, 7), end: (0, 11), text: `Type`
+    pattern: 36, capture: 7 - punctuation.delimiter, start: (0, 14), end: (0, 16), text: `->`
+    pattern: 36, capture: 7 - punctuation.delimiter, start: (0, 19), end: (0, 21), text: `->`
+    pattern: 18, capture: 8 - function, start: (1, 0), end: (1, 4), text: `wrap`
     pattern:  1, capture: 1 - type.builtin, start: (1, 5), end: (1, 8), text: `i64`
-    pattern: 16, capture: 8 - variable.parameter, start: (1, 9), end: (1, 10), text: `x`
-    pattern: 30, capture: 13 - punctuation.delimiter, start: (1, 11), end: (1, 12), text: `=`
-    pattern:  9, capture: 4 - function, start: (3, 0), end: (3, 4), text: `main`
-    pattern: 30, capture: 13 - punctuation.delimiter, start: (3, 5), end: (3, 6), text: `:`
-    pattern:  9, capture: 5 - type, start: (3, 7), end: (3, 17), text: `i64 -> i64`
+    pattern: 19, capture: 10 - variable.parameter, start: (1, 9), end: (1, 10), text: `x`
+    pattern: 36, capture: 7 - punctuation.delimiter, start: (1, 11), end: (1, 12), text: `=`
+    pattern: 12, capture: 8 - function, start: (3, 0), end: (3, 4), text: `main`
+    pattern: 36, capture: 7 - punctuation.delimiter, start: (3, 5), end: (3, 6), text: `:`
+    pattern: 12, capture: 5 - type, start: (3, 7), end: (3, 17), text: `i64 -> i64`
     pattern:  1, capture: 1 - type.builtin, start: (3, 7), end: (3, 10), text: `i64`
-    pattern: 30, capture: 13 - punctuation.delimiter, start: (3, 11), end: (3, 13), text: `->`
+    pattern: 36, capture: 7 - punctuation.delimiter, start: (3, 11), end: (3, 13), text: `->`
     pattern:  1, capture: 1 - type.builtin, start: (3, 14), end: (3, 17), text: `i64`
-    pattern: 15, capture: 4 - function, start: (4, 0), end: (4, 4), text: `main`
-    pattern: 16, capture: 8 - variable.parameter, start: (4, 5), end: (4, 6), text: `x`
-    pattern: 30, capture: 13 - punctuation.delimiter, start: (4, 7), end: (4, 8), text: `=`
-    pattern:  5, capture: 4 - function, start: (4, 9), end: (4, 15), text: `scalar`
-    pattern:  5, capture: 4 - function, start: (4, 16), end: (4, 20), text: `axpy`
+    pattern: 18, capture: 8 - function, start: (4, 0), end: (4, 4), text: `main`
+    pattern: 19, capture: 10 - variable.parameter, start: (4, 5), end: (4, 6), text: `x`
+    pattern: 36, capture: 7 - punctuation.delimiter, start: (4, 7), end: (4, 8), text: `=`
+    pattern:  8, capture: 8 - function, start: (4, 9), end: (4, 15), text: `scalar`
+    pattern:  8, capture: 8 - function, start: (4, 16), end: (4, 20), text: `axpy`
     pattern:  1, capture: 1 - type.builtin, start: (4, 21), end: (4, 24), text: `i64`

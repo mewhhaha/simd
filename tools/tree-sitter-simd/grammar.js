@@ -33,6 +33,7 @@ module.exports = grammar({
         $.import_decl,
         $.type_alias,
         $.family_decl,
+        $.enum_decl,
         $.signature,
         $.clause,
       ),
@@ -53,6 +54,24 @@ module.exports = grammar({
         repeat(field("param", $.identifier)),
         "=",
         field("body", $.type),
+      ),
+
+    enum_decl: ($) =>
+      prec.left(
+        seq(
+          "enum",
+          field("name", $.identifier),
+          repeat(field("param", $.identifier)),
+          "=",
+          repeat1(seq(repeat1($._newline), $.enum_ctor)),
+        ),
+      ),
+
+    enum_ctor: ($) =>
+      seq(
+        "|",
+        field("name", $.identifier),
+        repeat(field("field", $.type_atom)),
       ),
 
     family_decl: ($) =>
@@ -124,7 +143,38 @@ module.exports = grammar({
       ),
 
     pattern: ($) =>
-      choice($.wildcard, $.bool_literal, $.prim_type, $.identifier, $.int, $.float),
+      choice(
+        $.wildcard,
+        $.bool_literal,
+        $.char,
+        $.string,
+        $.slice_pattern,
+        $.ctor_pattern,
+        $.prim_type,
+        $.identifier,
+        $.int,
+        $.float,
+        seq("(", $.pattern, ")"),
+      ),
+
+    ctor_pattern: ($) =>
+      seq(
+        "(",
+        field("constructor", $.identifier),
+        repeat1(field("argument", $.pattern)),
+        ")",
+      ),
+
+    slice_pattern: ($) =>
+      seq(
+        "[",
+        optional(seq($.slice_item, repeat(seq(",", $.slice_item)))),
+        "]",
+      ),
+
+    slice_item: ($) => choice($.slice_rest, $.pattern),
+
+    slice_rest: ($) => choice("...", seq("...", field("name", $.identifier))),
 
     type: ($) =>
       choice(
@@ -328,6 +378,7 @@ module.exports = grammar({
       seq(field("name", $.identifier), "=", field("value", $.expr)),
 
     wildcard: (_) => "_",
+    char: () => token(seq("'", choice(/[^'\\\n]/, seq("\\", /./)), "'")),
     string: () =>
       token(
         seq(
@@ -336,7 +387,7 @@ module.exports = grammar({
           '"',
         ),
       ),
-    identifier: (_) => /[a-z][a-zA-Z0-9_]*/,
+    identifier: (_) => /[A-Za-z][a-zA-Z0-9_]*/,
     nat: (_) => /[0-9]+/,
     int: (_) => /[0-9]+/,
     float: (_) => /[0-9]+\.[0-9]+/,

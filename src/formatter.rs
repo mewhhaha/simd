@@ -53,6 +53,9 @@ pub fn format_program(program: &SurfaceProgram) -> String {
                 (Decl::TypeAlias(_), Decl::TypeAlias(_)) => "\n",
                 (Decl::TypeAlias(_), _) => "\n\n",
                 (_, Decl::TypeAlias(_)) => "\n\n",
+                (Decl::Enum(_), Decl::Enum(_)) => "\n",
+                (Decl::Enum(_), _) => "\n\n",
+                (_, Decl::Enum(_)) => "\n\n",
                 (Decl::Signature(left), Decl::Clause(right)) if left.name == right.name => "\n",
                 (Decl::Clause(left), Decl::Clause(right)) if left.name == right.name => "\n",
                 _ => "\n\n",
@@ -92,15 +95,15 @@ fn format_enum_decl(enum_decl: &crate::EnumDecl) -> String {
         out.push(' ');
         out.push_str(&enum_decl.params.join(" "));
     }
-    out.push_str(" =\n");
+    out.push_str(" =");
     for ctor in &enum_decl.ctors {
+        out.push('\n');
         out.push_str("  | ");
         out.push_str(&ctor.name);
         for field in &ctor.fields {
             out.push(' ');
             out.push_str(&format_type(field));
         }
-        out.push('\n');
     }
     out
 }
@@ -243,6 +246,7 @@ fn format_pattern(pattern: &Pattern) -> String {
         Pattern::Int(value) => value.to_string(),
         Pattern::Float(value) => super::format_float(*value),
         Pattern::Bool(value) => value.to_string(),
+        Pattern::Char(value) => format_char_literal(*value),
         Pattern::Type(prim) => format_prim(*prim).to_string(),
         Pattern::Ctor(name, subpatterns) => {
             let mut out = name.to_string();
@@ -255,6 +259,11 @@ fn format_pattern(pattern: &Pattern) -> String {
             }
             format!("({})", out)
         }
+        Pattern::Slice {
+            prefix,
+            suffix,
+            rest,
+        } => format_slice_pattern(prefix, suffix, rest.as_ref()),
         Pattern::Name(name) => name.clone(),
         Pattern::Wildcard => "_".to_string(),
     }
@@ -266,6 +275,7 @@ fn format_expr(expr: &Expr, min_prec: u8) -> String {
         Expr::Int(value) => value.to_string(),
         Expr::Float(value) => super::format_float(*value),
         Expr::Bool(value) => value.to_string(),
+        Expr::Char(value) => format_char_literal(*value),
         Expr::String(value) => format_string_literal(value),
         Expr::Lambda { param, body } => {
             format!("\\{} -> {}", param, format_expr(body, PREC_LET))
@@ -373,6 +383,7 @@ fn expr_precedence(expr: &Expr) -> u8 {
         | Expr::Int(_)
         | Expr::Float(_)
         | Expr::Bool(_)
+        | Expr::Char(_)
         | Expr::String(_)
         | Expr::Record(_) => PREC_ATOM,
     }
@@ -411,6 +422,37 @@ fn format_string_literal(value: &str) -> String {
     out
 }
 
+fn format_char_literal(value: char) -> String {
+    let mut out = String::from("'");
+    match value {
+        '\'' => out.push_str("\\'"),
+        '\\' => out.push_str("\\\\"),
+        '\n' => out.push_str("\\n"),
+        '\r' => out.push_str("\\r"),
+        '\t' => out.push_str("\\t"),
+        _ => out.push(value),
+    }
+    out.push('\'');
+    out
+}
+
+fn format_slice_pattern(prefix: &[Pattern], suffix: &[Pattern], rest: Option<&crate::SliceRest>) -> String {
+    let mut parts = Vec::<String>::new();
+    for pattern in prefix {
+        parts.push(format_pattern(pattern));
+    }
+    if let Some(rest) = rest {
+        match rest {
+            crate::SliceRest::Bind(name) => parts.push(format!("...{}", name)),
+            crate::SliceRest::Ignore => parts.push("...".to_string()),
+        }
+    }
+    for pattern in suffix {
+        parts.push(format_pattern(pattern));
+    }
+    format!("[{}]", parts.join(", "))
+}
+
 fn infix_binding_power(op: PrimOp) -> (u8, u8) {
     match op {
         PrimOp::Mul | PrimOp::Div | PrimOp::Mod => (PREC_MUL, PREC_MUL + 1),
@@ -427,6 +469,7 @@ fn format_prim(prim: Prim) -> &'static str {
         Prim::I64 => "i64",
         Prim::F32 => "f32",
         Prim::F64 => "f64",
+        Prim::Char => "char",
     }
 }
 
