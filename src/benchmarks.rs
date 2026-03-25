@@ -992,6 +992,7 @@ fn prim_label(prim: Prim) -> &'static str {
         Prim::I64 => "i64",
         Prim::F32 => "f32",
         Prim::F64 => "f64",
+        Prim::Char => "char",
     }
 }
 
@@ -1047,6 +1048,12 @@ fn build_matrix_unary_input(prim: Prim, size: usize) -> BenchInput {
         Prim::I32 => (0..size)
             .map(|index| ScalarValue::I32((index % 1024) as i32))
             .collect::<Vec<_>>(),
+        Prim::Char => (0..size)
+            .map(|index| {
+                let code = 32u32 + (index % 95) as u32;
+                ScalarValue::Char(char::from_u32(code).unwrap_or(' '))
+            })
+            .collect::<Vec<_>>(),
         Prim::I64 => (0..size)
             .map(|index| ScalarValue::I64((index % 1024) as i64))
             .collect::<Vec<_>>(),
@@ -1073,6 +1080,12 @@ fn build_matrix_axpy_input(prim: Prim, size: usize) -> BenchInput {
         Prim::I32 => (0..size)
             .map(|index| ScalarValue::I32((index % 257) as i32))
             .collect::<Vec<_>>(),
+        Prim::Char => (0..size)
+            .map(|index| {
+                let code = 33u32 + (index % 90) as u32;
+                ScalarValue::Char(char::from_u32(code).unwrap_or('!'))
+            })
+            .collect::<Vec<_>>(),
         Prim::I64 => (0..size)
             .map(|index| ScalarValue::I64((index % 257) as i64))
             .collect::<Vec<_>>(),
@@ -1086,6 +1099,12 @@ fn build_matrix_axpy_input(prim: Prim, size: usize) -> BenchInput {
     let ys = match prim {
         Prim::I32 => (0..size)
             .map(|index| ScalarValue::I32(((index * 3) % 257) as i32))
+            .collect::<Vec<_>>(),
+        Prim::Char => (0..size)
+            .map(|index| {
+                let code = 33u32 + ((index * 3) % 90) as u32;
+                ScalarValue::Char(char::from_u32(code).unwrap_or('!'))
+            })
             .collect::<Vec<_>>(),
         Prim::I64 => (0..size)
             .map(|index| ScalarValue::I64(((index * 3) % 257) as i64))
@@ -1104,6 +1123,7 @@ fn build_matrix_axpy_input(prim: Prim, size: usize) -> BenchInput {
                 Prim::F64 => Value::Scalar(ScalarValue::F64(7.0)),
                 Prim::I32 => Value::Scalar(ScalarValue::I32(7)),
                 Prim::I64 => Value::Scalar(ScalarValue::I64(7)),
+                Prim::Char => Value::Scalar(ScalarValue::Char('\u{7}')),
             },
             Value::Bulk(BulkValue {
                 prim,
@@ -1126,6 +1146,12 @@ fn build_matrix_axpy2_input(prim: Prim, size: usize) -> BenchInput {
         Prim::I32 => (0..size)
             .map(|index| ScalarValue::I32((index % 257) as i32))
             .collect::<Vec<_>>(),
+        Prim::Char => (0..size)
+            .map(|index| {
+                let code = 33u32 + (index % 90) as u32;
+                ScalarValue::Char(char::from_u32(code).unwrap_or('!'))
+            })
+            .collect::<Vec<_>>(),
         Prim::I64 => (0..size)
             .map(|index| ScalarValue::I64((index % 257) as i64))
             .collect::<Vec<_>>(),
@@ -1139,6 +1165,12 @@ fn build_matrix_axpy2_input(prim: Prim, size: usize) -> BenchInput {
     let uy = match prim {
         Prim::I32 => (0..size)
             .map(|index| ScalarValue::I32(((index * 3) % 257) as i32))
+            .collect::<Vec<_>>(),
+        Prim::Char => (0..size)
+            .map(|index| {
+                let code = 33u32 + ((index * 3) % 90) as u32;
+                ScalarValue::Char(char::from_u32(code).unwrap_or('!'))
+            })
             .collect::<Vec<_>>(),
         Prim::I64 => (0..size)
             .map(|index| ScalarValue::I64(((index * 3) % 257) as i64))
@@ -1154,6 +1186,12 @@ fn build_matrix_axpy2_input(prim: Prim, size: usize) -> BenchInput {
         Prim::I32 => (0..size)
             .map(|index| ScalarValue::I32(((index * 5) % 257) as i32))
             .collect::<Vec<_>>(),
+        Prim::Char => (0..size)
+            .map(|index| {
+                let code = 33u32 + ((index * 5) % 90) as u32;
+                ScalarValue::Char(char::from_u32(code).unwrap_or('!'))
+            })
+            .collect::<Vec<_>>(),
         Prim::I64 => (0..size)
             .map(|index| ScalarValue::I64(((index * 5) % 257) as i64))
             .collect::<Vec<_>>(),
@@ -1167,6 +1205,12 @@ fn build_matrix_axpy2_input(prim: Prim, size: usize) -> BenchInput {
     let vy = match prim {
         Prim::I32 => (0..size)
             .map(|index| ScalarValue::I32(((index * 7) % 257) as i32))
+            .collect::<Vec<_>>(),
+        Prim::Char => (0..size)
+            .map(|index| {
+                let code = 33u32 + ((index * 7) % 90) as u32;
+                ScalarValue::Char(char::from_u32(code).unwrap_or('!'))
+            })
             .collect::<Vec<_>>(),
         Prim::I64 => (0..size)
             .map(|index| ScalarValue::I64(((index * 7) % 257) as i64))
@@ -1185,6 +1229,7 @@ fn build_matrix_axpy2_input(prim: Prim, size: usize) -> BenchInput {
                 Prim::F64 => Value::Scalar(ScalarValue::F64(7.0)),
                 Prim::I32 => Value::Scalar(ScalarValue::I32(7)),
                 Prim::I64 => Value::Scalar(ScalarValue::I64(7)),
+                Prim::Char => Value::Scalar(ScalarValue::Char('\u{7}')),
             },
             Value::Record(std::collections::BTreeMap::from([
                 (
@@ -1235,6 +1280,12 @@ fn build_matrix_rank2_square_input(prim: Prim, size: usize) -> BenchInput {
         Prim::I32 => (0..size)
             .map(|index| ScalarValue::I32((index % 4096) as i32))
             .collect::<Vec<_>>(),
+        Prim::Char => (0..size)
+            .map(|index| {
+                let code = 33u32 + (index % 90) as u32;
+                ScalarValue::Char(char::from_u32(code).unwrap_or('!'))
+            })
+            .collect::<Vec<_>>(),
         Prim::I64 => (0..size)
             .map(|index| ScalarValue::I64((index % 4096) as i64))
             .collect::<Vec<_>>(),
@@ -1263,6 +1314,12 @@ fn build_matrix_rank2_affine_input(prim: Prim, size: usize) -> BenchInput {
         Prim::I32 => (0..size)
             .map(|index| ScalarValue::I32((index % 4096) as i32))
             .collect::<Vec<_>>(),
+        Prim::Char => (0..size)
+            .map(|index| {
+                let code = 33u32 + (index % 90) as u32;
+                ScalarValue::Char(char::from_u32(code).unwrap_or('!'))
+            })
+            .collect::<Vec<_>>(),
         Prim::I64 => (0..size)
             .map(|index| ScalarValue::I64((index % 4096) as i64))
             .collect::<Vec<_>>(),
@@ -1278,12 +1335,14 @@ fn build_matrix_rank2_affine_input(prim: Prim, size: usize) -> BenchInput {
         Prim::I64 => Value::Scalar(ScalarValue::I64(3)),
         Prim::F32 => Value::Scalar(ScalarValue::F32(1.75)),
         Prim::F64 => Value::Scalar(ScalarValue::F64(1.75)),
+        Prim::Char => Value::Scalar(ScalarValue::Char('\u{3}')),
     };
     let bias = match prim {
         Prim::I32 => Value::Scalar(ScalarValue::I32(11)),
         Prim::I64 => Value::Scalar(ScalarValue::I64(11)),
         Prim::F32 => Value::Scalar(ScalarValue::F32(0.125)),
         Prim::F64 => Value::Scalar(ScalarValue::F64(0.125)),
+        Prim::Char => Value::Scalar(ScalarValue::Char('\u{b}')),
     };
     BenchInput {
         args: vec![
@@ -1797,6 +1856,9 @@ fn expect_scalar_prim(args: &[Value], index: usize, prim: Prim) -> Result<f64> {
         Some(Value::Scalar(ScalarValue::I64(value))) if prim == Prim::I64 => Ok(*value as f64),
         Some(Value::Scalar(ScalarValue::F32(value))) if prim == Prim::F32 => Ok(*value as f64),
         Some(Value::Scalar(ScalarValue::F64(value))) if prim == Prim::F64 => Ok(*value),
+        Some(Value::Scalar(ScalarValue::Char(value))) if prim == Prim::Char => {
+            Ok(u32::from(*value) as f64)
+        }
         Some(other) => Err(SimdError::new(format!(
             "expected {} scalar at argument {}, found {:?}",
             prim_label(prim),
@@ -1960,6 +2022,7 @@ fn parse_prim_label(label: &str) -> Option<Prim> {
         "i64" => Some(Prim::I64),
         "f32" => Some(Prim::F32),
         "f64" => Some(Prim::F64),
+        "char" => Some(Prim::Char),
         _ => None,
     }
 }
@@ -2165,6 +2228,8 @@ fn handcrafted_matrix_axpy2_record_artifact(prim: Prim) -> Result<WasmArtifact> 
             ],
         },
         grouped_export: None,
+        result_type: Type::Scalar(Prim::I64),
+        enum_ctors: BTreeMap::new(),
         leaf_exports,
         optimizer_reports: vec![WasmOptimizationReport {
             function: format!("handcrafted_matrix_axpy2_record_{}", prim_label(prim)),
@@ -2252,6 +2317,8 @@ fn handcrafted_matrix_image_tone_rgb_f32_artifact() -> Result<WasmArtifact> {
             ],
         },
         grouped_export: None,
+        result_type: Type::Scalar(Prim::I64),
+        enum_ctors: BTreeMap::new(),
         leaf_exports: vec![
             WasmLeafExport {
                 leaf_path: LeafPath(vec!["r".to_string()]),
@@ -2403,6 +2470,8 @@ fn handcrafted_matrix_image_blend_rgb_f32_artifact() -> Result<WasmArtifact> {
             ],
         },
         grouped_export: None,
+        result_type: Type::Scalar(Prim::I64),
+        enum_ctors: BTreeMap::new(),
         leaf_exports: vec![
             WasmLeafExport {
                 leaf_path: LeafPath(vec!["r".to_string()]),
@@ -2468,6 +2537,8 @@ fn build_handcrafted_single_leaf_artifact(
             shape_param,
         },
         grouped_export: None,
+        result_type: Type::Scalar(Prim::I64),
+        enum_ctors: BTreeMap::new(),
         leaf_exports: vec![WasmLeafExport {
             leaf_path: LeafPath::root(),
             export_name: "main".to_string(),
@@ -3021,26 +3092,27 @@ fn handcrafted_val_type(prim: Prim) -> ValType {
         Prim::I64 => ValType::I64,
         Prim::F32 => ValType::F32,
         Prim::F64 => ValType::F64,
+        Prim::Char => ValType::I32,
     }
 }
 
 fn handcrafted_lane_count(prim: Prim) -> u32 {
     match prim {
-        Prim::I32 | Prim::F32 => 4,
+        Prim::I32 | Prim::Char | Prim::F32 => 4,
         Prim::I64 | Prim::F64 => 2,
     }
 }
 
 fn handcrafted_element_bytes(prim: Prim) -> i32 {
     match prim {
-        Prim::I32 | Prim::F32 => 4,
+        Prim::I32 | Prim::Char | Prim::F32 => 4,
         Prim::I64 | Prim::F64 => 8,
     }
 }
 
 fn handcrafted_scalar_align_log2(prim: Prim) -> u32 {
     match prim {
-        Prim::I32 | Prim::F32 => 2,
+        Prim::I32 | Prim::Char | Prim::F32 => 2,
         Prim::I64 | Prim::F64 => 3,
     }
 }
@@ -3048,6 +3120,9 @@ fn handcrafted_scalar_align_log2(prim: Prim) -> u32 {
 fn emit_scalar_const(function: &mut Function, prim: Prim, value: f64) {
     match prim {
         Prim::I32 => {
+            function.instruction(&Instruction::I32Const(value as i32));
+        }
+        Prim::Char => {
             function.instruction(&Instruction::I32Const(value as i32));
         }
         Prim::I64 => {
@@ -3066,6 +3141,7 @@ fn emit_vector_splat_const(function: &mut Function, prim: Prim, value: f64) {
     emit_scalar_const(function, prim, value);
     match prim {
         Prim::I32 => function.instruction(&Instruction::I32x4Splat),
+        Prim::Char => function.instruction(&Instruction::I32x4Splat),
         Prim::I64 => function.instruction(&Instruction::I64x2Splat),
         Prim::F32 => function.instruction(&Instruction::F32x4Splat),
         Prim::F64 => function.instruction(&Instruction::F64x2Splat),
@@ -3076,6 +3152,7 @@ fn emit_vector_splat_param(function: &mut Function, prim: Prim, param_index: u32
     function.instruction(&Instruction::LocalGet(param_index));
     match prim {
         Prim::I32 => function.instruction(&Instruction::I32x4Splat),
+        Prim::Char => function.instruction(&Instruction::I32x4Splat),
         Prim::I64 => function.instruction(&Instruction::I64x2Splat),
         Prim::F32 => function.instruction(&Instruction::F32x4Splat),
         Prim::F64 => function.instruction(&Instruction::F64x2Splat),
@@ -3086,6 +3163,7 @@ fn emit_vector_splat_local(function: &mut Function, prim: Prim, local_index: u32
     function.instruction(&Instruction::LocalGet(local_index));
     match prim {
         Prim::I32 => function.instruction(&Instruction::I32x4Splat),
+        Prim::Char => function.instruction(&Instruction::I32x4Splat),
         Prim::I64 => function.instruction(&Instruction::I64x2Splat),
         Prim::F32 => function.instruction(&Instruction::F32x4Splat),
         Prim::F64 => function.instruction(&Instruction::F64x2Splat),
@@ -3095,6 +3173,7 @@ fn emit_vector_splat_local(function: &mut Function, prim: Prim, local_index: u32
 fn emit_vector_add(function: &mut Function, prim: Prim) {
     match prim {
         Prim::I32 => function.instruction(&Instruction::I32x4Add),
+        Prim::Char => function.instruction(&Instruction::I32x4Add),
         Prim::I64 => function.instruction(&Instruction::I64x2Add),
         Prim::F32 => function.instruction(&Instruction::F32x4Add),
         Prim::F64 => function.instruction(&Instruction::F64x2Add),
@@ -3104,6 +3183,7 @@ fn emit_vector_add(function: &mut Function, prim: Prim) {
 fn emit_vector_mul(function: &mut Function, prim: Prim) {
     match prim {
         Prim::I32 => function.instruction(&Instruction::I32x4Mul),
+        Prim::Char => function.instruction(&Instruction::I32x4Mul),
         Prim::I64 => function.instruction(&Instruction::I64x2Mul),
         Prim::F32 => function.instruction(&Instruction::F32x4Mul),
         Prim::F64 => function.instruction(&Instruction::F64x2Mul),
@@ -3113,6 +3193,7 @@ fn emit_vector_mul(function: &mut Function, prim: Prim) {
 fn emit_scalar_add(function: &mut Function, prim: Prim) {
     match prim {
         Prim::I32 => function.instruction(&Instruction::I32Add),
+        Prim::Char => function.instruction(&Instruction::I32Add),
         Prim::I64 => function.instruction(&Instruction::I64Add),
         Prim::F32 => function.instruction(&Instruction::F32Add),
         Prim::F64 => function.instruction(&Instruction::F64Add),
@@ -3122,6 +3203,7 @@ fn emit_scalar_add(function: &mut Function, prim: Prim) {
 fn emit_scalar_sub(function: &mut Function, prim: Prim) {
     match prim {
         Prim::I32 => function.instruction(&Instruction::I32Sub),
+        Prim::Char => function.instruction(&Instruction::I32Sub),
         Prim::I64 => function.instruction(&Instruction::I64Sub),
         Prim::F32 => function.instruction(&Instruction::F32Sub),
         Prim::F64 => function.instruction(&Instruction::F64Sub),
@@ -3131,6 +3213,7 @@ fn emit_scalar_sub(function: &mut Function, prim: Prim) {
 fn emit_scalar_mul(function: &mut Function, prim: Prim) {
     match prim {
         Prim::I32 => function.instruction(&Instruction::I32Mul),
+        Prim::Char => function.instruction(&Instruction::I32Mul),
         Prim::I64 => function.instruction(&Instruction::I64Mul),
         Prim::F32 => function.instruction(&Instruction::F32Mul),
         Prim::F64 => function.instruction(&Instruction::F64Mul),
@@ -3141,6 +3224,7 @@ fn emit_scalar_load(function: &mut Function, prim: Prim) {
     let align = handcrafted_scalar_align_log2(prim);
     match prim {
         Prim::I32 => function.instruction(&Instruction::I32Load(handcrafted_memarg(0, align))),
+        Prim::Char => function.instruction(&Instruction::I32Load(handcrafted_memarg(0, align))),
         Prim::I64 => function.instruction(&Instruction::I64Load(handcrafted_memarg(0, align))),
         Prim::F32 => function.instruction(&Instruction::F32Load(handcrafted_memarg(0, align))),
         Prim::F64 => function.instruction(&Instruction::F64Load(handcrafted_memarg(0, align))),
@@ -3151,6 +3235,7 @@ fn emit_scalar_store(function: &mut Function, prim: Prim) {
     let align = handcrafted_scalar_align_log2(prim);
     match prim {
         Prim::I32 => function.instruction(&Instruction::I32Store(handcrafted_memarg(0, align))),
+        Prim::Char => function.instruction(&Instruction::I32Store(handcrafted_memarg(0, align))),
         Prim::I64 => function.instruction(&Instruction::I64Store(handcrafted_memarg(0, align))),
         Prim::F32 => function.instruction(&Instruction::F32Store(handcrafted_memarg(0, align))),
         Prim::F64 => function.instruction(&Instruction::F64Store(handcrafted_memarg(0, align))),
@@ -3309,6 +3394,8 @@ fn handcrafted_unary_i64_artifact(
             shape_param: 0,
         },
         grouped_export: None,
+        result_type: Type::Scalar(Prim::I64),
+        enum_ctors: BTreeMap::new(),
         leaf_exports: vec![WasmLeafExport {
             leaf_path: LeafPath::root(),
             export_name: "main".to_string(),
@@ -3456,6 +3543,8 @@ fn handcrafted_square_f32_artifact() -> Result<WasmArtifact> {
             shape_param: 0,
         },
         grouped_export: None,
+        result_type: Type::Scalar(Prim::I64),
+        enum_ctors: BTreeMap::new(),
         leaf_exports: vec![WasmLeafExport {
             leaf_path: LeafPath::root(),
             export_name: "main".to_string(),
@@ -3651,6 +3740,8 @@ fn handcrafted_axpy_i64_artifact() -> Result<WasmArtifact> {
             shape_param: 1,
         },
         grouped_export: None,
+        result_type: Type::Scalar(Prim::I64),
+        enum_ctors: BTreeMap::new(),
         leaf_exports: vec![WasmLeafExport {
             leaf_path: LeafPath::root(),
             export_name: "main".to_string(),
@@ -3778,6 +3869,8 @@ fn handcrafted_axpy2_record_i64_artifact() -> Result<WasmArtifact> {
             ],
         },
         grouped_export: None,
+        result_type: Type::Scalar(Prim::I64),
+        enum_ctors: BTreeMap::new(),
         leaf_exports: leafs,
         optimizer_reports: vec![WasmOptimizationReport {
             function: "handcrafted_axpy2_record_i64".to_string(),
@@ -3998,6 +4091,7 @@ fn build_prepared_bulk_read_scratch(bound: &BoundPreparedRun) -> Vec<PreparedRea
             Prim::I64 => PreparedBulkScratch::I64(vec![0; len]),
             Prim::F32 => PreparedBulkScratch::F32(vec![0.0; len]),
             Prim::F64 => PreparedBulkScratch::F64(vec![0.0; len]),
+            Prim::Char => PreparedBulkScratch::I32(vec![0; len]),
         };
         scratch.push(PreparedReadSlotScratch {
             slot: slot.index,

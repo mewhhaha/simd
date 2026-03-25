@@ -145,10 +145,22 @@ pub enum Pattern {
     Int(i64),
     Float(f64),
     Bool(bool),
+    Char(char),
     Type(Prim),
     Name(String),
     Wildcard,
     Ctor(String, Vec<Pattern>),
+    Slice {
+        prefix: Vec<Pattern>,
+        suffix: Vec<Pattern>,
+        rest: Option<SliceRest>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum SliceRest {
+    Bind(String),
+    Ignore,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -157,6 +169,7 @@ pub enum Expr {
     Int(i64),
     Float(f64),
     Bool(bool),
+    Char(char),
     String(String),
     App(Box<Expr>, Box<Expr>),
     Lambda {
@@ -234,6 +247,7 @@ pub enum Prim {
     I64,
     F32,
     F64,
+    Char,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -364,6 +378,7 @@ pub enum TypedExprKind {
     Int(i64, Prim),
     Float(f64, Prim),
     Bool(bool),
+    Char(char),
     String(String),
     TypeToken(Prim),
     Lambda {
@@ -664,6 +679,7 @@ pub enum ScalarValue {
     I64(i64),
     F32(f32),
     F64(f64),
+    Char(char),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -708,6 +724,7 @@ impl Prim {
             "i64" => Some(Self::I64),
             "f32" => Some(Self::F32),
             "f64" => Some(Self::F64),
+            "char" => Some(Self::Char),
             _ => None,
         }
     }
@@ -722,14 +739,14 @@ impl Prim {
 
     fn lane_width(self) -> usize {
         match self {
-            Self::I32 | Self::F32 => 4,
+            Self::I32 | Self::F32 | Self::Char => 4,
             Self::I64 | Self::F64 => 2,
         }
     }
 
     fn byte_width(self) -> usize {
         match self {
-            Self::I32 | Self::F32 => 4,
+            Self::I32 | Self::F32 | Self::Char => 4,
             Self::I64 | Self::F64 => 8,
         }
     }
@@ -741,6 +758,7 @@ fn format_prim(prim: Prim) -> &'static str {
         Prim::I64 => "i64",
         Prim::F32 => "f32",
         Prim::F64 => "f64",
+        Prim::Char => "char",
     }
 }
 
@@ -836,6 +854,7 @@ impl ScalarValue {
             Self::I64(_) => Prim::I64,
             Self::F32(_) => Prim::F32,
             Self::F64(_) => Prim::F64,
+            Self::Char(_) => Prim::Char,
         }
     }
 
@@ -845,6 +864,7 @@ impl ScalarValue {
             Self::I64(value) => value.to_string(),
             Self::F32(value) => format_float(*value as f64),
             Self::F64(value) => format_float(*value),
+            Self::Char(value) => json_string(&value.to_string()),
         }
     }
 }
@@ -1216,6 +1236,7 @@ enum TokenKind {
     In,
     Int,
     Float,
+    CharLit,
     StringLit,
     Newline,
     Semicolon,
@@ -1237,6 +1258,7 @@ enum TokenKind {
     Ge,
     Backtick,
     Backslash,
+    Ellipsis,
     Dot,
     LParen,
     RParen,
@@ -1377,6 +1399,42 @@ fn lex(source: &str) -> Result<Vec<Token>> {
             });
             continue;
         }
+        if ch == '\'' {
+            let start = index;
+            index += 1;
+            let mut escaped = false;
+            while index < chars.len() {
+                let current = chars[index];
+                if escaped {
+                    escaped = false;
+                    index += 1;
+                    continue;
+                }
+                if current == '\\' {
+                    escaped = true;
+                    index += 1;
+                    continue;
+                }
+                if current == '\'' {
+                    index += 1;
+                    break;
+                }
+                if current == '\n' {
+                    return Err(SimdError::new("char literal cannot contain newlines"));
+                }
+                index += 1;
+            }
+            if index > chars.len() || chars.get(index.saturating_sub(1)) != Some(&'\'') {
+                return Err(SimdError::new("unterminated char literal"));
+            }
+            let text: String = chars[start..index].iter().collect();
+            tokens.push(Token {
+                kind: TokenKind::CharLit,
+                text,
+                leading_space,
+            });
+            continue;
+        }
         if ch.is_ascii_digit() {
             let start = index;
             index += 1;
@@ -1456,7 +1514,13 @@ fn lex(source: &str) -> Result<Vec<Token>> {
             ']' => (TokenKind::RBracket, 1),
             '{' => (TokenKind::LBrace, 1),
             '}' => (TokenKind::RBrace, 1),
-            '.' => (TokenKind::Dot, 1),
+            '.' => {
+                if chars.get(index + 1) == Some(&'.') && chars.get(index + 2) == Some(&'.') {
+                    (TokenKind::Ellipsis, 3)
+                } else {
+                    (TokenKind::Dot, 1)
+                }
+            }
             '`' => (TokenKind::Backtick, 1),
             ',' => (TokenKind::Comma, 1),
             ';' => (TokenKind::Semicolon, 1),
@@ -1788,6 +1852,20 @@ impl Parser {
                     Ok(Pattern::Name(token.text))
                 }
             }
+            TokenKind::CharLit => {
+                self.pos += 1;
+                Ok(Pattern::Char(parse_char_literal(&token.text)?))
+            }
+            TokenKind::StringLit => {
+                self.pos += 1;
+                let value = parse_string_literal(&token.text)?;
+                Ok(Pattern::Slice {
+                    prefix: value.chars().map(Pattern::Char).collect(),
+                    suffix: Vec::new(),
+                    rest: None,
+                })
+            }
+            TokenKind::LBracket => self.parse_slice_pattern(),
             TokenKind::Int => {
                 self.pos += 1;
                 Ok(Pattern::Int(parse_int(&token.text)?))
@@ -1801,6 +1879,88 @@ impl Parser {
                 token.text
             ))),
         }
+    }
+
+    fn parse_slice_pattern(&mut self) -> Result<Pattern> {
+        self.expect(TokenKind::LBracket)?;
+        self.skip_newlines();
+        if self.eat(TokenKind::RBracket) {
+            return Ok(Pattern::Slice {
+                prefix: Vec::new(),
+                suffix: Vec::new(),
+                rest: None,
+            });
+        }
+        if self.peek_is(TokenKind::Ellipsis) {
+            self.expect(TokenKind::Ellipsis)?;
+            let rest = if self.peek_is(TokenKind::Ident) {
+                let name = self.expect_ident()?;
+                if name == "_" {
+                    Some(SliceRest::Ignore)
+                } else {
+                    Some(SliceRest::Bind(name))
+                }
+            } else {
+                Some(SliceRest::Ignore)
+            };
+            let mut suffix = Vec::new();
+            if self.eat(TokenKind::Comma) {
+                loop {
+                    self.skip_newlines();
+                    suffix.push(self.parse_pattern()?);
+                    self.skip_newlines();
+                    if self.eat(TokenKind::Comma) {
+                        continue;
+                    }
+                    break;
+                }
+            }
+            self.skip_newlines();
+            self.expect(TokenKind::RBracket)?;
+            return Ok(Pattern::Slice {
+                prefix: Vec::new(),
+                suffix,
+                rest,
+            });
+        }
+
+        let mut prefix = Vec::new();
+        loop {
+            self.skip_newlines();
+            prefix.push(self.parse_pattern()?);
+            self.skip_newlines();
+            if self.eat(TokenKind::Comma) {
+                if self.peek_is(TokenKind::Ellipsis) {
+                    self.expect(TokenKind::Ellipsis)?;
+                    let rest = if self.peek_is(TokenKind::Ident) {
+                        let name = self.expect_ident()?;
+                        if name == "_" {
+                            Some(SliceRest::Ignore)
+                        } else {
+                            Some(SliceRest::Bind(name))
+                        }
+                    } else {
+                        Some(SliceRest::Ignore)
+                    };
+                    self.skip_newlines();
+                    self.expect(TokenKind::RBracket)?;
+                    return Ok(Pattern::Slice {
+                        prefix,
+                        suffix: Vec::new(),
+                        rest,
+                    });
+                }
+                continue;
+            }
+            break;
+        }
+        self.skip_newlines();
+        self.expect(TokenKind::RBracket)?;
+        Ok(Pattern::Slice {
+            prefix,
+            suffix: Vec::new(),
+            rest: None,
+        })
     }
 
     fn parse_type(&mut self) -> Result<Type> {
@@ -2025,6 +2185,10 @@ impl Parser {
                 self.pos += 1;
                 Ok(Expr::Float(parse_float(&token.text)?))
             }
+            TokenKind::CharLit => {
+                self.pos += 1;
+                Ok(Expr::Char(parse_char_literal(&token.text)?))
+            }
             TokenKind::StringLit => {
                 self.pos += 1;
                 Ok(Expr::String(parse_string_literal(&token.text)?))
@@ -2098,6 +2262,7 @@ impl Parser {
                     | TokenKind::Let
                     | TokenKind::Int
                     | TokenKind::Float
+                    | TokenKind::CharLit
                     | TokenKind::StringLit
                     | TokenKind::LParen
             )
@@ -2636,6 +2801,43 @@ fn parse_string_literal(text: &str) -> Result<String> {
         }
     }
     Ok(out)
+}
+
+fn parse_char_literal(text: &str) -> Result<char> {
+    if !text.starts_with('\'') || !text.ends_with('\'') || text.len() < 2 {
+        return Err(SimdError::new(format!("invalid char literal '{}'", text)));
+    }
+    let inner = &text[1..text.len() - 1];
+    let mut chars = inner.chars();
+    let ch = match chars.next() {
+        Some('\\') => {
+            let escaped = chars
+                .next()
+                .ok_or_else(|| SimdError::new("unterminated char escape"))?;
+            match escaped {
+                'n' => '\n',
+                'r' => '\r',
+                't' => '\t',
+                '\\' => '\\',
+                '\'' => '\'',
+                '"' => '"',
+                other => {
+                    return Err(SimdError::new(format!(
+                        "unsupported char escape '\\{}'",
+                        other
+                    )))
+                }
+            }
+        }
+        Some(ch) => ch,
+        None => return Err(SimdError::new("char literal cannot be empty")),
+    };
+    if chars.next().is_some() {
+        return Err(SimdError::new(
+            "char literal must contain exactly one Unicode scalar",
+        ));
+    }
+    Ok(ch)
 }
 
 pub fn parse_source(source: &str) -> Result<SurfaceProgram> {
@@ -3286,8 +3488,12 @@ fn inferred_pattern_type(pattern: &Pattern) -> Result<Option<Type>> {
         Pattern::Int(_) => Ok(Some(Type::Scalar(Prim::I64))),
         Pattern::Float(_) => Ok(Some(Type::Scalar(Prim::F64))),
         Pattern::Bool(_) => Ok(Some(builtin_bool_type())),
+        Pattern::Char(_) => Ok(Some(Type::Scalar(Prim::Char))),
         Pattern::Type(prim) => Ok(Some(Type::TypeToken(Box::new(Type::Scalar(*prim))))),
-        Pattern::Name(_) | Pattern::Wildcard | Pattern::Ctor(_, _) => Ok(None),
+        Pattern::Name(_)
+        | Pattern::Wildcard
+        | Pattern::Ctor(_, _)
+        | Pattern::Slice { .. } => Ok(None),
     }
 }
 
@@ -3607,7 +3813,12 @@ fn analyze_pointwise(module: &Module) -> Result<BTreeMap<String, bool>> {
 
 fn validate_pointwise_expr(expr: &Expr, known: &BTreeMap<String, usize>) -> Result<()> {
     match expr {
-        Expr::Ref(_) | Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::String(_) => Ok(()),
+        Expr::Ref(_)
+        | Expr::Int(_)
+        | Expr::Float(_)
+        | Expr::Bool(_)
+        | Expr::Char(_)
+        | Expr::String(_) => Ok(()),
         Expr::Lambda { body, .. } => validate_pointwise_expr(body, known),
         Expr::Let { bindings, body } => {
             for binding in bindings {
@@ -3909,6 +4120,7 @@ fn apply_infer_bindings_expr(expr: &mut TypedExpr, infer_bindings: &BTreeMap<u32
         | TypedExprKind::Int(_, _)
         | TypedExprKind::Float(_, _)
         | TypedExprKind::Bool(_)
+        | TypedExprKind::Char(_)
         | TypedExprKind::String(_)
         | TypedExprKind::TypeToken(_) => {}
     }
@@ -3961,6 +4173,7 @@ fn collect_local_usage_types<'a>(expr: &'a TypedExpr, name: &str, out: &mut Vec<
         | TypedExprKind::Int(_, _)
         | TypedExprKind::Float(_, _)
         | TypedExprKind::Bool(_)
+        | TypedExprKind::Char(_)
         | TypedExprKind::String(_)
         | TypedExprKind::TypeToken(_) => {}
     }
@@ -4114,10 +4327,53 @@ fn check_pattern(
             }
             Ok(())
         }
+        Pattern::Slice {
+            prefix,
+            suffix,
+            rest,
+        } => {
+            let (elem_ty, rest_ty) = match ty {
+                Type::Named(name, args) if name == "string" && args.is_empty() => {
+                    (Type::Scalar(Prim::Char), builtin_string_type())
+                }
+                Type::Bulk(prim, shape) if shape.0.len() == 1 => {
+                    (Type::Scalar(*prim), ty.clone())
+                }
+                _ => {
+                    return Err(SimdError::new(format!(
+                        "slice pattern is only valid against rank-1 bulk or string types, found {:?}",
+                        ty
+                    )))
+                }
+            };
+            for subpattern in prefix {
+                check_pattern(subpattern, &elem_ty, locals, enum_ctors)?;
+            }
+            for subpattern in suffix {
+                check_pattern(subpattern, &elem_ty, locals, enum_ctors)?;
+            }
+            if let Some(SliceRest::Bind(name)) = rest
+                && name != "_"
+                && locals.insert(name.clone(), rest_ty).is_some()
+            {
+                return Err(SimdError::new(format!(
+                    "pattern name '{}' is bound more than once in one clause",
+                    name
+                )));
+            }
+            Ok(())
+        }
         Pattern::Int(_) => match ty {
             Type::Scalar(prim) if prim.is_int() => Ok(()),
             _ => Err(SimdError::new(format!(
                 "integer pattern is only valid against scalar integer types, found {:?}",
+                ty
+            ))),
+        },
+        Pattern::Char(_) => match ty {
+            Type::Scalar(Prim::Char) => Ok(()),
+            _ => Err(SimdError::new(format!(
+                "char pattern is only valid against char scalar types, found {:?}",
                 ty
             ))),
         },
@@ -4285,6 +4541,22 @@ fn infer_expr(
             Ok(TypedExpr {
                 ty,
                 kind: TypedExprKind::Bool(*value),
+            })
+        }
+        Expr::Char(value) => {
+            let ty = Type::Scalar(Prim::Char);
+            if let Some(expected_ty) = expected
+                && expected_ty != &ty
+                && !matches!(expected_ty, Type::Var(_) | Type::Infer(_))
+            {
+                return Err(SimdError::new(format!(
+                    "char literal has type {:?}, expected {:?}",
+                    ty, expected_ty
+                )));
+            }
+            Ok(TypedExpr {
+                ty,
+                kind: TypedExprKind::Char(*value),
             })
         }
         Expr::String(value) => {
@@ -4628,7 +4900,7 @@ fn collect_expr_local_names_into(expr: &Expr, names: &mut BTreeSet<String>) {
                 names.insert(reference.name.clone());
             }
         }
-        Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::String(_) => {}
+        Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::Char(_) | Expr::String(_) => {}
         Expr::Lambda { body, .. } => {
             collect_expr_local_names_into(body, names);
         }
@@ -5585,6 +5857,7 @@ fn type_arg_segment(type_arg: &TypeArg) -> String {
             Prim::I64 => "i64".to_string(),
             Prim::F32 => "f32".to_string(),
             Prim::F64 => "f64".to_string(),
+            Prim::Char => "char".to_string(),
         },
         TypeArg::Name(name) => name.clone(),
     }
@@ -5618,6 +5891,7 @@ fn render_ref_expr(reference: &RefExpr) -> String {
                 Prim::I64 => "i64",
                 Prim::F32 => "f32",
                 Prim::F64 => "f64",
+                Prim::Char => "char",
             }),
             TypeArg::Name(name) => out.push_str(name),
         }
@@ -5989,6 +6263,13 @@ fn infer_primitive_signature(
 }
 
 fn ensure_valid_primitive_prim(op: PrimOp, prim: Prim) -> Result<()> {
+    if prim == Prim::Char
+        && !matches!(op, PrimOp::Eq | PrimOp::Lt | PrimOp::Gt | PrimOp::Le | PrimOp::Ge)
+    {
+        return Err(SimdError::new(
+            "char operands currently support only comparison operators",
+        ));
+    }
     if matches!(op, PrimOp::Mod) && prim.is_float() {
         return Err(SimdError::new(
             "modulo is only defined on integer primitives in v0",
@@ -6261,6 +6542,7 @@ fn visit_tail_calls(
         | TypedExprKind::Int(_, _)
         | TypedExprKind::Float(_, _)
         | TypedExprKind::Bool(_)
+        | TypedExprKind::Char(_)
         | TypedExprKind::String(_)
         | TypedExprKind::TypeToken(_) => {}
         TypedExprKind::Lambda { body, .. } => {
@@ -6404,9 +6686,11 @@ fn pattern_uses_enum(pattern: &Pattern) -> bool {
         Pattern::Int(_)
         | Pattern::Float(_)
         | Pattern::Bool(_)
+        | Pattern::Char(_)
         | Pattern::Type(_)
         | Pattern::Name(_)
-        | Pattern::Wildcard => false,
+        | Pattern::Wildcard
+        | Pattern::Slice { .. } => false,
     }
 }
 
@@ -6418,6 +6702,7 @@ fn typed_expr_uses_enum(expr: &TypedExpr) -> bool {
         | TypedExprKind::Int(_, _)
         | TypedExprKind::Float(_, _)
         | TypedExprKind::Bool(_)
+        | TypedExprKind::Char(_)
         | TypedExprKind::String(_)
         | TypedExprKind::TypeToken(_) => false,
         TypedExprKind::Lambda { body, .. } => typed_expr_uses_enum(body),
@@ -6446,6 +6731,7 @@ fn typed_expr_uses_type_witness(expr: &TypedExpr) -> bool {
         | TypedExprKind::Int(_, _)
         | TypedExprKind::Float(_, _)
         | TypedExprKind::Bool(_)
+        | TypedExprKind::Char(_)
         | TypedExprKind::String(_) => false,
         TypedExprKind::Lambda { body, .. } => typed_expr_uses_type_witness(body),
         TypedExprKind::Let { bindings, body } => {
@@ -6574,6 +6860,36 @@ fn normalize_function_leaf(
                         &mut locals,
                     )?;
                 }
+                Pattern::Char(value) => {
+                    if leaves.len() != 1 {
+                        return Err(SimdError::new(format!(
+                            "char pattern in '{}' must normalize to exactly one leaf",
+                            function.name
+                        )));
+                    }
+                    patterns.push(TypedPattern {
+                        pattern: Pattern::Char(*value),
+                        ty: leaves[0].ty.clone(),
+                    });
+                }
+                Pattern::Slice { .. } => {
+                    if leaves.len() != 1 {
+                        return Err(SimdError::new(format!(
+                            "slice pattern in '{}' must normalize to exactly one leaf",
+                            function.name
+                        )));
+                    }
+                    patterns.push(TypedPattern {
+                        pattern: typed_pattern.pattern.clone(),
+                        ty: leaves[0].ty.clone(),
+                    });
+                    collect_pattern_local_leaf_bindings(
+                        &typed_pattern.pattern,
+                        &typed_pattern.ty,
+                        enum_ctors,
+                        &mut locals,
+                    )?;
+                }
             }
         }
 
@@ -6660,9 +6976,49 @@ fn collect_pattern_local_leaf_bindings(
             }
             Ok(())
         }
-        Pattern::Wildcard | Pattern::Int(_) | Pattern::Float(_) | Pattern::Bool(_) | Pattern::Type(_) => {
+        Pattern::Slice {
+            prefix,
+            suffix,
+            rest,
+        } => {
+            let elem_ty = match ty {
+                Type::Named(name, args) if name == "string" && args.is_empty() => {
+                    Type::Scalar(Prim::Char)
+                }
+                Type::Bulk(prim, shape) if shape.0.len() == 1 => Type::Scalar(*prim),
+                other => {
+                    return Err(SimdError::new(format!(
+                        "slice pattern expects rank-1 bulk/string type, found {:?}",
+                        other
+                    )))
+                }
+            };
+            for subpattern in prefix {
+                collect_pattern_local_leaf_bindings(subpattern, &elem_ty, enum_ctors, locals)?;
+            }
+            for subpattern in suffix {
+                collect_pattern_local_leaf_bindings(subpattern, &elem_ty, enum_ctors, locals)?;
+            }
+            if let Some(SliceRest::Bind(name)) = rest {
+                for leaf in flatten_type_leaves(ty) {
+                    locals
+                        .entry(name.clone())
+                        .or_default()
+                        .push(LocalLeafBinding {
+                            path: leaf.path.clone(),
+                            local_name: normalized_local_name(name, &leaf.path),
+                            ty: leaf.ty.clone(),
+                        });
+                }
+            }
             Ok(())
         }
+        Pattern::Wildcard
+        | Pattern::Int(_)
+        | Pattern::Float(_)
+        | Pattern::Bool(_)
+        | Pattern::Char(_)
+        | Pattern::Type(_) => Ok(()),
     }
 }
 
@@ -6729,6 +7085,17 @@ fn normalize_expr_to_leaf(
             Ok(TypedExpr {
                 ty: leaf_ty,
                 kind: TypedExprKind::Bool(*value),
+            })
+        }
+        TypedExprKind::Char(value) => {
+            if !requested.is_root() {
+                return Err(SimdError::new(
+                    "char literal cannot be projected into a record leaf",
+                ));
+            }
+            Ok(TypedExpr {
+                ty: leaf_ty,
+                kind: TypedExprKind::Char(*value),
             })
         }
         TypedExprKind::String(value) => {
@@ -7036,6 +7403,7 @@ fn collect_typed_local_names(expr: &TypedExpr, names: &mut BTreeSet<String>) {
         | TypedExprKind::Int(_, _)
         | TypedExprKind::Float(_, _)
         | TypedExprKind::Bool(_)
+        | TypedExprKind::Char(_)
         | TypedExprKind::String(_)
         | TypedExprKind::TypeToken(_) => {}
         TypedExprKind::Lambda { body, .. } => collect_typed_local_names(body, names),
@@ -7660,13 +8028,23 @@ fn count_primitive_ops(expr: &IrExpr) -> usize {
 
 fn lower_function(function: &NormalizedFunction) -> Result<LoweredFunction> {
     let (params, ret) = function.signature.ty.fun_parts();
+    let mut slice_pattern_params = BTreeSet::<usize>::new();
+    for clause in &function.clauses {
+        for (index, pattern) in clause.patterns.iter().enumerate() {
+            if matches!(pattern.pattern, Pattern::Slice { .. }) {
+                slice_pattern_params.insert(index);
+            }
+        }
+    }
     let param_access: Vec<AccessKind> = params
         .iter()
-        .map(|ty| match ty {
+        .enumerate()
+        .map(|(index, ty)| match ty {
             Type::Scalar(_) => AccessKind::Same,
             Type::Named(name, args) if args.is_empty() && (name == "string" || name == "bool") => {
                 AccessKind::Same
             }
+            Type::Bulk(_, _) if slice_pattern_params.contains(&index) => AccessKind::Same,
             Type::Bulk(_, _) => AccessKind::Lane,
             Type::TypeToken(_) => AccessKind::Same,
             Type::Record(_) => AccessKind::Same,
@@ -7830,12 +8208,6 @@ fn lower_expr_to_ir(
                 }
                 _ => expr.ty.clone(),
             };
-            if matches!(lowered_ty, Type::Bulk(_, _)) {
-                return Err(SimdError::new(format!(
-                    "cannot lower bulk local '{}' into scalar loop IR directly",
-                    name
-                )));
-            }
             Ok(IrExpr {
                 ty: lowered_ty,
                 kind: IrExprKind::Local(name.clone()),
@@ -7848,6 +8220,10 @@ fn lower_expr_to_ir(
         TypedExprKind::Float(value, prim) => Ok(IrExpr {
             ty: Type::Scalar(*prim),
             kind: IrExprKind::Float(*value, *prim),
+        }),
+        TypedExprKind::Char(value) => Ok(IrExpr {
+            ty: Type::Scalar(Prim::Char),
+            kind: IrExprKind::Int(*value as i64, Prim::Char),
         }),
         TypedExprKind::Record(fields) => Ok(IrExpr {
             ty: expr.ty.clone(),
@@ -8093,7 +8469,7 @@ fn parse_json_type_witness_prim(json: &JsonValue) -> Result<Prim> {
     };
     Prim::parse(text).ok_or_else(|| {
         SimdError::new(format!(
-            "unknown type witness '{}'; expected one of i32/i64/f32/f64",
+            "unknown type witness '{}'; expected one of i32/i64/f32/f64/char",
             text
         ))
     })
@@ -8216,6 +8592,14 @@ impl<'a> Evaluator<'a> {
                 };
                 Ok(matches_int_pattern(*expected, &value))
             }
+            Pattern::Char(expected) => {
+                let Value::Scalar(ScalarValue::Char(actual)) =
+                    self.expect_host_value(self.force_binding(binding)?)?
+                else {
+                    return Err(SimdError::new("char pattern can only match char scalar inputs"));
+                };
+                Ok(*expected == actual)
+            }
             Pattern::Float(expected) => {
                 let Value::Scalar(value) = self.expect_host_value(self.force_binding(binding)?)?
                 else {
@@ -8230,6 +8614,128 @@ impl<'a> Evaluator<'a> {
                 };
                 Ok(*expected == actual)
             }
+            Pattern::Slice {
+                prefix,
+                suffix,
+                rest,
+            } => {
+                let value = self.expect_host_value(self.force_binding(binding)?)?;
+                self.match_slice_pattern(prefix, suffix, rest, &pattern.ty, value, env)
+            }
+        }
+    }
+
+    fn match_slice_pattern(
+        &self,
+        prefix: &[Pattern],
+        suffix: &[Pattern],
+        rest: &Option<SliceRest>,
+        scrutinee_ty: &Type,
+        value: Value,
+        env: &mut Env<'a>,
+    ) -> Result<bool> {
+        let elem_ty = match scrutinee_ty {
+            Type::Named(name, args) if name == "string" && args.is_empty() => Type::Scalar(Prim::Char),
+            Type::Bulk(prim, shape) if shape.0.len() == 1 => Type::Scalar(*prim),
+            other => {
+                return Err(SimdError::new(format!(
+                    "slice pattern expects rank-1 bulk/string type, found {:?}",
+                    other
+                )))
+            }
+        };
+        match value {
+            Value::String(text) => {
+                let chars = text.chars().collect::<Vec<_>>();
+                let fixed = prefix.len() + suffix.len();
+                if chars.len() < fixed {
+                    return Ok(false);
+                }
+                if rest.is_none() && chars.len() != fixed {
+                    return Ok(false);
+                }
+                for (index, subpattern) in prefix.iter().enumerate() {
+                    let typed = TypedPattern {
+                        pattern: subpattern.clone(),
+                        ty: elem_ty.clone(),
+                    };
+                    let value = Value::Scalar(ScalarValue::Char(chars[index]));
+                    if !self.match_pattern(&typed, &Binding::Ready(EvalValue::Host(value)), env)? {
+                        return Ok(false);
+                    }
+                }
+                for (offset, subpattern) in suffix.iter().enumerate() {
+                    let idx = chars.len() - suffix.len() + offset;
+                    let typed = TypedPattern {
+                        pattern: subpattern.clone(),
+                        ty: elem_ty.clone(),
+                    };
+                    let value = Value::Scalar(ScalarValue::Char(chars[idx]));
+                    if !self.match_pattern(&typed, &Binding::Ready(EvalValue::Host(value)), env)? {
+                        return Ok(false);
+                    }
+                }
+                if let Some(SliceRest::Bind(name)) = rest {
+                    let start = prefix.len();
+                    let end = chars.len() - suffix.len();
+                    let rest_string = chars[start..end].iter().collect::<String>();
+                    env.insert(
+                        name.clone(),
+                        Binding::Ready(EvalValue::Host(Value::String(rest_string))),
+                    );
+                }
+                Ok(true)
+            }
+            Value::Bulk(bulk) => {
+                if bulk.shape.len() != 1 {
+                    return Err(SimdError::new(
+                        "slice pattern can only match rank-1 bulk values",
+                    ));
+                }
+                let len = bulk.elements.len();
+                let fixed = prefix.len() + suffix.len();
+                if len < fixed {
+                    return Ok(false);
+                }
+                if rest.is_none() && len != fixed {
+                    return Ok(false);
+                }
+                for (index, subpattern) in prefix.iter().enumerate() {
+                    let typed = TypedPattern {
+                        pattern: subpattern.clone(),
+                        ty: elem_ty.clone(),
+                    };
+                    let value = Value::Scalar(bulk.elements[index].clone());
+                    if !self.match_pattern(&typed, &Binding::Ready(EvalValue::Host(value)), env)? {
+                        return Ok(false);
+                    }
+                }
+                for (offset, subpattern) in suffix.iter().enumerate() {
+                    let idx = len - suffix.len() + offset;
+                    let typed = TypedPattern {
+                        pattern: subpattern.clone(),
+                        ty: elem_ty.clone(),
+                    };
+                    let value = Value::Scalar(bulk.elements[idx].clone());
+                    if !self.match_pattern(&typed, &Binding::Ready(EvalValue::Host(value)), env)? {
+                        return Ok(false);
+                    }
+                }
+                if let Some(SliceRest::Bind(name)) = rest {
+                    let start = prefix.len();
+                    let end = len - suffix.len();
+                    env.insert(
+                        name.clone(),
+                        Binding::Ready(EvalValue::Host(Value::Bulk(BulkValue {
+                            prim: bulk.prim,
+                            shape: vec![end - start],
+                            elements: bulk.elements[start..end].to_vec(),
+                        }))),
+                    );
+                }
+                Ok(true)
+            }
+            _ => Ok(false),
         }
     }
 
@@ -8356,6 +8862,9 @@ impl<'a> Evaluator<'a> {
                 make_float_value(*value, *prim),
             ))),
             TypedExprKind::Bool(value) => Ok(EvalValue::Host(Value::Bool(*value))),
+            TypedExprKind::Char(value) => Ok(EvalValue::Host(Value::Scalar(ScalarValue::Char(
+                *value,
+            )))),
             TypedExprKind::String(value) => Ok(EvalValue::Host(Value::String(value.clone()))),
             TypedExprKind::TypeToken(prim) => Ok(EvalValue::Host(Value::TypeToken(*prim))),
             TypedExprKind::Lambda { param, body } => Ok(EvalValue::Closure(Closure::Lambda {
@@ -8893,7 +9402,7 @@ fn matches_int_pattern(expected: i64, actual: &ScalarValue) -> bool {
     match actual {
         ScalarValue::I32(value) => i64::from(*value) == expected,
         ScalarValue::I64(value) => *value == expected,
-        ScalarValue::F32(_) | ScalarValue::F64(_) => false,
+        ScalarValue::F32(_) | ScalarValue::F64(_) | ScalarValue::Char(_) => false,
     }
 }
 
@@ -8901,7 +9410,7 @@ fn matches_float_pattern(expected: f64, actual: &ScalarValue) -> bool {
     match actual {
         ScalarValue::F32(value) => (*value as f64).to_bits() == expected.to_bits(),
         ScalarValue::F64(value) => value.to_bits() == expected.to_bits(),
-        ScalarValue::I32(_) | ScalarValue::I64(_) => false,
+        ScalarValue::I32(_) | ScalarValue::I64(_) | ScalarValue::Char(_) => false,
     }
 }
 
@@ -8911,6 +9420,13 @@ fn make_int_value(value: i64, prim: Prim) -> Result<ScalarValue> {
             SimdError::new(format!("integer literal '{}' does not fit in i32", value))
         })?)),
         Prim::I64 => Ok(ScalarValue::I64(value)),
+        Prim::Char => {
+            let scalar = u32::try_from(value)
+                .ok()
+                .and_then(char::from_u32)
+                .ok_or_else(|| SimdError::new(format!("'{}' is not a valid char codepoint", value)))?;
+            Ok(ScalarValue::Char(scalar))
+        }
         Prim::F32 | Prim::F64 => Err(SimdError::new("integer literal cannot inhabit float type")),
     }
 }
@@ -8919,7 +9435,7 @@ fn make_float_value(value: f64, prim: Prim) -> ScalarValue {
     match prim {
         Prim::F32 => ScalarValue::F32(value as f32),
         Prim::F64 => ScalarValue::F64(value),
-        Prim::I32 | Prim::I64 => unreachable!(),
+        Prim::I32 | Prim::I64 | Prim::Char => unreachable!(),
     }
 }
 
@@ -8948,6 +9464,7 @@ fn coerce_poly_literal_to_runtime_target(
         ScalarValue::I64(_) => Prim::I64,
         ScalarValue::F32(_) => Prim::F32,
         ScalarValue::F64(_) => Prim::F64,
+        ScalarValue::Char(_) => Prim::Char,
     };
     match &expr.kind {
         TypedExprKind::Int(value, _) => {
@@ -9123,6 +9640,10 @@ fn apply_primitive(op: PrimOp, left: &ScalarValue, right: &ScalarValue) -> Resul
                     _ => unreachable!(),
                 }
             })
+        }
+        (ScalarValue::Char(left), ScalarValue::Char(right)) => {
+            apply_int_primitive_i64(op, i64::from(u32::from(*left)), i64::from(u32::from(*right)))
+                .and_then(|value| make_int_value(value, primitive_result_prim(op, Prim::Char)))
         }
         _ => Err(SimdError::new(format!(
             "primitive {:?} received mismatched scalar operands {:?} and {:?}",
@@ -9460,6 +9981,25 @@ impl<'a> LoweredEvaluator<'a> {
                         return Ok(None);
                     }
                 }
+                Pattern::Char(expected) => {
+                    let Value::Scalar(ScalarValue::Char(actual)) = value else {
+                        return Err(SimdError::new(
+                            "char pattern can only match char scalar runtime values",
+                        ));
+                    };
+                    if expected != actual {
+                        return Ok(None);
+                    }
+                }
+                Pattern::Slice {
+                    prefix,
+                    suffix,
+                    rest,
+                } => {
+                    if !self.match_lowered_slice_pattern(prefix, suffix, rest, value, &mut env)? {
+                        return Ok(None);
+                    }
+                }
             }
         }
         Ok(Some(env))
@@ -9557,6 +10097,14 @@ impl<'a> LoweredEvaluator<'a> {
                 };
                 Ok(matches_int_pattern(*expected, actual))
             }
+            Pattern::Char(expected) => {
+                let Value::Scalar(ScalarValue::Char(actual)) = value else {
+                    return Err(SimdError::new(
+                        "char pattern can only match char scalar runtime values",
+                    ));
+                };
+                Ok(expected == actual)
+            }
             Pattern::Float(expected) => {
                 let Value::Scalar(actual) = value else {
                     return Err(SimdError::new(
@@ -9579,6 +10127,97 @@ impl<'a> LoweredEvaluator<'a> {
                 };
                 Ok(actual == prim)
             }
+            Pattern::Slice {
+                prefix,
+                suffix,
+                rest,
+            } => self.match_lowered_slice_pattern(prefix, suffix, rest, value, env),
+        }
+    }
+
+    fn match_lowered_slice_pattern(
+        &self,
+        prefix: &[Pattern],
+        suffix: &[Pattern],
+        rest: &Option<SliceRest>,
+        value: &Value,
+        env: &mut BTreeMap<String, Value>,
+    ) -> Result<bool> {
+        match value {
+            Value::String(text) => {
+                let chars = text.chars().collect::<Vec<_>>();
+                let fixed = prefix.len() + suffix.len();
+                if chars.len() < fixed {
+                    return Ok(false);
+                }
+                if rest.is_none() && chars.len() != fixed {
+                    return Ok(false);
+                }
+                for (index, subpattern) in prefix.iter().enumerate() {
+                    let value = Value::Scalar(ScalarValue::Char(chars[index]));
+                    if !self.match_lowered_pattern(subpattern, &value, env)? {
+                        return Ok(false);
+                    }
+                }
+                for (offset, subpattern) in suffix.iter().enumerate() {
+                    let idx = chars.len() - suffix.len() + offset;
+                    let value = Value::Scalar(ScalarValue::Char(chars[idx]));
+                    if !self.match_lowered_pattern(subpattern, &value, env)? {
+                        return Ok(false);
+                    }
+                }
+                if let Some(SliceRest::Bind(name)) = rest {
+                    let start = prefix.len();
+                    let end = chars.len() - suffix.len();
+                    env.insert(
+                        name.clone(),
+                        Value::String(chars[start..end].iter().collect::<String>()),
+                    );
+                }
+                Ok(true)
+            }
+            Value::Bulk(bulk) => {
+                if bulk.shape.len() != 1 {
+                    return Err(SimdError::new(
+                        "slice pattern can only match rank-1 bulk values",
+                    ));
+                }
+                let len = bulk.elements.len();
+                let fixed = prefix.len() + suffix.len();
+                if len < fixed {
+                    return Ok(false);
+                }
+                if rest.is_none() && len != fixed {
+                    return Ok(false);
+                }
+                for (index, subpattern) in prefix.iter().enumerate() {
+                    let value = Value::Scalar(bulk.elements[index].clone());
+                    if !self.match_lowered_pattern(subpattern, &value, env)? {
+                        return Ok(false);
+                    }
+                }
+                for (offset, subpattern) in suffix.iter().enumerate() {
+                    let idx = len - suffix.len() + offset;
+                    let value = Value::Scalar(bulk.elements[idx].clone());
+                    if !self.match_lowered_pattern(subpattern, &value, env)? {
+                        return Ok(false);
+                    }
+                }
+                if let Some(SliceRest::Bind(name)) = rest {
+                    let start = prefix.len();
+                    let end = len - suffix.len();
+                    env.insert(
+                        name.clone(),
+                        Value::Bulk(BulkValue {
+                            prim: bulk.prim,
+                            shape: vec![end - start],
+                            elements: bulk.elements[start..end].to_vec(),
+                        }),
+                    );
+                }
+                Ok(true)
+            }
+            _ => Ok(false),
         }
     }
 
@@ -9918,6 +10557,23 @@ fn value_from_json(
     enum_names: &BTreeSet<String>,
 ) -> Result<Value> {
     match ty {
+        Type::Scalar(Prim::Char) => {
+            let JsonValue::String(text) = json else {
+                return Err(SimdError::new(
+                    "char runtime argument must be a one-character JSON string",
+                ));
+            };
+            let mut chars = text.chars();
+            let ch = chars.next().ok_or_else(|| {
+                SimdError::new("char runtime argument must be a one-character JSON string")
+            })?;
+            if chars.next().is_some() {
+                return Err(SimdError::new(
+                    "char runtime argument must be a one-character JSON string",
+                ));
+            }
+            Ok(Value::Scalar(ScalarValue::Char(ch)))
+        }
         Type::Scalar(prim) => Ok(Value::Scalar(scalar_from_json_number(json, *prim)?)),
         Type::Bulk(prim, expected_shape) => {
             let (shape, elements) = collect_bulk_values(json, *prim)?;
@@ -10044,6 +10700,11 @@ fn value_from_json(
 }
 
 fn scalar_from_json_number(json: &JsonValue, prim: Prim) -> Result<ScalarValue> {
+    if prim == Prim::Char {
+        return Err(SimdError::new(
+            "char runtime argument must be provided as a one-character JSON string",
+        ));
+    }
     let JsonValue::Number(number) = json else {
         return Err(SimdError::new(
             "scalar runtime argument must be a JSON number",
@@ -10526,6 +11187,15 @@ mod tests {
     }
 
     #[test]
+    fn parses_char_literals_and_slice_patterns() {
+        let program = parse_source(
+            "main : string -> i64\nmain ['c', 'a', 'r', ...rest] = len rest\nmain [..., 'e', 'd'] = 1\nmain _ = 0\n",
+        )
+        .unwrap();
+        assert_eq!(program.decls.len(), 4);
+    }
+
+    #[test]
     fn parses_import_and_qualified_call() {
         let program = parse_source(
             "import math/scalar as scalar\naxpy : i64 -> i64 -> i64 -> i64\naxpy a x y = a * x + y\nmain : i64 -> i64[n] -> i64[n] -> i64[n]\nmain a xs ys = scalar\\axpy a xs ys\n",
@@ -10765,6 +11435,22 @@ mod tests {
         let src = "flip true = false\nflip false = true\nmain x = flip x\n";
         assert_eq!(run(src, "main", "[true]"), "false");
         assert_eq!(run(src, "main", "[false]"), "true");
+    }
+
+    #[test]
+    fn evaluates_char_literal_patterns() {
+        let src = "main : char -> i64\nmain 'a' = 1\nmain _ = 0\n";
+        assert_eq!(run(src, "main", "[\"a\"]"), "1");
+        assert_eq!(run(src, "main", "[\"z\"]"), "0");
+    }
+
+    #[test]
+    fn evaluates_string_and_slice_view_patterns() {
+        let src = "main : string -> i64\nmain \"car\" = 100\nmain ['c', 'a', 'r', ...rest] = len rest\nmain [..., 'e', 'd'] = 7\nmain _ = 0\n";
+        assert_eq!(run(src, "main", "[\"car\"]"), "100");
+        assert_eq!(run(src, "main", "[\"cargo\"]"), "2");
+        assert_eq!(run(src, "main", "[\"red\"]"), "7");
+        assert_eq!(run(src, "main", "[\"x\"]"), "0");
     }
 
     #[test]
@@ -11374,6 +12060,226 @@ mod tests {
                 .to_json_string(),
             "{\"contains_left\":true,\"eq_roundtrip\":false,\"joined\":\"abcd\",\"swapped\":\"cdab\",\"total_len\":8}"
         );
+    }
+
+    #[test]
+    fn json_parser_adt_example_runs() {
+        let source = include_str!("../examples/json_parser_adt.simd");
+        let ok = run_main(source, "main", "[\"null\"]")
+            .expect("json parser adt example should run")
+            .to_json_string();
+        assert_eq!(ok, "10");
+
+        let nested = run_main(source, "main", "[\"[1,[2],null]\"]")
+            .expect("json parser adt example should run")
+            .to_json_string();
+        assert_eq!(nested, "813");
+
+        let err = run_main(source, "main", "[\"oops\"]")
+            .expect("json parser adt example should run")
+            .to_json_string();
+        assert_eq!(err, "-100");
+
+        let compiled = compile_source(source).expect("json parser adt example should compile");
+        let object = run_compiled_main(
+            &compiled,
+            "main",
+            &[Value::String("{\"a\":1,\"b\":[2]}".to_string())],
+        )
+        .expect("json parser adt example should accept direct string args")
+        .to_json_string();
+        assert_eq!(object, "905");
+
+        let bool_true = run_compiled_main(&compiled, "main", &[Value::String("true".to_string())])
+            .expect("json parser adt example should parse true")
+            .to_json_string();
+        assert_eq!(bool_true, "21");
+
+        let bool_false =
+            run_compiled_main(&compiled, "main", &[Value::String("false".to_string())])
+                .expect("json parser adt example should parse false")
+                .to_json_string();
+        assert_eq!(bool_false, "20");
+
+        let neg_num = run_compiled_main(&compiled, "main", &[Value::String("-12".to_string())])
+            .expect("json parser adt example should parse negative integer")
+            .to_json_string();
+        assert_eq!(neg_num, "88");
+
+        let escaped = run_compiled_main(
+            &compiled,
+            "main",
+            &[Value::String("\"\\\\\"".to_string())],
+        )
+        .expect("json parser adt example should handle escaped string chars")
+        .to_json_string();
+        assert_eq!(escaped, "201");
+
+        let unicode_escape = run_compiled_main(
+            &compiled,
+            "main",
+            &[Value::String("\"\\u1234\"".to_string())],
+        )
+        .expect("json parser adt example should handle unicode escape shape")
+        .to_json_string();
+        assert_eq!(unicode_escape, "201");
+
+        let strict_unicode_hex = run_compiled_main(
+            &compiled,
+            "main",
+            &[Value::String("\"\\u12af\"".to_string())],
+        )
+        .expect("json parser adt example should accept lowercase unicode hex digits")
+        .to_json_string();
+        assert_eq!(strict_unicode_hex, "201");
+
+        let invalid_unicode_hex = run_compiled_main(
+            &compiled,
+            "main",
+            &[Value::String("\"\\u12x4\"".to_string())],
+        )
+        .expect("json parser adt example should reject non-hex unicode escapes")
+        .to_json_string();
+        assert_eq!(invalid_unicode_hex, "-202");
+
+        let surrogate_pair = run_compiled_main(
+            &compiled,
+            "main",
+            &[Value::String("\"\\ud834\\udd1e\"".to_string())],
+        )
+        .expect("json parser adt example should reject surrogate pairs for now")
+        .to_json_string();
+        assert_eq!(surrogate_pair, "-202");
+
+        let unpaired_high = run_compiled_main(
+            &compiled,
+            "main",
+            &[Value::String("\"\\ud834\"".to_string())],
+        )
+        .expect("json parser adt example should reject unpaired high surrogates")
+        .to_json_string();
+        assert_eq!(unpaired_high, "-202");
+
+        let unpaired_low = run_compiled_main(
+            &compiled,
+            "main",
+            &[Value::String("\"\\udd1e\"".to_string())],
+        )
+        .expect("json parser adt example should reject unpaired low surrogates")
+        .to_json_string();
+        assert_eq!(unpaired_low, "-202");
+
+        let invalid_escape = run_compiled_main(
+            &compiled,
+            "main",
+            &[Value::String("\"\\x\"".to_string())],
+        )
+        .expect("json parser adt example should return an escape error")
+        .to_json_string();
+        assert_eq!(invalid_escape, "-202");
+
+        let trailing = run_compiled_main(
+            &compiled,
+            "main",
+            &[Value::String("nullx".to_string())],
+        )
+        .expect("json parser adt example should report trailing garbage")
+        .to_json_string();
+        assert_eq!(trailing, "-999");
+
+        let empty_array = run_compiled_main(
+            &compiled,
+            "main",
+            &[Value::String("[]".to_string())],
+        )
+        .expect("json parser adt example should parse empty array")
+        .to_json_string();
+        assert_eq!(empty_array, "300");
+
+        let empty_object = run_compiled_main(
+            &compiled,
+            "main",
+            &[Value::String("{}".to_string())],
+        )
+        .expect("json parser adt example should parse empty object")
+        .to_json_string();
+        assert_eq!(empty_object, "400");
+
+        let whitespace_nested = run_compiled_main(
+            &compiled,
+            "main",
+            &[Value::String("[ 1 , [ 2 , 3 ] ] ".to_string())],
+        )
+        .expect("json parser adt example should parse nested values with whitespace")
+        .to_json_string();
+        assert_eq!(whitespace_nested, "906");
+
+        let malformed_minus = run_compiled_main(
+            &compiled,
+            "main",
+            &[Value::String("-abc".to_string())],
+        )
+        .expect("json parser adt example should report malformed minus")
+        .to_json_string();
+        assert_eq!(malformed_minus, "-301");
+
+        let object_key_lengths = run_compiled_main(
+            &compiled,
+            "main",
+            &[Value::String("{\"ab\":1,\"c\":2}".to_string())],
+        )
+        .expect("json parser adt example should account for object key lengths")
+        .to_json_string();
+        assert_eq!(object_key_lengths, "606");
+
+        let decimal = run_compiled_main(&compiled, "main", &[Value::String("1.25".to_string())])
+            .expect("json parser adt example should parse decimals")
+            .to_json_string();
+        assert_eq!(decimal, "101");
+
+        let exponent = run_compiled_main(&compiled, "main", &[Value::String("2e9".to_string())])
+            .expect("json parser adt example should parse exponent forms")
+            .to_json_string();
+        assert_eq!(exponent, "102");
+
+        let signed_decimal_exp =
+            run_compiled_main(&compiled, "main", &[Value::String("-3.4e5".to_string())])
+                .expect("json parser adt example should parse signed decimal exponents")
+                .to_json_string();
+        assert_eq!(signed_decimal_exp, "97");
+
+        let invalid_decimal =
+            run_compiled_main(&compiled, "main", &[Value::String("1.".to_string())])
+                .expect("json parser adt example should report decimal fraction errors")
+                .to_json_string();
+        assert_eq!(invalid_decimal, "-302");
+
+        let invalid_exponent =
+            run_compiled_main(&compiled, "main", &[Value::String("1e".to_string())])
+                .expect("json parser adt example should report exponent errors")
+                .to_json_string();
+        assert_eq!(invalid_exponent, "-303");
+
+        let debug_ok = run_compiled_main(
+            &compiled,
+            "main_json",
+            &[Value::String("[1,null]".to_string())],
+        )
+        .expect("json parser adt example should expose a structural debug entry")
+        .to_json_string();
+        assert!(debug_ok.contains("\"$enum\""));
+        assert!(debug_ok.contains("JArray"));
+        assert!(debug_ok.contains("JArrCons"));
+
+        let debug_err = run_compiled_main(
+            &compiled,
+            "main_json",
+            &[Value::String("1.".to_string())],
+        )
+        .expect("json parser adt example debug entry should return error payload")
+        .to_json_string();
+        assert!(debug_err.contains("JNum"));
+        assert!(debug_err.contains("-302"));
     }
 
     #[test]

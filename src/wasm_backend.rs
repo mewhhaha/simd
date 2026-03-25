@@ -12,12 +12,14 @@ use wasmtime::{
     Config, Engine, Func, Instance, Memory, Module as WasmtimeModule, OptLevel, Store, Val,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct WasmArtifact {
     pub bytes: Vec<u8>,
     pub export_name: String,
     pub params: Vec<WasmParamAbi>,
     pub result: WasmResultAbi,
+    pub result_type: Type,
+    pub enum_ctors: BTreeMap<String, EnumCtorInfo>,
     pub grouped_export: Option<WasmGroupedExport>,
     pub leaf_exports: Vec<WasmLeafExport>,
     pub optimizer_reports: Vec<WasmOptimizationReport>,
@@ -966,6 +968,7 @@ fn row_major_strides(shape: &[usize]) -> Vec<usize> {
 fn default_scalar_value(prim: Prim) -> ScalarValue {
     match prim {
         Prim::I32 => ScalarValue::I32(0),
+        Prim::Char => ScalarValue::Char('\0'),
         Prim::I64 => ScalarValue::I64(0),
         Prim::F32 => ScalarValue::F32(0.0),
         Prim::F64 => ScalarValue::F64(0.0),
@@ -1085,6 +1088,9 @@ fn load_prepared_args(bound: &mut BoundPreparedRun, args: &[Value]) -> Result<()
                     ScalarValue::I64(value) => bound.set_scalar_i64(slot, *value)?,
                     ScalarValue::F32(value) => bound.set_scalar_f32(slot, *value)?,
                     ScalarValue::F64(value) => bound.set_scalar_f64(slot, *value)?,
+                    ScalarValue::Char(value) => {
+                        bound.set_input_scalar(slot, Prim::Char, ScalarValue::Char(*value))?
+                    }
                 }
             }
             Value::Bulk(bulk) => {
@@ -1815,9 +1821,11 @@ fn specialize_function_instance(
                         Pattern::Wildcard => {}
                         Pattern::Int(_)
                         | Pattern::Float(_)
+                        | Pattern::Char(_)
                         | Pattern::Bool(_)
                         | Pattern::Type(_)
-                        | Pattern::Ctor(_, _) => {
+                        | Pattern::Ctor(_, _)
+                        | Pattern::Slice { .. } => {
                             return Err(SimdError::new(format!(
                                 "function-typed parameter {} in '{}' used a literal pattern",
                                 index, pending.base_name
@@ -1833,7 +1841,12 @@ fn specialize_function_instance(
                             }
                         }
                         Pattern::Wildcard | Pattern::Name(_) => {}
-                        Pattern::Int(_) | Pattern::Float(_) | Pattern::Bool(_) | Pattern::Ctor(_, _) => {
+                        Pattern::Int(_)
+                        | Pattern::Float(_)
+                        | Pattern::Char(_)
+                        | Pattern::Bool(_)
+                        | Pattern::Ctor(_, _)
+                        | Pattern::Slice { .. } => {
                             return Err(SimdError::new(format!(
                                 "type witness parameter {} in '{}' used a non-Type literal pattern",
                                 index, pending.base_name
@@ -1939,6 +1952,7 @@ fn specialize_expr(
             _ => TypedExprKind::Float(*value, *prim),
         },
         TypedExprKind::Bool(value) => TypedExprKind::Bool(*value),
+        TypedExprKind::Char(value) => TypedExprKind::Char(*value),
         TypedExprKind::TypeToken(prim) => TypedExprKind::TypeToken(*prim),
         TypedExprKind::String(value) => TypedExprKind::String(value.clone()),
         TypedExprKind::Lambda { param, body } => TypedExprKind::Lambda {
@@ -2216,6 +2230,7 @@ fn extract_known_function_binding(expr: &TypedExpr) -> Option<KnownFunctionBindi
         | TypedExprKind::Int(_, _)
         | TypedExprKind::Float(_, _)
         | TypedExprKind::Bool(_)
+        | TypedExprKind::Char(_)
         | TypedExprKind::String(_)
         | TypedExprKind::TypeToken(_) => None,
     }
@@ -2319,7 +2334,12 @@ fn try_inline_lambda_result_call(
     if clause
         .patterns
         .iter()
-        .any(|pattern| matches!(pattern.pattern, Pattern::Int(_) | Pattern::Float(_)))
+        .any(|pattern| {
+            matches!(
+                pattern.pattern,
+                Pattern::Int(_) | Pattern::Float(_) | Pattern::Char(_) | Pattern::Slice { .. }
+            )
+        })
     {
         return Ok(None);
     }
@@ -2372,9 +2392,11 @@ fn try_inline_lambda_result_call(
             }
             Pattern::Int(_)
             | Pattern::Float(_)
+            | Pattern::Char(_)
             | Pattern::Bool(_)
             | Pattern::Type(_)
-            | Pattern::Ctor(_, _) => {
+            | Pattern::Ctor(_, _)
+            | Pattern::Slice { .. } => {
                 return Ok(None);
             }
         }
@@ -2961,6 +2983,7 @@ fn mangle_type(ty: &Type) -> String {
         Type::Scalar(prim) => match prim {
             Prim::I32 => "i32".to_string(),
             Prim::I64 => "i64".to_string(),
+            Prim::Char => "char".to_string(),
             Prim::F32 => "f32".to_string(),
             Prim::F64 => "f64".to_string(),
         },
@@ -3070,6 +3093,7 @@ fn eliminate_non_escaping_lambdas_expr(
         TypedExprKind::Int(value, prim) => TypedExprKind::Int(*value, *prim),
         TypedExprKind::Float(value, prim) => TypedExprKind::Float(*value, *prim),
         TypedExprKind::Bool(value) => TypedExprKind::Bool(*value),
+        TypedExprKind::Char(value) => TypedExprKind::Char(*value),
         TypedExprKind::String(value) => TypedExprKind::String(value.clone()),
         TypedExprKind::TypeToken(prim) => TypedExprKind::TypeToken(*prim),
         TypedExprKind::Lambda { param, body } => TypedExprKind::Lambda {
@@ -3286,6 +3310,7 @@ fn collect_free_locals(
         | TypedExprKind::Int(_, _)
         | TypedExprKind::Float(_, _)
         | TypedExprKind::Bool(_)
+        | TypedExprKind::Char(_)
         | TypedExprKind::String(_)
         | TypedExprKind::TypeToken(_) => {}
         TypedExprKind::Lambda { param, body } => {
@@ -3352,6 +3377,7 @@ fn rename_free_locals(
         TypedExprKind::Int(value, prim) => TypedExprKind::Int(*value, *prim),
         TypedExprKind::Float(value, prim) => TypedExprKind::Float(*value, *prim),
         TypedExprKind::Bool(value) => TypedExprKind::Bool(*value),
+        TypedExprKind::Char(value) => TypedExprKind::Char(*value),
         TypedExprKind::String(value) => TypedExprKind::String(value.clone()),
         TypedExprKind::TypeToken(prim) => TypedExprKind::TypeToken(*prim),
         TypedExprKind::Lambda { param, body } => {
@@ -3448,6 +3474,7 @@ fn collect_used_locals(expr: &TypedExpr, names: &mut BTreeSet<String>) {
         | TypedExprKind::Int(_, _)
         | TypedExprKind::Float(_, _)
         | TypedExprKind::Bool(_)
+        | TypedExprKind::Char(_)
         | TypedExprKind::String(_)
         | TypedExprKind::TypeToken(_) => {}
         TypedExprKind::Lambda { body, .. } => collect_used_locals(body, names),
@@ -3541,6 +3568,7 @@ fn canonicalize_backend_higher_order_expr(
         TypedExprKind::Int(value, prim) => TypedExprKind::Int(*value, *prim),
         TypedExprKind::Float(value, prim) => TypedExprKind::Float(*value, *prim),
         TypedExprKind::Bool(value) => TypedExprKind::Bool(*value),
+        TypedExprKind::Char(value) => TypedExprKind::Char(*value),
         TypedExprKind::String(value) => TypedExprKind::String(value.clone()),
         TypedExprKind::TypeToken(prim) => TypedExprKind::TypeToken(*prim),
         TypedExprKind::Lambda { param, body } => TypedExprKind::Lambda {
@@ -3690,6 +3718,7 @@ fn classify_function_value_expr_for_backend(expr: &TypedExpr) -> FunctionValueCl
         TypedExprKind::Int(_, _)
         | TypedExprKind::Float(_, _)
         | TypedExprKind::Bool(_)
+        | TypedExprKind::Char(_)
         | TypedExprKind::String(_)
         | TypedExprKind::TypeToken(_)
         | TypedExprKind::Record(_)
@@ -4126,6 +4155,7 @@ fn collect_higher_order_expr_counts(
         | TypedExprKind::Int(_, _)
         | TypedExprKind::Float(_, _)
         | TypedExprKind::Bool(_)
+        | TypedExprKind::Char(_)
         | TypedExprKind::String(_)
         | TypedExprKind::TypeToken(_) => {}
     }
@@ -4175,6 +4205,7 @@ fn typed_expr_contains_lambda_or_apply(expr: &TypedExpr) -> bool {
         | TypedExprKind::Int(_, _)
         | TypedExprKind::Float(_, _)
         | TypedExprKind::Bool(_)
+        | TypedExprKind::Char(_)
         | TypedExprKind::String(_)
         | TypedExprKind::TypeToken(_) => false,
     }
@@ -4208,6 +4239,7 @@ fn typed_expr_contains_fun_local(expr: &TypedExpr) -> bool {
         | TypedExprKind::Int(_, _)
         | TypedExprKind::Float(_, _)
         | TypedExprKind::Bool(_)
+        | TypedExprKind::Char(_)
         | TypedExprKind::String(_)
         | TypedExprKind::TypeToken(_) => false,
     }
@@ -4237,6 +4269,12 @@ fn compile_wasm_artifact_checked(
 ) -> Result<WasmArtifact> {
     let higher_order_reports = collect_higher_order_reports(checked_program, origins);
     ensure_backend_first_order_compatibility(&higher_order_reports)?;
+    let entry_result_type = checked_program
+        .functions
+        .iter()
+        .find(|function| function.name == main)
+        .map(|function| function.signature.ty.fun_parts().1)
+        .ok_or_else(|| SimdError::new(format!("unknown entry function '{}'", main)))?;
     let mut plan = build_wasm_plan(checked_program, main)?;
     let normalized = normalize_records(&plan.checked)?;
     let lowered_program = optimize_lowered_program(&lower_program(&normalized)?);
@@ -4451,6 +4489,8 @@ fn compile_wasm_artifact_checked(
         export_name: main.to_string(),
         params: plan.params,
         result: plan.result,
+        result_type: entry_result_type,
+        enum_ctors: checked_program.enum_ctors.clone(),
         grouped_export,
         leaf_exports: plan.leaf_exports,
         optimizer_reports,
@@ -4711,11 +4751,11 @@ fn choose_vector_plan(
     let stream_weight = total_streams.max(1);
     let weighted_ops = op_count.saturating_mul(stream_weight);
     let vec4_ready = match result_prim {
-        Prim::I32 | Prim::F32 => weighted_ops >= 18 && total_streams <= 8,
+        Prim::I32 | Prim::Char | Prim::F32 => weighted_ops >= 18 && total_streams <= 8,
         Prim::I64 | Prim::F64 => weighted_ops >= 28 && total_streams <= 5,
     };
     let vec2_ready = match result_prim {
-        Prim::I32 | Prim::F32 => weighted_ops >= 8 || op_count >= 6,
+        Prim::I32 | Prim::Char | Prim::F32 => weighted_ops >= 8 || op_count >= 6,
         Prim::I64 | Prim::F64 => weighted_ops >= 10 || op_count >= 7,
     };
 
@@ -5573,7 +5613,12 @@ fn try_inline_grouped_leaf_call(
         || clause
             .patterns
             .iter()
-            .any(|pattern| matches!(pattern.pattern, Pattern::Int(_) | Pattern::Float(_)))
+            .any(|pattern| {
+                matches!(
+                    pattern.pattern,
+                    Pattern::Int(_) | Pattern::Float(_) | Pattern::Char(_) | Pattern::Slice { .. }
+                )
+            })
     {
         return Ok(None);
     }
@@ -5722,10 +5767,12 @@ fn add_function_type(types: &mut TypeSection, params: &[ValType], result: Option
 
 fn scalar_signature(function: &CheckedFunction) -> Result<(Vec<ValType>, Option<ValType>)> {
     let (params, result) = function.signature.ty.fun_parts();
-    let params = params
+    let _validated_params = params
         .into_iter()
         .map(|ty| match ty {
             Type::Scalar(prim) => Ok(wasm_val_type(prim)),
+            Type::Bulk(_, _) => Ok(ValType::I32),
+            Type::Named(name, args) if is_wasm_string_named_type(&name, &args) => Ok(ValType::I32),
             Type::Named(name, args) if is_wasm_enum_named_type(&name, &args) => Ok(ValType::I32),
             Type::Record(_) => Err(SimdError::new(format!(
                 "scalar Wasm function '{}' cannot accept record parameters",
@@ -5741,6 +5788,30 @@ fn scalar_signature(function: &CheckedFunction) -> Result<(Vec<ValType>, Option<
             ))),
         })
         .collect::<Result<Vec<_>>>()?;
+    let mut expanded_params = Vec::<ValType>::new();
+    for ty in function.signature.ty.fun_parts().0 {
+        match ty {
+            Type::Bulk(_, _) => {
+                expanded_params.push(ValType::I32);
+                expanded_params.push(ValType::I32);
+            }
+            Type::Named(name, args) if is_wasm_string_named_type(&name, &args) => {
+                expanded_params.push(ValType::I32);
+                expanded_params.push(ValType::I32);
+            }
+            Type::Scalar(prim) => expanded_params.push(wasm_val_type(prim)),
+            Type::Named(name, args) if is_wasm_enum_named_type(&name, &args) => {
+                expanded_params.push(ValType::I32);
+            }
+            Type::Record(_) | Type::Var(_) | Type::Infer(_) | Type::TypeToken(_) | Type::Named(_, _) | Type::Fun(_, _) => {
+                // Already validated above; keep original error path.
+                return Err(SimdError::new(format!(
+                    "scalar Wasm function '{}' has unsupported parameter form after validation",
+                    function.name
+                )));
+            }
+        }
+    }
     let result = match result {
         Type::Scalar(prim) => Some(wasm_val_type(prim)),
         Type::Named(name, args) if is_wasm_enum_named_type(&name, &args) => Some(ValType::I32),
@@ -5763,7 +5834,7 @@ fn scalar_signature(function: &CheckedFunction) -> Result<(Vec<ValType>, Option<
             )));
         }
     };
-    Ok((params, result))
+    Ok((expanded_params, result))
 }
 
 fn entry_signature(function: &CheckedFunction) -> Result<(Vec<ValType>, Option<ValType>)> {
@@ -5774,6 +5845,11 @@ fn entry_signature(function: &CheckedFunction) -> Result<(Vec<ValType>, Option<V
         match ty {
             Type::Scalar(prim) => lowered.push(wasm_val_type(prim)),
             Type::Bulk(_, _) => {
+                saw_bulk.get_or_insert(index);
+                lowered.push(ValType::I32);
+                lowered.push(ValType::I32);
+            }
+            Type::Named(name, args) if is_wasm_string_named_type(&name, &args) => {
                 saw_bulk.get_or_insert(index);
                 lowered.push(ValType::I32);
                 lowered.push(ValType::I32);
@@ -5843,6 +5919,7 @@ fn entry_signature(function: &CheckedFunction) -> Result<(Vec<ValType>, Option<V
 fn wasm_val_type(prim: Prim) -> ValType {
     match prim {
         Prim::I32 => ValType::I32,
+        Prim::Char => ValType::I32,
         Prim::I64 => ValType::I64,
         Prim::F32 => ValType::F32,
         Prim::F64 => ValType::F64,
@@ -5857,6 +5934,11 @@ fn compile_scalar_function(
     signatures: &BTreeMap<String, &CheckedFunction>,
 ) -> Result<Function> {
     let (param_types, result_ty) = checked.signature.ty.fun_parts();
+    let tail_loop = if param_types.iter().any(is_wasm_bulk_like_type) {
+        None
+    } else {
+        lowered.tail_loop.as_ref()
+    };
     let result_val_type = match result_ty {
         Type::Scalar(prim) => wasm_val_type(prim),
         Type::Named(name, args) if is_wasm_enum_named_type(&name, &args) => ValType::I32,
@@ -5868,8 +5950,11 @@ fn compile_scalar_function(
         }
     };
     let mut locals = Vec::<(u32, ValType)>::new();
-    let mut next_local = param_types.len() as u32;
-    let temp_locals = if lowered.tail_loop.is_some() {
+    let mut next_local = 0u32;
+    for ty in &param_types {
+        next_local += if is_wasm_bulk_like_type(ty) { 2 } else { 1 };
+    }
+    let temp_locals = if tail_loop.is_some() {
         let mut temp = Vec::new();
         for val_type in param_types.iter().map(|ty| match ty {
             Type::Scalar(prim) => Ok(wasm_val_type(*prim)),
@@ -5892,7 +5977,7 @@ fn compile_scalar_function(
     } else {
         Vec::new()
     };
-    let result_local = if lowered.tail_loop.is_some() {
+    let result_local = if tail_loop.is_some() {
         let local = next_local;
         next_local += 1;
         locals.push((1, result_val_type));
@@ -5909,15 +5994,19 @@ fn compile_scalar_function(
     let enum_save_sp_local = next_local;
     next_local += 1;
     locals.push((1, ValType::I32));
+    let enum_base_tmp_local = next_local;
+    next_local += 1;
+    locals.push((1, ValType::I32));
     let enum_state = EnumWasmState {
         ptr_local: enum_ptr_local,
         base_local: enum_base_local,
         save_sp_local: enum_save_sp_local,
+        base_tmp_local: enum_base_tmp_local,
     };
 
     let mut clause_locals = BTreeMap::<usize, BTreeMap<String, u32>>::new();
     let mut shared_named_locals = BTreeMap::<String, (u32, Type)>::new();
-    match (&lowered.kind, &lowered.tail_loop) {
+    match (&lowered.kind, tail_loop) {
         (LoweredKind::Scalar { clauses: _ }, Some(tail_loop)) => {
             for clause in &tail_loop.clauses {
                 let map = build_clause_local_map(
@@ -5953,7 +6042,7 @@ fn compile_scalar_function(
     function.instruction(&Instruction::I32Const(ENUM_SAVE_STACK_START));
     function.instruction(&Instruction::LocalSet(enum_state.save_sp_local));
 
-    match (&lowered.kind, &lowered.tail_loop) {
+    match (&lowered.kind, tail_loop) {
         (LoweredKind::Scalar { clauses: _ }, Some(tail_loop)) => {
             let result_local =
                 result_local.ok_or_else(|| SimdError::new("missing tail-loop result local"))?;
@@ -7003,6 +7092,7 @@ struct EnumWasmState {
     ptr_local: u32,
     base_local: u32,
     save_sp_local: u32,
+    base_tmp_local: u32,
 }
 
 const ENUM_HEAP_PTR_ADDR: u32 = 0;
@@ -7082,10 +7172,11 @@ fn emit_enum_field_store(
     function: &mut Function,
     field_index: usize,
     field_ty: &Type,
+    enum_state: EnumWasmState,
 ) -> Result<()> {
     let offset = enum_field_slot_offset(field_index)?;
     match field_ty {
-        Type::Scalar(Prim::I32) => {
+        Type::Scalar(Prim::I32 | Prim::Char) => {
             function.instruction(&Instruction::I32Store(memarg(offset, 2)));
         }
         Type::Scalar(Prim::I64) => {
@@ -7099,6 +7190,16 @@ fn emit_enum_field_store(
         }
         Type::Named(name, args) if is_wasm_enum_named_type(name, args) => {
             function.instruction(&Instruction::I32Store(memarg(offset, 2)));
+        }
+        Type::Named(name, args) if is_wasm_string_named_type(name, args) => {
+            function.instruction(&Instruction::LocalSet(enum_state.ptr_local));
+            function.instruction(&Instruction::LocalSet(enum_state.base_local));
+            function.instruction(&Instruction::LocalTee(enum_state.base_tmp_local));
+            function.instruction(&Instruction::LocalGet(enum_state.base_local));
+            function.instruction(&Instruction::I32Store(memarg(offset, 2)));
+            function.instruction(&Instruction::LocalGet(enum_state.base_tmp_local));
+            function.instruction(&Instruction::LocalGet(enum_state.ptr_local));
+            function.instruction(&Instruction::I32Store(memarg(offset + 4, 2)));
         }
         other => {
             return Err(SimdError::new(format!(
@@ -7119,7 +7220,7 @@ fn emit_enum_field_load(
     let offset = enum_field_slot_offset(field_index)?;
     function.instruction(&Instruction::LocalGet(value_local));
     match field_ty {
-        Type::Scalar(Prim::I32) => {
+        Type::Scalar(Prim::I32 | Prim::Char) => {
             function.instruction(&Instruction::I32Load(memarg(offset, 2)));
         }
         Type::Scalar(Prim::I64) => {
@@ -7133,6 +7234,11 @@ fn emit_enum_field_load(
         }
         Type::Named(name, args) if is_wasm_enum_named_type(name, args) => {
             function.instruction(&Instruction::I32Load(memarg(offset, 2)));
+        }
+        Type::Named(name, args) if is_wasm_string_named_type(name, args) => {
+            function.instruction(&Instruction::I32Load(memarg(offset, 2)));
+            function.instruction(&Instruction::LocalGet(value_local));
+            function.instruction(&Instruction::I32Load(memarg(offset + 4, 2)));
         }
         other => {
             return Err(SimdError::new(format!(
@@ -7155,6 +7261,38 @@ fn emit_enum_field_as_condition_value(
 
 fn is_pattern_constructor_name(name: &str, enum_ctors: &BTreeMap<String, EnumCtorInfo>) -> bool {
     is_constructor_name(name) && enum_ctors.contains_key(name)
+}
+
+fn bulk_len_local_name(name: &str) -> String {
+    format!("__len${name}")
+}
+
+fn is_wasm_string_named_type(name: &str, args: &[Type]) -> bool {
+    name == "string" && args.is_empty()
+}
+
+fn is_wasm_bulk_like_type(ty: &Type) -> bool {
+    matches!(ty, Type::Bulk(_, _))
+        || matches!(ty, Type::Named(name, args) if is_wasm_string_named_type(name, args))
+}
+
+fn wasm_slice_pattern_prim(ty: &Type) -> Result<Prim> {
+    match ty {
+        Type::Bulk(prim, shape) => {
+            if shape.0.len() != 1 {
+                return Err(SimdError::new(format!(
+                    "Wasm backend currently supports slice patterns only for rank-1 bulk/string values, found shape {:?}",
+                    shape
+                )));
+            }
+            Ok(*prim)
+        }
+        Type::Named(name, args) if is_wasm_string_named_type(name, args) => Ok(Prim::Char),
+        _ => Err(SimdError::new(format!(
+            "Wasm backend currently supports slice patterns only for rank-1 bulk/string values, found {:?}",
+            ty
+        ))),
+    }
 }
 
 fn wasm_local_val_type_for_pattern_binding(ty: &Type) -> Result<ValType> {
@@ -7209,7 +7347,31 @@ fn collect_pattern_binding_types(
             }
             Ok(())
         }
-        Pattern::Wildcard | Pattern::Int(_) | Pattern::Float(_) | Pattern::Bool(_) | Pattern::Type(_) => {
+        Pattern::Wildcard
+        | Pattern::Int(_)
+        | Pattern::Float(_)
+        | Pattern::Char(_)
+        | Pattern::Bool(_)
+        | Pattern::Type(_) => {
+            Ok(())
+        }
+        Pattern::Slice {
+            prefix,
+            suffix,
+            rest,
+        } => {
+            let elem_ty = Type::Scalar(wasm_slice_pattern_prim(ty)?);
+            for subpattern in prefix {
+                collect_pattern_binding_types(subpattern, &elem_ty, enum_ctors, out)?;
+            }
+            for subpattern in suffix {
+                collect_pattern_binding_types(subpattern, &elem_ty, enum_ctors, out)?;
+            }
+            if let Some(SliceRest::Bind(name)) = rest
+                && name != "_"
+            {
+                out.push((name.clone(), ty.clone()));
+            }
             Ok(())
         }
     }
@@ -7220,7 +7382,15 @@ fn clause_has_condition(
     enum_ctors: &BTreeMap<String, EnumCtorInfo>,
 ) -> bool {
     patterns.iter().any(|pattern| {
-        matches!(pattern.pattern, Pattern::Int(_) | Pattern::Float(_) | Pattern::Bool(_) | Pattern::Ctor(_, _))
+        matches!(
+            pattern.pattern,
+            Pattern::Int(_)
+                | Pattern::Float(_)
+                | Pattern::Char(_)
+                | Pattern::Bool(_)
+                | Pattern::Ctor(_, _)
+                | Pattern::Slice { .. }
+        )
             || matches!(&pattern.pattern, Pattern::Name(name) if is_pattern_constructor_name(name, enum_ctors))
     })
 }
@@ -7233,13 +7403,18 @@ fn build_clause_local_map(
     enum_ctors: &BTreeMap<String, EnumCtorInfo>,
 ) -> Result<BTreeMap<String, u32>> {
     let mut map = BTreeMap::<String, u32>::new();
-    for (index, typed_pattern) in patterns.iter().enumerate() {
+    let mut value_local = 0u32;
+    for typed_pattern in patterns {
         if let Pattern::Name(name) = &typed_pattern.pattern
             && !is_pattern_constructor_name(name, enum_ctors)
             && name != "_"
         {
-            map.insert(name.clone(), index as u32);
+            map.insert(name.clone(), value_local);
+            if is_wasm_bulk_like_type(&typed_pattern.ty) {
+                map.insert(bulk_len_local_name(name), value_local + 1);
+            }
         }
+        value_local += wasm_pattern_value_width(&typed_pattern.ty);
     }
     for typed_pattern in patterns {
         let mut bindings = Vec::<(String, Type)>::new();
@@ -7260,18 +7435,39 @@ fn build_clause_local_map(
                         name, existing_ty, ty
                     )));
                 }
-                map.insert(name, *index);
+                map.insert(name.clone(), *index);
+                if is_wasm_bulk_like_type(&ty) {
+                    map.insert(bulk_len_local_name(&name), *index + 1);
+                }
                 continue;
             }
-            let val_type = wasm_local_val_type_for_pattern_binding(&ty)?;
             let index = *next_local;
-            *next_local += 1;
-            locals.push((1, val_type));
-            shared_named_locals.insert(name.clone(), (index, ty));
-            map.insert(name, index);
+            if is_wasm_bulk_like_type(&ty) {
+                *next_local += 2;
+                locals.push((2, ValType::I32));
+                map.insert(name.clone(), index);
+                map.insert(bulk_len_local_name(&name), index + 1);
+            } else {
+                let val_type = wasm_local_val_type_for_pattern_binding(&ty)?;
+                *next_local += 1;
+                locals.push((1, val_type));
+                map.insert(name.clone(), index);
+            }
+            shared_named_locals.insert(name, (index, ty));
         }
     }
     Ok(map)
+}
+
+fn wasm_pattern_value_width(ty: &Type) -> u32 {
+    match ty {
+        _ if is_wasm_bulk_like_type(ty) => 2,
+        Type::Record(fields) => fields
+            .values()
+            .map(|field_ty| wasm_pattern_value_width(field_ty))
+            .sum(),
+        _ => 1,
+    }
 }
 
 fn emit_matching_if(
@@ -7292,12 +7488,13 @@ fn emit_clause_condition(
     enum_state: Option<EnumWasmState>,
 ) -> Result<()> {
     let mut terms = 0usize;
-    for (index, pattern) in patterns.iter().enumerate() {
+    let mut value_local = 0u32;
+    for pattern in patterns {
         if emit_single_pattern_condition(
             function,
             &pattern.pattern,
             &pattern.ty,
-            index as u32,
+            value_local,
             enum_ctors,
             enum_state,
         )? {
@@ -7306,9 +7503,149 @@ fn emit_clause_condition(
             }
             terms += 1;
         }
+        value_local += wasm_pattern_value_width(&pattern.ty);
     }
     if terms == 0 {
         function.instruction(&Instruction::I32Const(1));
+    }
+    Ok(())
+}
+
+fn emit_bulk_element_load_at_prefix_index(
+    function: &mut Function,
+    ptr_local: u32,
+    prim: Prim,
+    index: usize,
+) -> Result<()> {
+    let stride = byte_width(prim) as u64;
+    let offset = u64::try_from(index)
+        .map_err(|_| SimdError::new("slice pattern index does not fit in u64"))?
+        .saturating_mul(stride);
+    function.instruction(&Instruction::LocalGet(ptr_local));
+    match prim {
+        Prim::I32 | Prim::Char => function.instruction(&Instruction::I32Load(memarg(offset, 2))),
+        Prim::I64 => function.instruction(&Instruction::I64Load(memarg(offset, 3))),
+        Prim::F32 => function.instruction(&Instruction::F32Load(memarg(offset, 2))),
+        Prim::F64 => function.instruction(&Instruction::F64Load(memarg(offset, 3))),
+    };
+    Ok(())
+}
+
+fn emit_bulk_element_load_at_suffix_index(
+    function: &mut Function,
+    ptr_local: u32,
+    len_local: u32,
+    prim: Prim,
+    suffix_len: usize,
+    suffix_index: usize,
+) -> Result<()> {
+    let suffix_len_i32 = i32::try_from(suffix_len)
+        .map_err(|_| SimdError::new("slice suffix length does not fit in i32"))?;
+    let suffix_index_i32 = i32::try_from(suffix_index)
+        .map_err(|_| SimdError::new("slice suffix index does not fit in i32"))?;
+    let stride_i32 = i32::try_from(byte_width(prim))
+        .map_err(|_| SimdError::new("slice element byte-width does not fit in i32"))?;
+    function.instruction(&Instruction::LocalGet(ptr_local));
+    function.instruction(&Instruction::LocalGet(len_local));
+    function.instruction(&Instruction::I32Const(suffix_len_i32));
+    function.instruction(&Instruction::I32Sub);
+    if suffix_index_i32 != 0 {
+        function.instruction(&Instruction::I32Const(suffix_index_i32));
+        function.instruction(&Instruction::I32Add);
+    }
+    function.instruction(&Instruction::I32Const(stride_i32));
+    function.instruction(&Instruction::I32Mul);
+    function.instruction(&Instruction::I32Add);
+    match prim {
+        Prim::I32 | Prim::Char => function.instruction(&Instruction::I32Load(memarg(0, 2))),
+        Prim::I64 => function.instruction(&Instruction::I64Load(memarg(0, 3))),
+        Prim::F32 => function.instruction(&Instruction::F32Load(memarg(0, 2))),
+        Prim::F64 => function.instruction(&Instruction::F64Load(memarg(0, 3))),
+    };
+    Ok(())
+}
+
+fn emit_slice_element_pattern_condition(
+    function: &mut Function,
+    pattern: &Pattern,
+    prim: Prim,
+    enum_ctors: &BTreeMap<String, EnumCtorInfo>,
+) -> Result<bool> {
+    match pattern {
+        Pattern::Wildcard => Ok(false),
+        Pattern::Name(name) => {
+            if is_pattern_constructor_name(name, enum_ctors) {
+                return Err(SimdError::new(format!(
+                    "constructor '{}' cannot match a scalar bulk element",
+                    name
+                )));
+            }
+            Ok(false)
+        }
+        Pattern::Int(expected) => {
+            if !prim.is_int() {
+                return Err(SimdError::new(format!(
+                    "integer slice element pattern requires integer bulk element type, found {:?}",
+                    prim
+                )));
+            }
+            emit_int_const(function, prim, *expected)?;
+            emit_int_eq(function, prim);
+            Ok(true)
+        }
+        Pattern::Float(expected) => {
+            if !prim.is_float() {
+                return Err(SimdError::new(format!(
+                    "float slice element pattern requires float bulk element type, found {:?}",
+                    prim
+                )));
+            }
+            emit_float_bits_eq(function, prim, *expected)?;
+            Ok(true)
+        }
+        Pattern::Char(expected) => {
+            if prim != Prim::Char {
+                return Err(SimdError::new(format!(
+                    "char slice element pattern requires char bulk element type, found {:?}",
+                    prim
+                )));
+            }
+            function.instruction(&Instruction::I32Const(
+                i32::try_from(u32::from(*expected))
+                    .map_err(|_| SimdError::new("char literal codepoint does not fit in i32"))?,
+            ));
+            function.instruction(&Instruction::I32Eq);
+            Ok(true)
+        }
+        Pattern::Bool(_) => Err(SimdError::new(
+            "Wasm backend does not support bool slice element patterns",
+        )),
+        Pattern::Type(_) => Err(SimdError::new(
+            "Wasm backend does not support type witness slice element patterns",
+        )),
+        Pattern::Ctor(_, _) => Err(SimdError::new(
+            "Wasm backend does not support constructor slice element patterns",
+        )),
+        Pattern::Slice { .. } => Err(SimdError::new(
+            "Wasm backend does not support nested slice element patterns",
+        )),
+    }
+}
+
+fn emit_slice_element_name_binding(
+    function: &mut Function,
+    pattern: &Pattern,
+    target_local: Option<u32>,
+    enum_ctors: &BTreeMap<String, EnumCtorInfo>,
+) -> Result<()> {
+    let Some(target_local) = target_local else {
+        return Ok(());
+    };
+    if let Pattern::Name(name) = pattern
+        && name != "_"
+        && !is_pattern_constructor_name(name, enum_ctors)
+    {
+        function.instruction(&Instruction::LocalSet(target_local));
     }
     Ok(())
 }
@@ -7377,12 +7714,101 @@ fn emit_single_pattern_condition(
             emit_float_bits_eq(function, prim, *expected)?;
             Ok(true)
         }
+        Pattern::Char(expected) => {
+            let prim = ty.prim().ok_or_else(|| {
+                SimdError::new(format!(
+                    "char pattern requires scalar primitive type, found {:?}",
+                    ty
+                ))
+            })?;
+            if prim != Prim::Char {
+                return Err(SimdError::new(format!(
+                    "char pattern requires char type, found {:?}",
+                    ty
+                )));
+            }
+            function.instruction(&Instruction::LocalGet(value_local));
+            function.instruction(&Instruction::I32Const(i32::try_from(u32::from(*expected)).map_err(
+                |_| SimdError::new("char literal codepoint does not fit in i32"),
+            )?));
+            function.instruction(&Instruction::I32Eq);
+            Ok(true)
+        }
         Pattern::Bool(_) => Err(SimdError::new(
             "Wasm backend does not support bool clause patterns",
         )),
         Pattern::Type(_) => Err(SimdError::new(
             "Wasm backend does not support type witness clause patterns",
         )),
+        Pattern::Slice {
+            prefix,
+            suffix,
+            rest,
+        } => {
+            let prim = wasm_slice_pattern_prim(ty)?;
+
+            let len_local = value_local + 1;
+            let fixed = prefix.len() + suffix.len();
+            let fixed_i32 = i32::try_from(fixed)
+                .map_err(|_| SimdError::new("slice fixed width does not fit in i32"))?;
+
+            function.instruction(&Instruction::LocalGet(len_local));
+            function.instruction(&Instruction::I32Const(fixed_i32));
+            match rest {
+                None => function.instruction(&Instruction::I32Eq),
+                Some(SliceRest::Ignore) | Some(SliceRest::Bind(_)) => {
+                    function.instruction(&Instruction::I32GeU)
+                }
+            };
+            function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+
+            let mut inner_terms = 0usize;
+
+            for (index, subpattern) in prefix.iter().enumerate() {
+                if matches!(subpattern, Pattern::Wildcard | Pattern::Name(_)) {
+                    continue;
+                }
+                emit_bulk_element_load_at_prefix_index(function, value_local, prim, index)?;
+                let emitted =
+                    emit_slice_element_pattern_condition(function, subpattern, prim, enum_ctors)?;
+                debug_assert!(emitted);
+                if inner_terms > 0 {
+                    function.instruction(&Instruction::I32And);
+                }
+                inner_terms += 1;
+            }
+
+            for (index, subpattern) in suffix.iter().enumerate() {
+                if matches!(subpattern, Pattern::Wildcard | Pattern::Name(_)) {
+                    continue;
+                }
+                emit_bulk_element_load_at_suffix_index(
+                    function,
+                    value_local,
+                    len_local,
+                    prim,
+                    suffix.len(),
+                    index,
+                )?;
+                let emitted =
+                    emit_slice_element_pattern_condition(function, subpattern, prim, enum_ctors)?;
+                debug_assert!(emitted);
+                if inner_terms > 0 {
+                    function.instruction(&Instruction::I32And);
+                }
+                inner_terms += 1;
+            }
+
+            if inner_terms == 0 {
+                function.instruction(&Instruction::I32Const(1));
+            }
+
+            function.instruction(&Instruction::Else);
+            function.instruction(&Instruction::I32Const(0));
+            function.instruction(&Instruction::End);
+
+            Ok(true)
+        }
         Pattern::Ctor(name, subpatterns) => {
             let ctor = enum_ctors
                 .get(name)
@@ -7454,6 +7880,32 @@ fn emit_single_pattern_condition(
                         function.instruction(&Instruction::I32And);
                         terms += 1;
                     }
+                    Pattern::Char(expected) => {
+                        emit_enum_field_as_condition_value(
+                            function,
+                            value_local,
+                            field_index,
+                            &field_ty,
+                        )?;
+                        let prim = field_ty.prim().ok_or_else(|| {
+                            SimdError::new(format!(
+                                "char subpattern in '{}' requires scalar field, found {:?}",
+                                name, field_ty
+                            ))
+                        })?;
+                        if prim != Prim::Char {
+                            return Err(SimdError::new(format!(
+                                "char subpattern in '{}' requires char field, found {:?}",
+                                name, field_ty
+                            )));
+                        }
+                        function.instruction(&Instruction::I32Const(i32::try_from(u32::from(*expected)).map_err(
+                            |_| SimdError::new("char literal codepoint does not fit in i32"),
+                        )?));
+                        function.instruction(&Instruction::I32Eq);
+                        function.instruction(&Instruction::I32And);
+                        terms += 1;
+                    }
                     Pattern::Name(ctor_name) if is_pattern_constructor_name(ctor_name, enum_ctors) => {
                         let Some(enum_state) = enum_state else {
                             return Err(SimdError::new(
@@ -7505,6 +7957,11 @@ fn emit_single_pattern_condition(
                             "Wasm backend does not support type witness clause patterns",
                         ));
                     }
+                    Pattern::Slice { .. } => {
+                        return Err(SimdError::new(
+                            "Wasm backend does not yet support slice view patterns",
+                        ));
+                    }
                 }
             }
             Ok(terms > 0)
@@ -7519,16 +7976,18 @@ fn emit_clause_bindings(
     enum_ctors: &BTreeMap<String, EnumCtorInfo>,
     enum_state: Option<EnumWasmState>,
 ) -> Result<()> {
-    for (index, pattern) in patterns.iter().enumerate() {
+    let mut value_local = 0u32;
+    for pattern in patterns {
         emit_pattern_bindings(
             function,
             &pattern.pattern,
             &pattern.ty,
-            index as u32,
+            value_local,
             clause_locals,
             enum_ctors,
             enum_state,
         )?;
+        value_local += wasm_pattern_value_width(&pattern.ty);
     }
     Ok(())
 }
@@ -7583,11 +8042,28 @@ fn emit_pattern_bindings(
             {
                 let field_ty = apply_type_subst(field_ty_template, &subst);
                 match subpattern {
-                    Pattern::Wildcard | Pattern::Int(_) | Pattern::Float(_) | Pattern::Bool(_) | Pattern::Type(_) => {}
+                    Pattern::Wildcard
+                    | Pattern::Int(_)
+                    | Pattern::Float(_)
+                    | Pattern::Char(_)
+                    | Pattern::Bool(_)
+                    | Pattern::Type(_) => {}
                     Pattern::Name(local_name) if !is_pattern_constructor_name(local_name, enum_ctors) => {
                         if let Some(target_local) = clause_locals.get(local_name).copied() {
                             emit_enum_field_load(function, value_local, field_index, &field_ty)?;
-                            function.instruction(&Instruction::LocalSet(target_local));
+                            if is_wasm_bulk_like_type(&field_ty) {
+                                let len_key = bulk_len_local_name(local_name);
+                                let len_local = clause_locals.get(&len_key).copied().ok_or_else(|| {
+                                    SimdError::new(format!(
+                                        "missing clause local '{}' for enum bulk field binding",
+                                        len_key
+                                    ))
+                                })?;
+                                function.instruction(&Instruction::LocalSet(len_local));
+                                function.instruction(&Instruction::LocalSet(target_local));
+                            } else {
+                                function.instruction(&Instruction::LocalSet(target_local));
+                            }
                         }
                     }
                     Pattern::Name(_) | Pattern::Ctor(_, _) => {
@@ -7608,17 +8084,166 @@ fn emit_pattern_bindings(
                             enum_state.into(),
                         )?;
                     }
+                    Pattern::Slice { .. } => {
+                        return Err(SimdError::new(
+                            "Wasm backend does not yet support slice view patterns",
+                        ));
+                    }
                 }
             }
             Ok(())
         }
-        Pattern::Wildcard | Pattern::Int(_) | Pattern::Float(_) | Pattern::Bool(_) | Pattern::Type(_) => Ok(()),
+        Pattern::Wildcard
+        | Pattern::Int(_)
+        | Pattern::Float(_)
+        | Pattern::Char(_)
+        | Pattern::Bool(_)
+        | Pattern::Type(_) => Ok(()),
+        Pattern::Slice {
+            prefix,
+            suffix,
+            rest,
+        } => {
+            let prim = wasm_slice_pattern_prim(ty)?;
+            let input_len_local = value_local + 1;
+
+            for (index, subpattern) in prefix.iter().enumerate() {
+                let target = match subpattern {
+                    Pattern::Name(name)
+                        if !is_pattern_constructor_name(name, enum_ctors) && name != "_" =>
+                    {
+                        clause_locals.get(name).copied()
+                    }
+                    Pattern::Wildcard | Pattern::Int(_) | Pattern::Float(_) | Pattern::Char(_) => {
+                        None
+                    }
+                    Pattern::Name(_) => None,
+                    Pattern::Bool(_) => {
+                        return Err(SimdError::new(
+                            "Wasm backend does not support bool slice element bindings",
+                        ));
+                    }
+                    Pattern::Type(_) => {
+                        return Err(SimdError::new(
+                            "Wasm backend does not support type witness slice element bindings",
+                        ));
+                    }
+                    Pattern::Ctor(_, _) => {
+                        return Err(SimdError::new(
+                            "Wasm backend does not support constructor slice element bindings",
+                        ));
+                    }
+                    Pattern::Slice { .. } => {
+                        return Err(SimdError::new(
+                            "Wasm backend does not support nested slice element bindings",
+                        ));
+                    }
+                };
+                if target.is_some() {
+                    emit_bulk_element_load_at_prefix_index(function, value_local, prim, index)?;
+                    emit_slice_element_name_binding(function, subpattern, target, enum_ctors)?;
+                }
+            }
+
+            for (index, subpattern) in suffix.iter().enumerate() {
+                let target = match subpattern {
+                    Pattern::Name(name)
+                        if !is_pattern_constructor_name(name, enum_ctors) && name != "_" =>
+                    {
+                        clause_locals.get(name).copied()
+                    }
+                    Pattern::Wildcard | Pattern::Int(_) | Pattern::Float(_) | Pattern::Char(_) => {
+                        None
+                    }
+                    Pattern::Name(_) => None,
+                    Pattern::Bool(_) => {
+                        return Err(SimdError::new(
+                            "Wasm backend does not support bool slice element bindings",
+                        ));
+                    }
+                    Pattern::Type(_) => {
+                        return Err(SimdError::new(
+                            "Wasm backend does not support type witness slice element bindings",
+                        ));
+                    }
+                    Pattern::Ctor(_, _) => {
+                        return Err(SimdError::new(
+                            "Wasm backend does not support constructor slice element bindings",
+                        ));
+                    }
+                    Pattern::Slice { .. } => {
+                        return Err(SimdError::new(
+                            "Wasm backend does not support nested slice element bindings",
+                        ));
+                    }
+                };
+                if target.is_some() {
+                    emit_bulk_element_load_at_suffix_index(
+                        function,
+                        value_local,
+                        input_len_local,
+                        prim,
+                        suffix.len(),
+                        index,
+                    )?;
+                    emit_slice_element_name_binding(function, subpattern, target, enum_ctors)?;
+                }
+            }
+            if let Some(SliceRest::Bind(name)) = rest
+                && name != "_"
+                && !is_pattern_constructor_name(name, enum_ctors)
+            {
+                let Some(rest_ptr_local) = clause_locals.get(name).copied() else {
+                    return Err(SimdError::new(format!(
+                        "missing clause local '{}' for slice rest binding",
+                        name
+                    )));
+                };
+                let rest_len_key = bulk_len_local_name(name);
+                let Some(rest_len_local) = clause_locals.get(&rest_len_key).copied() else {
+                    return Err(SimdError::new(format!(
+                        "missing clause local '{}' for slice rest length binding",
+                        rest_len_key
+                    )));
+                };
+                let prefix_i32 = i32::try_from(prefix.len()).map_err(|_| {
+                    SimdError::new("slice prefix length does not fit in i32")
+                })?;
+                let suffix_i32 = i32::try_from(suffix.len()).map_err(|_| {
+                    SimdError::new("slice suffix length does not fit in i32")
+                })?;
+                let start_byte = i32::try_from(prefix.len())
+                    .ok()
+                    .and_then(|prefix_len| {
+                        i32::try_from(byte_width(prim))
+                            .ok()
+                            .map(|bw| prefix_len * bw)
+                    })
+                    .ok_or_else(|| SimdError::new("slice rest byte offset does not fit in i32"))?;
+                function.instruction(&Instruction::LocalGet(value_local));
+                function.instruction(&Instruction::I32Const(start_byte));
+                function.instruction(&Instruction::I32Add);
+                function.instruction(&Instruction::LocalSet(rest_ptr_local));
+
+                function.instruction(&Instruction::LocalGet(input_len_local));
+                if prefix_i32 != 0 {
+                    function.instruction(&Instruction::I32Const(prefix_i32));
+                    function.instruction(&Instruction::I32Sub);
+                }
+                if suffix_i32 != 0 {
+                    function.instruction(&Instruction::I32Const(suffix_i32));
+                    function.instruction(&Instruction::I32Sub);
+                }
+                function.instruction(&Instruction::LocalSet(rest_len_local));
+            }
+            Ok(())
+        }
     }
 }
 
 fn emit_int_const(function: &mut Function, prim: Prim, value: i64) -> Result<()> {
     match prim {
-        Prim::I32 => {
+        Prim::I32 | Prim::Char => {
             function.instruction(&Instruction::I32Const(i32::try_from(value).map_err(
                 |_| SimdError::new(format!("integer literal '{}' does not fit in i32", value)),
             )?));
@@ -7637,7 +8262,7 @@ fn emit_int_const(function: &mut Function, prim: Prim, value: i64) -> Result<()>
 
 fn emit_int_eq(function: &mut Function, prim: Prim) {
     match prim {
-        Prim::I32 => {
+        Prim::I32 | Prim::Char => {
             function.instruction(&Instruction::I32Eq);
         }
         Prim::I64 => {
@@ -7661,7 +8286,7 @@ fn emit_float_bits_eq(function: &mut Function, prim: Prim, value: f64) -> Result
             function.instruction(&Instruction::I64Eq);
             Ok(())
         }
-        Prim::I32 | Prim::I64 => Err(SimdError::new(
+        Prim::I32 | Prim::I64 | Prim::Char => Err(SimdError::new(
             "float pattern cannot be compiled against integer primitive",
         )),
     }
@@ -7817,13 +8442,30 @@ fn compile_scalar_ir_expr_with_hoists(
     inline_bindings: &BTreeMap<String, IrExpr>,
 ) -> Result<()> {
     if let Some(local) = hoisted_locals.get(&hoist_expr_key(expr)) {
+        if is_wasm_bulk_like_type(&expr.ty) {
+            return Err(SimdError::new(
+                "Wasm scalar codegen does not support hoisted bulk locals",
+            ));
+        }
         function.instruction(&Instruction::LocalGet(*local));
         return Ok(());
     }
     match &expr.kind {
         IrExprKind::Local(name) => {
             if let Some(index) = locals.get(name).copied() {
-                function.instruction(&Instruction::LocalGet(index));
+                if is_wasm_bulk_like_type(&expr.ty) {
+                    let len_key = bulk_len_local_name(name);
+                    let len_index = locals.get(&len_key).copied().ok_or_else(|| {
+                        SimdError::new(format!(
+                            "missing bulk length local '{}' in Wasm codegen",
+                            len_key
+                        ))
+                    })?;
+                    function.instruction(&Instruction::LocalGet(index));
+                    function.instruction(&Instruction::LocalGet(len_index));
+                } else {
+                    function.instruction(&Instruction::LocalGet(index));
+                }
             } else if let Some(inline_expr) = inline_bindings.get(name) {
                 compile_scalar_ir_expr_with_hoists(
                     function,
@@ -7851,7 +8493,7 @@ fn compile_scalar_ir_expr_with_hoists(
             Prim::F64 => {
                 function.instruction(&Instruction::F64Const((*value).into()));
             }
-            Prim::I32 | Prim::I64 => {
+            Prim::I32 | Prim::I64 | Prim::Char => {
                 return Err(SimdError::new(format!(
                     "float literal cannot inhabit integer primitive {:?}",
                     prim
@@ -7913,6 +8555,7 @@ fn compile_scalar_ir_expr_with_hoists(
                     ptr_local: enum_state.ptr_local,
                     base_local: enum_state.ptr_local,
                     save_sp_local: enum_state.save_sp_local,
+                    base_tmp_local: enum_state.base_tmp_local,
                 };
                 compile_scalar_ir_expr_with_hoists(
                     function,
@@ -7925,7 +8568,7 @@ fn compile_scalar_ir_expr_with_hoists(
                     hoisted_locals,
                     inline_bindings,
                 )?;
-                emit_enum_field_store(function, field_index, &arg.ty)?;
+                emit_enum_field_store(function, field_index, &arg.ty, enum_state)?;
                 function.instruction(&Instruction::LocalGet(enum_state.save_sp_local));
                 function.instruction(&Instruction::I32Const(4));
                 function.instruction(&Instruction::I32Sub);
@@ -8112,19 +8755,19 @@ fn emit_scalar_primitive(
         .prim()
         .ok_or_else(|| SimdError::new("primitive operand did not have a scalar primitive type"))?;
     match (op, operand_prim) {
-        (PrimOp::Add, Prim::I32) => {
+        (PrimOp::Add, Prim::I32 | Prim::Char) => {
             function.instruction(&Instruction::I32Add);
         }
-        (PrimOp::Sub, Prim::I32) => {
+        (PrimOp::Sub, Prim::I32 | Prim::Char) => {
             function.instruction(&Instruction::I32Sub);
         }
-        (PrimOp::Mul, Prim::I32) => {
+        (PrimOp::Mul, Prim::I32 | Prim::Char) => {
             function.instruction(&Instruction::I32Mul);
         }
-        (PrimOp::Div, Prim::I32) => {
+        (PrimOp::Div, Prim::I32 | Prim::Char) => {
             function.instruction(&Instruction::I32DivS);
         }
-        (PrimOp::Mod, Prim::I32) => {
+        (PrimOp::Mod, Prim::I32 | Prim::Char) => {
             function.instruction(&Instruction::I32RemS);
         }
         (PrimOp::Add, Prim::I64) => {
@@ -8166,25 +8809,25 @@ fn emit_scalar_primitive(
         (PrimOp::Div, Prim::F64) => {
             function.instruction(&Instruction::F64Div);
         }
-        (PrimOp::Eq, Prim::I32) => {
+        (PrimOp::Eq, Prim::I32 | Prim::Char) => {
             function.instruction(&Instruction::I32Eq);
             if result_prim == Prim::I64 {
                 function.instruction(&Instruction::I64ExtendI32U);
             }
         }
-        (PrimOp::Lt, Prim::I32) => {
+        (PrimOp::Lt, Prim::I32 | Prim::Char) => {
             function.instruction(&Instruction::I32LtS);
             function.instruction(&Instruction::I64ExtendI32U);
         }
-        (PrimOp::Gt, Prim::I32) => {
+        (PrimOp::Gt, Prim::I32 | Prim::Char) => {
             function.instruction(&Instruction::I32GtS);
             function.instruction(&Instruction::I64ExtendI32U);
         }
-        (PrimOp::Le, Prim::I32) => {
+        (PrimOp::Le, Prim::I32 | Prim::Char) => {
             function.instruction(&Instruction::I32LeS);
             function.instruction(&Instruction::I64ExtendI32U);
         }
-        (PrimOp::Ge, Prim::I32) => {
+        (PrimOp::Ge, Prim::I32 | Prim::Char) => {
             function.instruction(&Instruction::I32GeS);
             function.instruction(&Instruction::I64ExtendI32U);
         }
@@ -8337,9 +8980,15 @@ fn patterns_are_vectorizable(
                     return false;
                 }
             }
+            Pattern::Char(_) => {
+                if prim != Prim::Char {
+                    return false;
+                }
+            }
             Pattern::Bool(_) => return false,
             Pattern::Type(_) => return false,
             Pattern::Ctor(_, _) => return false,
+            Pattern::Slice { .. } => return false,
             Pattern::Name(_) | Pattern::Wildcard => {}
         }
     }
@@ -8388,7 +9037,11 @@ fn is_vectorizable_expr(
                     let Some(operand_prim) = args[0].ty.prim() else {
                         return false;
                     };
-                    result_prim == Prim::I64 && matches!(operand_prim, Prim::I64 | Prim::F64)
+                    result_prim == Prim::I64
+                        && matches!(
+                            operand_prim,
+                            Prim::I32 | Prim::I64 | Prim::Char | Prim::F64
+                        )
                 }
                 _ => false,
             },
@@ -8424,6 +9077,11 @@ fn emit_vector_clause_mask(
                 }
                 terms += 1;
             }
+            Pattern::Char(_) => {
+                return Err(SimdError::new(
+                    "Wasm backend does not support char vector clause patterns",
+                ));
+            }
             Pattern::Bool(_) => {
                 return Err(SimdError::new(
                     "Wasm backend does not support bool clause patterns",
@@ -8437,6 +9095,11 @@ fn emit_vector_clause_mask(
             Pattern::Type(_) => {
                 return Err(SimdError::new(
                     "Wasm backend does not support type witness clause patterns",
+                ));
+            }
+            Pattern::Slice { .. } => {
+                return Err(SimdError::new(
+                    "Wasm backend does not yet support slice view patterns",
                 ));
             }
         }
@@ -8472,7 +9135,7 @@ fn emit_vector_pattern_value(
 
 fn emit_vector_pattern_eq(function: &mut Function, prim: Prim, float_bits: bool) -> Result<()> {
     match (prim, float_bits) {
-        (Prim::I32, false) => {
+        (Prim::I32 | Prim::Char, false) => {
             function.instruction(&Instruction::I32x4Eq);
         }
         (Prim::I64, false) => {
@@ -8770,7 +9433,7 @@ fn compile_vector_ir_expr_with_hoists(
 fn emit_vector_splat_local(function: &mut Function, prim: Prim, local: u32) {
     function.instruction(&Instruction::LocalGet(local));
     match prim {
-        Prim::I32 => {
+        Prim::I32 | Prim::Char => {
             function.instruction(&Instruction::I32x4Splat);
         }
         Prim::I64 => {
@@ -8788,7 +9451,7 @@ fn emit_vector_splat_local(function: &mut Function, prim: Prim, local: u32) {
 fn emit_vector_splat_int(function: &mut Function, prim: Prim, value: i64) -> Result<()> {
     emit_int_const(function, prim, value)?;
     match prim {
-        Prim::I32 => {
+        Prim::I32 | Prim::Char => {
             function.instruction(&Instruction::I32x4Splat);
         }
         Prim::I64 => {
@@ -8813,7 +9476,7 @@ fn emit_vector_splat_float(function: &mut Function, prim: Prim, value: f64) -> R
             function.instruction(&Instruction::F64Const(value.into()));
             function.instruction(&Instruction::F64x2Splat);
         }
-        Prim::I32 | Prim::I64 => {
+        Prim::I32 | Prim::I64 | Prim::Char => {
             return Err(SimdError::new(
                 "float vector splat requested for integer primitive",
             ));
@@ -8844,13 +9507,13 @@ fn emit_vector_primitive(
     result_prim: Prim,
 ) -> Result<()> {
     match (op, operand_prim) {
-        (PrimOp::Add, Prim::I32) => {
+        (PrimOp::Add, Prim::I32 | Prim::Char) => {
             function.instruction(&Instruction::I32x4Add);
         }
-        (PrimOp::Sub, Prim::I32) => {
+        (PrimOp::Sub, Prim::I32 | Prim::Char) => {
             function.instruction(&Instruction::I32x4Sub);
         }
-        (PrimOp::Mul, Prim::I32) => {
+        (PrimOp::Mul, Prim::I32 | Prim::Char) => {
             function.instruction(&Instruction::I32x4Mul);
         }
         (PrimOp::Add, Prim::I64) => {
@@ -8885,6 +9548,36 @@ fn emit_vector_primitive(
         }
         (PrimOp::Div, Prim::F64) => {
             function.instruction(&Instruction::F64x2Div);
+        }
+        (PrimOp::Eq, Prim::I32 | Prim::Char) => {
+            function.instruction(&Instruction::I32x4Eq);
+            if result_prim == Prim::I64 {
+                emit_vector_bool_to_i64(function)?;
+            }
+        }
+        (PrimOp::Lt, Prim::I32 | Prim::Char) => {
+            function.instruction(&Instruction::I32x4LtS);
+            if result_prim == Prim::I64 {
+                emit_vector_bool_to_i64(function)?;
+            }
+        }
+        (PrimOp::Gt, Prim::I32 | Prim::Char) => {
+            function.instruction(&Instruction::I32x4GtS);
+            if result_prim == Prim::I64 {
+                emit_vector_bool_to_i64(function)?;
+            }
+        }
+        (PrimOp::Le, Prim::I32 | Prim::Char) => {
+            function.instruction(&Instruction::I32x4LeS);
+            if result_prim == Prim::I64 {
+                emit_vector_bool_to_i64(function)?;
+            }
+        }
+        (PrimOp::Ge, Prim::I32 | Prim::Char) => {
+            function.instruction(&Instruction::I32x4GeS);
+            if result_prim == Prim::I64 {
+                emit_vector_bool_to_i64(function)?;
+            }
         }
         (PrimOp::Eq, Prim::I64) => {
             function.instruction(&Instruction::I64x2Eq);
@@ -8966,7 +9659,7 @@ fn emit_vector_bool_to_i64(function: &mut Function) -> Result<()> {
 fn emit_lane_load_scalar_at_ptr(function: &mut Function, ptr_local: u32, prim: Prim) {
     function.instruction(&Instruction::LocalGet(ptr_local));
     match prim {
-        Prim::I32 => {
+        Prim::I32 | Prim::Char => {
             function.instruction(&Instruction::I32Load(memarg(0, 2)));
         }
         Prim::I64 => {
@@ -8983,7 +9676,7 @@ fn emit_lane_load_scalar_at_ptr(function: &mut Function, ptr_local: u32, prim: P
 
 fn emit_scalar_store(function: &mut Function, prim: Prim) {
     match prim {
-        Prim::I32 => {
+        Prim::I32 | Prim::Char => {
             function.instruction(&Instruction::I32Store(memarg(0, 2)));
         }
         Prim::I64 => {
@@ -9022,7 +9715,7 @@ fn memarg(offset: u64, align: u32) -> MemArg {
 
 fn byte_width(prim: Prim) -> u32 {
     match prim {
-        Prim::I32 | Prim::F32 => 4,
+        Prim::I32 | Prim::Char | Prim::F32 => 4,
         Prim::I64 | Prim::F64 => 8,
     }
 }
@@ -9196,6 +9889,12 @@ fn flatten_clause_patterns(
                 pattern: pattern.pattern.clone(),
                 ty: ty.clone(),
             }),
+            Type::Named(name, args) if is_wasm_string_named_type(name, args) => {
+                flattened.push(TypedPattern {
+                    pattern: pattern.pattern.clone(),
+                    ty: ty.clone(),
+                });
+            }
             Type::Named(name, args) if is_wasm_enum_named_type(name, args) => {
                 flattened.push(TypedPattern {
                     pattern: pattern.pattern.clone(),
@@ -9214,9 +9913,11 @@ fn flatten_clause_patterns(
                         Pattern::Wildcard => Pattern::Wildcard,
                         Pattern::Int(_)
                         | Pattern::Float(_)
+                        | Pattern::Char(_)
                         | Pattern::Bool(_)
                         | Pattern::Type(_)
-                        | Pattern::Ctor(_, _) => {
+                        | Pattern::Ctor(_, _)
+                        | Pattern::Slice { .. } => {
                             return Err(SimdError::new(
                                 "record parameters cannot use literal patterns",
                             ));
@@ -9327,6 +10028,17 @@ fn normalize_expr_for_leaf(
         TypedExprKind::Bool(_) => Err(SimdError::new(
             "Wasm record normalization does not support bool expressions",
         )),
+        TypedExprKind::Char(value) => {
+            if !leaf_path.is_root() {
+                return Err(SimdError::new(
+                    "char literal cannot be projected into a record leaf",
+                ));
+            }
+            Ok(TypedExpr {
+                ty: leaf_ty,
+                kind: TypedExprKind::Char(*value),
+            })
+        }
         TypedExprKind::String(value) => {
             if !leaf_path.is_root() {
                 return Err(SimdError::new(
@@ -9683,6 +10395,9 @@ fn wasm_param_abi_from_single_type(ty: &Type) -> Result<WasmParamAbi> {
     match ty {
         Type::Scalar(prim) => Ok(WasmParamAbi::Scalar { prim: *prim }),
         Type::Bulk(prim, _) => Ok(WasmParamAbi::Bulk { prim: *prim }),
+        Type::Named(name, args) if is_wasm_string_named_type(name, args) => {
+            Ok(WasmParamAbi::Bulk { prim: Prim::Char })
+        }
         Type::TypeToken(_) => Err(SimdError::new(
             "Wasm backend does not support Type witness entry parameters",
         )),
@@ -9720,6 +10435,9 @@ fn wasm_result_abi_from_type(ty: &Type, param_types: &[Type]) -> Result<WasmResu
                     )
                 })?,
         }),
+        Type::Named(name, args) if is_wasm_string_named_type(name, args) => Err(SimdError::new(
+            "Wasm backend does not yet support string entry results",
+        )),
         Type::TypeToken(_) => Err(SimdError::new(
             "Wasm backend does not support Type witness entry results",
         )),
@@ -9749,6 +10467,7 @@ fn wasm_result_abi_from_type(ty: &Type, param_types: &[Type]) -> Result<WasmResu
 fn type_contains_bulk_leaf(ty: &Type) -> bool {
     match ty {
         Type::Bulk(_, _) => true,
+        Type::Named(name, args) if is_wasm_string_named_type(name, args) => true,
         Type::Record(fields) => fields
             .iter()
             .any(|(_, field_ty)| type_contains_bulk_leaf(field_ty)),
@@ -9763,6 +10482,9 @@ fn wasm_leaf_result_abi_from_type(ty: &Type) -> Result<WasmLeafResultAbi> {
     match ty {
         Type::Scalar(prim) => Ok(WasmLeafResultAbi::Scalar { prim: *prim }),
         Type::Bulk(prim, _) => Ok(WasmLeafResultAbi::Bulk { prim: *prim }),
+        Type::Named(name, args) if is_wasm_string_named_type(name, args) => {
+            Ok(WasmLeafResultAbi::Bulk { prim: Prim::Char })
+        }
         Type::TypeToken(_) => Err(SimdError::new(
             "leaf result ABI cannot contain Type witness values",
         )),
@@ -9803,6 +10525,7 @@ fn type_at_leaf_path(ty: &Type, leaf_path: &LeafPath) -> Result<Type> {
     if leaf_path.is_root() {
         return match ty {
             Type::Scalar(_) | Type::Bulk(_, _) => Ok(ty.clone()),
+            Type::Named(name, args) if is_wasm_string_named_type(name, args) => Ok(ty.clone()),
             Type::TypeToken(_) => Err(SimdError::new(
                 "Type witness values cannot be used as leaf values",
             )),
@@ -10528,6 +11251,31 @@ fn flatten_wasm_value(
 ) -> Result<()> {
     match (value, abi) {
         (Value::Scalar(_), WasmParamAbi::Scalar { .. }) => out.push(value.clone()),
+        (Value::String(text), WasmParamAbi::Bulk { prim }) if *prim == Prim::Char => {
+            let elements = text.chars().map(ScalarValue::Char).collect::<Vec<_>>();
+            let bulk = BulkValue {
+                prim: Prim::Char,
+                shape: vec![elements.len()],
+                elements,
+            };
+            match bulk_info {
+                None => {
+                    *bulk_info = Some(BulkShapeInfo {
+                        shape: bulk.shape.clone(),
+                        len: bulk.elements.len(),
+                    });
+                }
+                Some(existing)
+                    if existing.shape == bulk.shape && existing.len == bulk.elements.len() => {}
+                Some(existing) => {
+                    return Err(SimdError::new(format!(
+                        "Wasm bulk arguments must share a shape, found {:?} and {:?}",
+                        &existing.shape, &bulk.shape
+                    )));
+                }
+            }
+            out.push(Value::Bulk(bulk));
+        }
         (Value::Bulk(bulk), WasmParamAbi::Bulk { prim }) => {
             if bulk.prim != *prim {
                 return Err(SimdError::new(format!(
@@ -10786,10 +11534,30 @@ fn execute_wasm_artifact_direct_in_runtime(
     let mut output_ptr = None::<usize>;
     let mut output_len = None::<usize>;
 
+    let string_as_char_bulk = |text: &str| -> BulkValue {
+        let elements = text.chars().map(ScalarValue::Char).collect::<Vec<_>>();
+        BulkValue {
+            prim: Prim::Char,
+            shape: vec![elements.len()],
+            elements,
+        }
+    };
+
     for (index, (abi, value)) in artifact.params.iter().zip(args).enumerate() {
         match (abi, value) {
             (WasmParamAbi::Scalar { prim }, Value::Scalar(value)) => {
                 wasm_args.push(scalar_to_wasmtime(value, *prim)?);
+            }
+            (WasmParamAbi::Bulk { prim }, Value::String(text)) if *prim == Prim::Char => {
+                let bulk = string_as_char_bulk(text);
+                let ptr = ensure_input_bulk_buffer(runtime, index, &bulk)?;
+                write_bulk_to_memory(&memory, &mut runtime.store, ptr, &bulk)?;
+                wasm_args.push(Val::I32(i32::try_from(ptr).map_err(|_| {
+                    SimdError::new("bulk input pointer does not fit in i32")
+                })?));
+                wasm_args.push(Val::I32(i32::try_from(bulk.elements.len()).map_err(
+                    |_| SimdError::new("bulk input length does not fit in i32"),
+                )?));
             }
             (WasmParamAbi::Bulk { prim }, Value::Bulk(bulk)) => {
                 if bulk.prim != *prim {
@@ -10831,14 +11599,17 @@ fn execute_wasm_artifact_direct_in_runtime(
         let shape_source = args
             .get(*shape_param)
             .ok_or_else(|| SimdError::new("missing bulk argument for Wasm result shape"))?;
-        let Value::Bulk(shape_value) = shape_source else {
-            return Err(SimdError::new(
-                "Wasm bulk result shape must come from a bulk input argument",
-            ));
+        let (shape, len) = match shape_source {
+            Value::Bulk(shape_value) => (shape_value.shape.clone(), shape_value.elements.len()),
+            Value::String(text) => (vec![text.chars().count()], text.chars().count()),
+            _ => {
+                return Err(SimdError::new(
+                    "Wasm bulk result shape must come from a bulk/string input argument",
+                ))
+            }
         };
-        let len = shape_value.elements.len();
         let bulk = BulkShapeInfo {
-            shape: shape_value.shape.clone(),
+            shape: shape.clone(),
             len,
         };
         let out_ptr = ensure_output_bulk_buffer(runtime, &LeafPath::root(), *prim, &bulk)?;
@@ -10848,7 +11619,7 @@ fn execute_wasm_artifact_direct_in_runtime(
         wasm_args.push(Val::I32(i32::try_from(len).map_err(|_| {
             SimdError::new("bulk output length does not fit in i32")
         })?));
-        output_shape = Some(shape_value.shape.clone());
+        output_shape = Some(shape);
         output_ptr = Some(out_ptr);
         output_len = Some(len);
     }
@@ -10867,6 +11638,26 @@ fn execute_wasm_artifact_direct_in_runtime(
                 .into_iter()
                 .next()
                 .ok_or_else(|| SimdError::new("Wasm scalar entry did not produce a result"))?;
+            if let Type::Named(enum_name, args) = &artifact.result_type {
+                if is_wasm_enum_named_type(enum_name, args) {
+                    let ptr = match value {
+                        Val::I32(ptr) => ptr,
+                        other => {
+                            return Err(SimdError::new(format!(
+                                "Wasm enum entry '{}' returned non-i32 handle: {:?}",
+                                artifact.export_name, other
+                            )))
+                        }
+                    };
+                    return decode_wasm_enum_value_from_ptr(
+                        &memory,
+                        &runtime.store,
+                        ptr,
+                        enum_name,
+                        &artifact.enum_ctors,
+                    );
+                }
+            }
             Ok(Value::Scalar(wasmtime_to_scalar(value, *prim)?))
         }
         WasmResultAbi::Bulk { prim, .. } => {
@@ -10886,6 +11677,134 @@ fn execute_wasm_artifact_direct_in_runtime(
             "direct Wasm execution does not support record results",
         )),
     }
+}
+
+fn decode_wasm_enum_value_from_ptr(
+    memory: &Memory,
+    store: &Store<()>,
+    ptr: i32,
+    enum_name: &str,
+    enum_ctors: &BTreeMap<String, EnumCtorInfo>,
+) -> Result<Value> {
+    let node_ptr = usize::try_from(ptr)
+        .map_err(|_| SimdError::new(format!("invalid negative enum handle '{}'", ptr)))?;
+    if node_ptr == 0 {
+        return Err(SimdError::new("enum handle 0 is invalid"));
+    }
+    let tag = read_i32_from_memory(memory, store, node_ptr)?;
+    if tag < 0 || tag > i32::from(u16::MAX) {
+        return Err(SimdError::new(format!(
+            "enum node tag '{}' is out of range",
+            tag
+        )));
+    }
+    let (ctor_name, ctor_info) = find_enum_ctor_by_tag(enum_name, tag as u16, enum_ctors)?;
+    let field_count = read_i32_from_memory(memory, store, node_ptr + 4)?;
+    if field_count < 0 {
+        return Err(SimdError::new(format!(
+            "enum constructor '{}' has invalid negative field count '{}'",
+            ctor_name, field_count
+        )));
+    }
+    if usize::try_from(field_count).ok() != Some(ctor_info.fields.len()) {
+        return Err(SimdError::new(format!(
+            "enum constructor '{}' expected {} fields, found {}",
+            ctor_name,
+            ctor_info.fields.len(),
+            field_count
+        )));
+    }
+    let mut args = Vec::with_capacity(ctor_info.fields.len());
+    for (index, field_ty) in ctor_info.fields.iter().enumerate() {
+        let slot_ptr = node_ptr + 8 + (index * 8);
+        args.push(decode_wasm_enum_field_value(
+            memory,
+            store,
+            slot_ptr,
+            field_ty,
+            enum_ctors,
+        )?);
+    }
+    build_enum_value(enum_ctors, ctor_name, args)
+}
+
+fn decode_wasm_enum_field_value(
+    memory: &Memory,
+    store: &Store<()>,
+    slot_ptr: usize,
+    field_ty: &Type,
+    enum_ctors: &BTreeMap<String, EnumCtorInfo>,
+) -> Result<Value> {
+    match field_ty {
+        Type::Scalar(prim) => Ok(Value::Scalar(read_scalar_from_memory(
+            memory, store, slot_ptr, *prim,
+        )?)),
+        Type::Named(name, args) if is_wasm_enum_named_type(name, args) => {
+            let child_ptr = read_i32_from_memory(memory, store, slot_ptr)?;
+            decode_wasm_enum_value_from_ptr(memory, store, child_ptr, name, enum_ctors)
+        }
+        Type::Named(name, args) if is_wasm_string_named_type(name, args) => {
+            let string_ptr = read_i32_from_memory(memory, store, slot_ptr)?;
+            let string_len = read_i32_from_memory(memory, store, slot_ptr + 4)?;
+            if string_ptr < 0 || string_len < 0 {
+                return Err(SimdError::new(format!(
+                    "invalid string field pointer/len ({}, {}) in enum node",
+                    string_ptr, string_len
+                )));
+            }
+            let bulk = read_bulk_from_memory(
+                memory,
+                store,
+                usize::try_from(string_ptr)
+                    .map_err(|_| SimdError::new("string field pointer conversion failed"))?,
+                usize::try_from(string_len)
+                    .map_err(|_| SimdError::new("string field length conversion failed"))?,
+                Prim::Char,
+                vec![usize::try_from(string_len)
+                    .map_err(|_| SimdError::new("string field shape conversion failed"))?],
+            )?;
+            let mut text = String::new();
+            for scalar in bulk.elements {
+                let ScalarValue::Char(ch) = scalar else {
+                    return Err(SimdError::new(
+                        "string enum field contained non-char scalar in Wasm memory",
+                    ));
+                };
+                text.push(ch);
+            }
+            Ok(Value::String(text))
+        }
+        other => Err(SimdError::new(format!(
+            "Wasm enum decode does not support field type {:?}",
+            other
+        ))),
+    }
+}
+
+fn read_i32_from_memory(memory: &Memory, store: &Store<()>, ptr: usize) -> Result<i32> {
+    let scalar = read_scalar_from_memory(memory, store, ptr, Prim::I32)?;
+    let ScalarValue::I32(value) = scalar else {
+        unreachable!("i32 memory read must produce i32 scalar");
+    };
+    Ok(value)
+}
+
+fn find_enum_ctor_by_tag<'a>(
+    enum_name: &str,
+    tag: u16,
+    enum_ctors: &'a BTreeMap<String, EnumCtorInfo>,
+) -> Result<(&'a str, &'a EnumCtorInfo)> {
+    enum_ctors
+        .iter()
+        .find_map(|(ctor_name, ctor)| {
+            (ctor.enum_name == enum_name && ctor.tag == tag).then_some((ctor_name.as_str(), ctor))
+        })
+        .ok_or_else(|| {
+            SimdError::new(format!(
+                "unknown enum constructor tag '{}' for enum '{}'",
+                tag, enum_name
+            ))
+        })
 }
 
 fn ensure_memory_size(memory: &Memory, store: &mut Store<()>, bytes: usize) -> Result<()> {
@@ -10953,6 +11872,7 @@ fn write_scalar_bytes(data: &mut [u8], cursor: &mut usize, value: &ScalarValue) 
         ScalarValue::I64(value) => write_bytes(data, cursor, &value.to_le_bytes()),
         ScalarValue::F32(value) => write_bytes(data, cursor, &value.to_bits().to_le_bytes()),
         ScalarValue::F64(value) => write_bytes(data, cursor, &value.to_bits().to_le_bytes()),
+        ScalarValue::Char(value) => write_bytes(data, cursor, &u32::from(*value).to_le_bytes()),
     }
 }
 
@@ -10961,6 +11881,16 @@ fn read_scalar_bytes(data: &[u8], cursor: &mut usize, prim: Prim) -> Result<Scal
         Prim::I32 => Ok(ScalarValue::I32(i32::from_le_bytes(read_bytes::<4>(
             data, cursor,
         )?))),
+        Prim::Char => {
+            let codepoint = u32::from_le_bytes(read_bytes::<4>(data, cursor)?);
+            let value = char::from_u32(codepoint).ok_or_else(|| {
+                SimdError::new(format!(
+                    "invalid char codepoint '{}' in Wasm memory",
+                    codepoint
+                ))
+            })?;
+            Ok(ScalarValue::Char(value))
+        }
         Prim::I64 => Ok(ScalarValue::I64(i64::from_le_bytes(read_bytes::<8>(
             data, cursor,
         )?))),
@@ -10997,6 +11927,11 @@ fn read_bytes<const N: usize>(data: &[u8], cursor: &mut usize) -> Result<[u8; N]
 fn scalar_to_wasmtime(value: &ScalarValue, prim: Prim) -> Result<Val> {
     match (value, prim) {
         (ScalarValue::I32(value), Prim::I32) => Ok(Val::I32(*value)),
+        (ScalarValue::I32(value), Prim::Char) => Ok(Val::I32(*value)),
+        (ScalarValue::Char(value), Prim::Char) => Ok(Val::I32(
+            i32::try_from(u32::from(*value))
+                .map_err(|_| SimdError::new("char scalar does not fit in i32 for Wasm input"))?,
+        )),
         (ScalarValue::I64(value), Prim::I64) => Ok(Val::I64(*value)),
         (ScalarValue::F32(value), Prim::F32) => Ok(Val::F32(value.to_bits())),
         (ScalarValue::F64(value), Prim::F64) => Ok(Val::F64(value.to_bits())),
@@ -11010,6 +11945,17 @@ fn scalar_to_wasmtime(value: &ScalarValue, prim: Prim) -> Result<Val> {
 fn wasmtime_to_scalar(value: Val, prim: Prim) -> Result<ScalarValue> {
     match (value, prim) {
         (Val::I32(value), Prim::I32) => Ok(ScalarValue::I32(value)),
+        (Val::I32(value), Prim::Char) => {
+            let codepoint = u32::try_from(value)
+                .map_err(|_| SimdError::new(format!("invalid negative char codepoint '{}'", value)))?;
+            let ch = char::from_u32(codepoint).ok_or_else(|| {
+                SimdError::new(format!(
+                    "invalid char codepoint '{}' returned from Wasm",
+                    codepoint
+                ))
+            })?;
+            Ok(ScalarValue::Char(ch))
+        }
         (Val::I64(value), Prim::I64) => Ok(ScalarValue::I64(value)),
         (Val::F32(value), Prim::F32) => Ok(ScalarValue::F32(f32::from_bits(value))),
         (Val::F64(value), Prim::F64) => Ok(ScalarValue::F64(f64::from_bits(value))),
@@ -11158,6 +12104,8 @@ mod tests {
             export_name: "alias".to_string(),
             params: vec![WasmParamAbi::Scalar { prim: Prim::I64 }],
             result: WasmResultAbi::Scalar { prim: Prim::I64 },
+            result_type: Type::Scalar(Prim::I64),
+            enum_ctors: BTreeMap::new(),
             grouped_export: None,
             leaf_exports: vec![WasmLeafExport {
                 leaf_path: LeafPath::root(),
@@ -11764,6 +12712,364 @@ mod tests {
     fn wasm_matches_scalar_entry() {
         let src = "pow2 : i64 -> i64 -> i64\npow2 0 x = x\npow2 n x = pow2 (n - 1) (x * 2)\nmain : i64 -> i64\nmain x = pow2 3 x\n";
         assert_eq!(wasm_run(src, "main", "[7]"), "56");
+    }
+
+    #[test]
+    fn wasm_matches_prefix_slice_pattern_for_rank1_bulk() {
+        let src = "main : i64[n] -> i64\nmain [1, 2, ...] = 7\nmain _ = 0\n";
+        assert_eq!(wasm_run(src, "main", "[[1,2,3,4]]"), "7");
+        assert_eq!(wasm_run(src, "main", "[[1,3,4]]"), "0");
+        assert_eq!(wasm_run(src, "main", "[[1]]"), "0");
+    }
+
+    #[test]
+    fn wasm_matches_suffix_slice_pattern_for_rank1_bulk() {
+        let src = "main : i64[n] -> i64\nmain [..., 4, 5] = 9\nmain _ = 0\n";
+        assert_eq!(wasm_run(src, "main", "[[1,4,5]]"), "9");
+        assert_eq!(wasm_run(src, "main", "[[4,6]]"), "0");
+    }
+
+    #[test]
+    fn wasm_matches_slice_rest_binding_for_rank1_bulk() {
+        let src = "head : i64[n] -> i64\nhead [x, ...] = x\nhead _ = 0\nmain : i64[n] -> i64\nmain [_, ...rest] = head rest\nmain _ = 0\n";
+        assert_eq!(wasm_run(src, "main", "[[5,6,7]]"), "6");
+        assert_eq!(wasm_run(src, "main", "[[5]]"), "0");
+    }
+
+    #[test]
+    fn wasm_lowers_string_param_to_char_bulk_abi() {
+        let src = "main : string -> i64\nmain _ = 0\n";
+        let artifact = compile_wasm_main(src, "main").expect("Wasm should compile");
+        assert_eq!(
+            artifact.params,
+            vec![WasmParamAbi::Bulk { prim: Prim::Char }]
+        );
+        assert_eq!(artifact.result, WasmResultAbi::Scalar { prim: Prim::I64 });
+    }
+
+    #[test]
+    fn wasm_matches_char_entry_roundtrip() {
+        let src = "main : char -> char\nmain c = c\n";
+        assert_eq!(wasm_run(src, "main", "[\"a\"]"), "\"a\"");
+    }
+
+    #[test]
+    fn wasm_matches_prefix_slice_pattern_for_string() {
+        let src = "starts : string -> i64\nstarts ['c', 'a', 'r', ...] = 1\nstarts _ = 0\nmain : string -> i64\nmain s = starts s\n";
+        assert_eq!(wasm_run(src, "main", "[\"carpet\"]"), "1");
+        assert_eq!(wasm_run(src, "main", "[\"cat\"]"), "0");
+    }
+
+    #[test]
+    fn wasm_matches_slice_rest_binding_for_string() {
+        let src = "head : string -> char\nhead [x, ...] = x\nhead _ = 'z'\nmain : string -> char\nmain [_, ...rest] = head rest\nmain _ = 'z'\n";
+        assert_eq!(wasm_run(src, "main", "[\"car\"]"), "\"a\"");
+        assert_eq!(wasm_run(src, "main", "[\"c\"]"), "\"z\"");
+    }
+
+    #[test]
+    fn wasm_json_parser_adt_example_runs() {
+        let src = include_str!("../examples/json_parser_adt.simd");
+        let eval_ok = run_main(src, "main", "[\"null\"]")
+            .expect("json parser adt example should run in evaluator")
+            .to_json_string();
+        let wasm_ok = run_wasm_main(src, "main", "[\"null\"]")
+            .expect("json parser adt example should run in wasm")
+            .to_json_string();
+        assert_eq!(eval_ok, wasm_ok);
+        assert_eq!(wasm_ok, "10");
+
+        let eval_nested = run_main(src, "main", "[\"[1,[2],null]\"]")
+            .expect("json parser adt example should run in evaluator")
+            .to_json_string();
+        let wasm_nested = run_wasm_main(src, "main", "[\"[1,[2],null]\"]")
+            .expect("json parser adt example should run in wasm")
+            .to_json_string();
+        assert_eq!(eval_nested, wasm_nested);
+        assert_eq!(wasm_nested, "813");
+
+        let eval_err = run_main(src, "main", "[\"oops\"]")
+            .expect("json parser adt example should run in evaluator")
+            .to_json_string();
+        let wasm_err = run_wasm_main(src, "main", "[\"oops\"]")
+            .expect("json parser adt example should run in wasm")
+            .to_json_string();
+        assert_eq!(eval_err, wasm_err);
+        assert_eq!(wasm_err, "-100");
+
+        let compiled = compile_source(src).expect("json parser adt example should compile");
+        let eval_object = run_compiled_main(
+            &compiled,
+            "main",
+            &[Value::String("{\"a\":1,\"b\":[2]}".to_string())],
+        )
+        .expect("json parser adt example should run in evaluator with direct string args")
+        .to_json_string();
+        let artifact = compile_wasm_main(src, "main").expect("json parser adt example should compile to wasm");
+        let wasm_object = run_wasm_artifact(
+            &artifact,
+            &[Value::String("{\"a\":1,\"b\":[2]}".to_string())],
+        )
+        .expect("json parser adt example should run in wasm with direct string args")
+        .to_json_string();
+        assert_eq!(eval_object, wasm_object);
+        assert_eq!(wasm_object, "905");
+
+        let escaped_input = Value::String("\"\\\\\"".to_string());
+        let eval_escaped = run_compiled_main(&compiled, "main", &[escaped_input.clone()])
+            .expect("json parser adt example should handle escaped chars in evaluator")
+            .to_json_string();
+        let wasm_escaped = run_wasm_artifact(&artifact, &[escaped_input])
+            .expect("json parser adt example should handle escaped chars in wasm")
+            .to_json_string();
+        assert_eq!(eval_escaped, wasm_escaped);
+        assert_eq!(wasm_escaped, "201");
+
+        let eval_true = run_compiled_main(&compiled, "main", &[Value::String("true".to_string())])
+            .expect("json parser adt example should parse true in evaluator")
+            .to_json_string();
+        let wasm_true = run_wasm_artifact(&artifact, &[Value::String("true".to_string())])
+            .expect("json parser adt example should parse true in wasm")
+            .to_json_string();
+        assert_eq!(eval_true, wasm_true);
+        assert_eq!(wasm_true, "21");
+
+        let eval_neg = run_compiled_main(&compiled, "main", &[Value::String("-12".to_string())])
+            .expect("json parser adt example should parse negative integer in evaluator")
+            .to_json_string();
+        let wasm_neg = run_wasm_artifact(&artifact, &[Value::String("-12".to_string())])
+            .expect("json parser adt example should parse negative integer in wasm")
+            .to_json_string();
+        assert_eq!(eval_neg, wasm_neg);
+        assert_eq!(wasm_neg, "88");
+
+        let eval_unicode = run_compiled_main(
+            &compiled,
+            "main",
+            &[Value::String("\"\\u1234\"".to_string())],
+        )
+        .expect("json parser adt example should parse unicode escape shape in evaluator")
+        .to_json_string();
+        let wasm_unicode = run_wasm_artifact(
+            &artifact,
+            &[Value::String("\"\\u1234\"".to_string())],
+        )
+        .expect("json parser adt example should parse unicode escape shape in wasm")
+        .to_json_string();
+        assert_eq!(eval_unicode, wasm_unicode);
+        assert_eq!(wasm_unicode, "201");
+
+        let eval_unicode_12af = run_compiled_main(
+            &compiled,
+            "main",
+            &[Value::String("\"\\u12af\"".to_string())],
+        )
+        .expect("json parser adt example should parse lowercase unicode escape in evaluator")
+        .to_json_string();
+        let wasm_unicode_12af = run_wasm_artifact(
+            &artifact,
+            &[Value::String("\"\\u12af\"".to_string())],
+        )
+        .expect("json parser adt example should parse lowercase unicode escape in wasm")
+        .to_json_string();
+        assert_eq!(eval_unicode_12af, wasm_unicode_12af);
+        assert_eq!(wasm_unicode_12af, "201");
+
+        let eval_invalid_escape = run_compiled_main(
+            &compiled,
+            "main",
+            &[Value::String("\"\\x\"".to_string())],
+        )
+        .expect("json parser adt example should report invalid escape in evaluator")
+        .to_json_string();
+        let wasm_invalid_escape = run_wasm_artifact(
+            &artifact,
+            &[Value::String("\"\\x\"".to_string())],
+        )
+        .expect("json parser adt example should report invalid escape in wasm")
+        .to_json_string();
+        assert_eq!(eval_invalid_escape, wasm_invalid_escape);
+        assert_eq!(wasm_invalid_escape, "-202");
+
+        let eval_invalid_unicode = run_compiled_main(
+            &compiled,
+            "main",
+            &[Value::String("\"\\u12x4\"".to_string())],
+        )
+        .expect("json parser adt example should reject non-hex unicode escape in evaluator")
+        .to_json_string();
+        let wasm_invalid_unicode = run_wasm_artifact(
+            &artifact,
+            &[Value::String("\"\\u12x4\"".to_string())],
+        )
+        .expect("json parser adt example should reject non-hex unicode escape in wasm")
+        .to_json_string();
+        assert_eq!(eval_invalid_unicode, wasm_invalid_unicode);
+        assert_eq!(wasm_invalid_unicode, "-202");
+
+        let surrogate_pair_input = Value::String("\"\\ud834\\udd1e\"".to_string());
+        let eval_surrogate_pair = run_compiled_main(&compiled, "main", &[surrogate_pair_input.clone()])
+            .expect("json parser adt example should reject surrogate pairs in evaluator")
+            .to_json_string();
+        let wasm_surrogate_pair = run_wasm_artifact(&artifact, &[surrogate_pair_input])
+            .expect("json parser adt example should reject surrogate pairs in wasm")
+            .to_json_string();
+        assert_eq!(eval_surrogate_pair, wasm_surrogate_pair);
+        assert_eq!(wasm_surrogate_pair, "-202");
+
+        let eval_unpaired_high = run_compiled_main(
+            &compiled,
+            "main",
+            &[Value::String("\"\\ud834\"".to_string())],
+        )
+        .expect("json parser adt example should reject unpaired high surrogates in evaluator")
+        .to_json_string();
+        let wasm_unpaired_high = run_wasm_artifact(
+            &artifact,
+            &[Value::String("\"\\ud834\"".to_string())],
+        )
+        .expect("json parser adt example should reject unpaired high surrogates in wasm")
+        .to_json_string();
+        assert_eq!(eval_unpaired_high, wasm_unpaired_high);
+        assert_eq!(wasm_unpaired_high, "-202");
+
+        let eval_unpaired_low = run_compiled_main(
+            &compiled,
+            "main",
+            &[Value::String("\"\\udd1e\"".to_string())],
+        )
+        .expect("json parser adt example should reject unpaired low surrogates in evaluator")
+        .to_json_string();
+        let wasm_unpaired_low = run_wasm_artifact(
+            &artifact,
+            &[Value::String("\"\\udd1e\"".to_string())],
+        )
+        .expect("json parser adt example should reject unpaired low surrogates in wasm")
+        .to_json_string();
+        assert_eq!(eval_unpaired_low, wasm_unpaired_low);
+        assert_eq!(wasm_unpaired_low, "-202");
+
+        let eval_trailing = run_compiled_main(&compiled, "main", &[Value::String("nullx".to_string())])
+            .expect("json parser adt example should report trailing garbage in evaluator")
+            .to_json_string();
+        let wasm_trailing = run_wasm_artifact(&artifact, &[Value::String("nullx".to_string())])
+            .expect("json parser adt example should report trailing garbage in wasm")
+            .to_json_string();
+        assert_eq!(eval_trailing, wasm_trailing);
+        assert_eq!(wasm_trailing, "-999");
+
+        let eval_decimal = run_compiled_main(&compiled, "main", &[Value::String("1.25".to_string())])
+            .expect("json parser adt example should parse decimal number in evaluator")
+            .to_json_string();
+        let wasm_decimal = run_wasm_artifact(&artifact, &[Value::String("1.25".to_string())])
+            .expect("json parser adt example should parse decimal number in wasm")
+            .to_json_string();
+        assert_eq!(eval_decimal, wasm_decimal);
+        assert_eq!(wasm_decimal, "101");
+
+        let eval_exp = run_compiled_main(&compiled, "main", &[Value::String("2e9".to_string())])
+            .expect("json parser adt example should parse exponent number in evaluator")
+            .to_json_string();
+        let wasm_exp = run_wasm_artifact(&artifact, &[Value::String("2e9".to_string())])
+            .expect("json parser adt example should parse exponent number in wasm")
+            .to_json_string();
+        assert_eq!(eval_exp, wasm_exp);
+        assert_eq!(wasm_exp, "102");
+
+        let eval_exp_negative = run_compiled_main(&compiled, "main", &[Value::String("-3.4e5".to_string())])
+            .expect("json parser adt example should parse signed exponent number in evaluator")
+            .to_json_string();
+        let wasm_exp_negative = run_wasm_artifact(&artifact, &[Value::String("-3.4e5".to_string())])
+            .expect("json parser adt example should parse signed exponent number in wasm")
+            .to_json_string();
+        assert_eq!(eval_exp_negative, wasm_exp_negative);
+        assert_eq!(wasm_exp_negative, "97");
+
+        let eval_decimal_dot = run_compiled_main(&compiled, "main", &[Value::String("1.".to_string())])
+            .expect("json parser adt example should reject dangling decimal point in evaluator")
+            .to_json_string();
+        let wasm_decimal_dot = run_wasm_artifact(&artifact, &[Value::String("1.".to_string())])
+            .expect("json parser adt example should reject dangling decimal point in wasm")
+            .to_json_string();
+        assert_eq!(eval_decimal_dot, wasm_decimal_dot);
+        assert_eq!(wasm_decimal_dot, "-302");
+
+        let eval_exponent = run_compiled_main(&compiled, "main", &[Value::String("1e".to_string())])
+            .expect("json parser adt example should reject dangling exponent in evaluator")
+            .to_json_string();
+        let wasm_exponent = run_wasm_artifact(&artifact, &[Value::String("1e".to_string())])
+            .expect("json parser adt example should reject dangling exponent in wasm")
+            .to_json_string();
+        assert_eq!(eval_exponent, wasm_exponent);
+        assert_eq!(wasm_exponent, "-303");
+
+        let eval_empty_array = run_compiled_main(&compiled, "main", &[Value::String("[]".to_string())])
+            .expect("json parser adt example should parse empty array in evaluator")
+            .to_json_string();
+        let wasm_empty_array = run_wasm_artifact(&artifact, &[Value::String("[]".to_string())])
+            .expect("json parser adt example should parse empty array in wasm")
+            .to_json_string();
+        assert_eq!(eval_empty_array, wasm_empty_array);
+        assert_eq!(wasm_empty_array, "300");
+
+        let eval_empty_object = run_compiled_main(&compiled, "main", &[Value::String("{}".to_string())])
+            .expect("json parser adt example should parse empty object in evaluator")
+            .to_json_string();
+        let wasm_empty_object = run_wasm_artifact(&artifact, &[Value::String("{}".to_string())])
+            .expect("json parser adt example should parse empty object in wasm")
+            .to_json_string();
+        assert_eq!(eval_empty_object, wasm_empty_object);
+        assert_eq!(wasm_empty_object, "400");
+
+        let whitespace_case = Value::String("[ 1 , [ 2 , 3 ] ] ".to_string());
+        let eval_whitespace = run_compiled_main(&compiled, "main", &[whitespace_case.clone()])
+            .expect("json parser adt example should parse whitespace nested values in evaluator")
+            .to_json_string();
+        let wasm_whitespace = run_wasm_artifact(&artifact, &[whitespace_case])
+            .expect("json parser adt example should parse whitespace nested values in wasm")
+            .to_json_string();
+        assert_eq!(eval_whitespace, wasm_whitespace);
+        assert_eq!(wasm_whitespace, "906");
+
+        let eval_malformed_minus = run_compiled_main(&compiled, "main", &[Value::String("-abc".to_string())])
+            .expect("json parser adt example should report malformed minus in evaluator")
+            .to_json_string();
+        let wasm_malformed_minus = run_wasm_artifact(&artifact, &[Value::String("-abc".to_string())])
+            .expect("json parser adt example should report malformed minus in wasm")
+            .to_json_string();
+        assert_eq!(eval_malformed_minus, wasm_malformed_minus);
+        assert_eq!(wasm_malformed_minus, "-301");
+
+        let object_case = Value::String("{\"ab\":1,\"c\":2}".to_string());
+        let eval_key_lengths = run_compiled_main(&compiled, "main", &[object_case.clone()])
+            .expect("json parser adt example should account for key lengths in evaluator")
+            .to_json_string();
+        let wasm_key_lengths = run_wasm_artifact(&artifact, &[object_case])
+            .expect("json parser adt example should account for key lengths in wasm")
+            .to_json_string();
+        assert_eq!(eval_key_lengths, wasm_key_lengths);
+        assert_eq!(wasm_key_lengths, "606");
+
+        let eval_debug = run_main(src, "main_json", "[\"[1,null]\"]")
+            .expect("json parser adt debug entry should run in evaluator")
+            .to_json_string();
+        let wasm_debug = run_wasm_main(src, "main_json", "[\"[1,null]\"]")
+            .expect("json parser adt debug entry should run in wasm")
+            .to_json_string();
+        assert_eq!(eval_debug, wasm_debug);
+        assert!(wasm_debug.contains("\"$enum\""));
+        assert!(wasm_debug.contains("JArray"));
+
+        let eval_debug_err = run_main(src, "main_json", "[\"1.\"]")
+            .expect("json parser adt debug error should run in evaluator")
+            .to_json_string();
+        let wasm_debug_err = run_wasm_main(src, "main_json", "[\"1.\"]")
+            .expect("json parser adt debug error should run in wasm")
+            .to_json_string();
+        assert_eq!(eval_debug_err, wasm_debug_err);
+        assert!(wasm_debug_err.contains("JNum"));
+        assert!(wasm_debug_err.contains("-302"));
+
     }
 
     #[test]
