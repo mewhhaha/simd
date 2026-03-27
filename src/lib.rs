@@ -1,7 +1,9 @@
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
 use std::rc::Rc;
+use std::time::Instant;
 
 mod benchmarks;
 mod formatter;
@@ -15,8 +17,10 @@ pub use lsp::lsp_command;
 pub use wasm_backend::{
     BoundPreparedRun, PreparedLayout, PreparedSlotKind, PreparedSlotMetadata, PreparedSlotRole,
     PreparedWasmMain, WasmArtifact, WasmExecutable, WasmHigherOrderReport, WasmParamAbi,
-    WasmResultAbi, compile_wasm_main, prepare_wasm_artifact, prepare_wasm_main, run_wasm_artifact,
-    run_wasm_command, run_wasm_main, wasm_command, wat_command, wat_main,
+    WasmResultAbi, WasmRunProfile, compile_wasm_main, prepare_wasm_artifact, prepare_wasm_main,
+    run_wasm_artifact, run_wasm_command, run_wasm_main, run_wasm_prepared_command,
+    run_wasm_prepared_main, run_wasm_profile_command, run_wasm_profile_main, wasm_command,
+    wat_command, wat_main,
 };
 
 pub type Result<T> = std::result::Result<T, SimdError>;
@@ -24,6 +28,36 @@ pub type Result<T> = std::result::Result<T, SimdError>;
 #[derive(Debug, Clone, PartialEq)]
 pub struct SimdError {
     message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvalRunProfile {
+    pub result_json: String,
+    pub frontend_ms: u128,
+    pub frontend_us: u128,
+    pub parse_args_ms: u128,
+    pub parse_args_us: u128,
+    pub execute_ms: u128,
+    pub execute_us: u128,
+    pub total_ms: u128,
+    pub total_us: u128,
+}
+
+impl EvalRunProfile {
+    pub fn to_kv_string(&self) -> String {
+        [
+            format!("result_json={}", self.result_json),
+            format!("frontend_ms={}", self.frontend_ms),
+            format!("frontend_us={}", self.frontend_us),
+            format!("parse_args_ms={}", self.parse_args_ms),
+            format!("parse_args_us={}", self.parse_args_us),
+            format!("execute_ms={}", self.execute_ms),
+            format!("execute_us={}", self.execute_us),
+            format!("total_ms={}", self.total_ms),
+            format!("total_us={}", self.total_us),
+        ]
+        .join("\n")
+    }
 }
 
 impl SimdError {
@@ -475,6 +509,7 @@ pub enum IntentClass {
     MapBinaryBroadcast,
     MapTernaryBroadcast,
     GroupedMap,
+    Structural,
     ScalarTailRec,
     Fallback,
 }
@@ -507,6 +542,9 @@ pub enum GroupedLoweredKind {
     Scalar {
         clauses: Vec<LoweredClause>,
     },
+    Structural {
+        clauses: Vec<LoweredClause>,
+    },
     Kernel {
         shape: Shape,
         vector_width: usize,
@@ -527,6 +565,9 @@ pub struct LoweredFunction {
 #[derive(Debug, Clone, PartialEq)]
 pub enum LoweredKind {
     Scalar {
+        clauses: Vec<LoweredClause>,
+    },
+    Structural {
         clauses: Vec<LoweredClause>,
     },
     Kernel {
@@ -6582,7 +6623,6 @@ fn visit_tail_calls(
         TypedExprKind::Apply { callee, arg } => {
             visit_tail_calls(callee, self_name, false, recursive, valid);
             visit_tail_calls(arg, self_name, false, recursive, valid);
-            *valid = false;
         }
     }
 }
@@ -7436,6 +7476,12 @@ fn group_lowered_program(
             clause_patterns: Vec<String>,
             tail_loop: bool,
         },
+        Structural {
+            result_prim: Prim,
+            clause_count: usize,
+            clause_patterns: Vec<String>,
+            tail_loop: bool,
+        },
         Kernel {
             result_prim: Prim,
             shape: Shape,
@@ -7481,17 +7527,26 @@ fn group_lowered_program(
             continue;
         };
         let clause_count = match &lowered_function.kind {
-            LoweredKind::Scalar { clauses } => clauses.len(),
-            LoweredKind::Kernel { clauses, .. } => clauses.len(),
+            LoweredKind::Scalar { clauses }
+            | LoweredKind::Structural { clauses }
+            | LoweredKind::Kernel { clauses, .. } => clauses.len(),
         };
         let clause_patterns = match &lowered_function.kind {
-            LoweredKind::Scalar { clauses } | LoweredKind::Kernel { clauses, .. } => clauses
+            LoweredKind::Scalar { clauses }
+            | LoweredKind::Structural { clauses }
+            | LoweredKind::Kernel { clauses, .. } => clauses
                 .iter()
                 .map(|clause| format!("{:?}", clause.patterns))
                 .collect::<Vec<_>>(),
         };
         let kind_key = match &lowered_function.kind {
             LoweredKind::Scalar { .. } => GroupedLoweredKindKey::Scalar {
+                result_prim,
+                clause_count,
+                clause_patterns,
+                tail_loop: lowered_function.tail_loop.is_some(),
+            },
+            LoweredKind::Structural { .. } => GroupedLoweredKindKey::Structural {
                 result_prim,
                 clause_count,
                 clause_patterns,
@@ -7532,6 +7587,9 @@ fn group_lowered_program(
         } else {
             let kind = match &lowered_function.kind {
                 LoweredKind::Scalar { clauses } => GroupedLoweredKind::Scalar {
+                    clauses: clauses.clone(),
+                },
+                LoweredKind::Structural { clauses } => GroupedLoweredKind::Structural {
                     clauses: clauses.clone(),
                 },
                 LoweredKind::Kernel {
@@ -7579,19 +7637,88 @@ fn group_lowered_program(
 }
 
 fn optimize_lowered_program(program: &LoweredProgram) -> LoweredProgram {
+    let trivial_wrappers = collect_trivial_wrapper_calls(program);
     LoweredProgram {
         functions: program
             .functions
             .iter()
-            .map(optimize_lowered_function)
+            .map(|function| optimize_lowered_function(function, &trivial_wrappers))
             .collect(),
     }
 }
 
-fn optimize_lowered_function(function: &LoweredFunction) -> LoweredFunction {
+#[derive(Debug, Clone)]
+struct TrivialWrapperCall {
+    params: Vec<Option<String>>,
+    body: IrExpr,
+}
+
+fn collect_trivial_wrapper_calls(program: &LoweredProgram) -> BTreeMap<String, TrivialWrapperCall> {
+    program
+        .functions
+        .iter()
+        .filter_map(|function| {
+            if function.tail_loop.is_some() {
+                return None;
+            }
+            let clauses = match &function.kind {
+                LoweredKind::Scalar { clauses } | LoweredKind::Structural { clauses } => clauses,
+                LoweredKind::Kernel { .. } => return None,
+            };
+            let [clause] = clauses.as_slice() else {
+                return None;
+            };
+            let mut params = Vec::with_capacity(clause.patterns.len());
+            for pattern in &clause.patterns {
+                match &pattern.pattern {
+                    Pattern::Name(name) => params.push(Some(name.clone())),
+                    Pattern::Wildcard => params.push(None),
+                    _ => return None,
+                }
+            }
+            if ir_expr_contains_let(&clause.body) {
+                return None;
+            }
+            Some((
+                function.name.clone(),
+                TrivialWrapperCall {
+                    params,
+                    body: clause.body.clone(),
+                },
+            ))
+        })
+        .collect()
+}
+
+fn ir_expr_contains_let(expr: &IrExpr) -> bool {
+    match &expr.kind {
+        IrExprKind::Let { .. } => true,
+        IrExprKind::Record(fields) => fields.values().any(ir_expr_contains_let),
+        IrExprKind::EnumCtor { args, .. } => args.iter().any(ir_expr_contains_let),
+        IrExprKind::EnumTag { value }
+        | IrExprKind::EnumChildBySlot { value, .. }
+        | IrExprKind::EnumNonRecField { value, .. } => ir_expr_contains_let(value),
+        IrExprKind::Call { args, .. } => args.iter().any(ir_expr_contains_let),
+        IrExprKind::Local(_) | IrExprKind::Int(_, _) | IrExprKind::Float(_, _) => false,
+    }
+}
+
+fn optimize_lowered_function(
+    function: &LoweredFunction,
+    trivial_wrappers: &BTreeMap<String, TrivialWrapperCall>,
+) -> LoweredFunction {
     let kind = match &function.kind {
         LoweredKind::Scalar { clauses } => LoweredKind::Scalar {
-            clauses: clauses.iter().map(optimize_lowered_clause).collect(),
+            clauses: clauses
+                .iter()
+                .map(|clause| optimize_lowered_clause(clause, trivial_wrappers))
+                .collect(),
+        },
+        LoweredKind::Structural { clauses } => LoweredKind::Structural {
+            clauses: clauses
+                .iter()
+                .map(|clause| optimize_lowered_clause(clause, trivial_wrappers))
+                .collect(),
         },
         LoweredKind::Kernel {
             shape,
@@ -7602,10 +7729,16 @@ fn optimize_lowered_function(function: &LoweredFunction) -> LoweredFunction {
             shape: shape.clone(),
             vector_width: *vector_width,
             cleanup: *cleanup,
-            clauses: clauses.iter().map(optimize_lowered_clause).collect(),
+            clauses: clauses
+                .iter()
+                .map(|clause| optimize_lowered_clause(clause, trivial_wrappers))
+                .collect(),
         },
     };
-    let tail_loop = function.tail_loop.as_ref().map(optimize_tail_loop);
+    let tail_loop = function
+        .tail_loop
+        .as_ref()
+        .map(|tail_loop| optimize_tail_loop(tail_loop, trivial_wrappers));
     LoweredFunction {
         name: function.name.clone(),
         param_access: function.param_access.clone(),
@@ -7615,7 +7748,10 @@ fn optimize_lowered_function(function: &LoweredFunction) -> LoweredFunction {
     }
 }
 
-fn optimize_tail_loop(tail_loop: &TailLoop) -> TailLoop {
+fn optimize_tail_loop(
+    tail_loop: &TailLoop,
+    trivial_wrappers: &BTreeMap<String, TrivialWrapperCall>,
+) -> TailLoop {
     TailLoop {
         clauses: tail_loop
             .clauses
@@ -7624,10 +7760,13 @@ fn optimize_tail_loop(tail_loop: &TailLoop) -> TailLoop {
                 patterns: clause.patterns.clone(),
                 action: match &clause.action {
                     TailAction::Continue { args } => TailAction::Continue {
-                        args: args.iter().map(optimize_ir_expr).collect(),
+                        args: args
+                            .iter()
+                            .map(|expr| optimize_ir_expr(expr, trivial_wrappers, 0))
+                            .collect(),
                     },
                     TailAction::Return { expr } => TailAction::Return {
-                        expr: optimize_ir_expr(expr),
+                        expr: optimize_ir_expr(expr, trivial_wrappers, 0),
                     },
                 },
             })
@@ -7635,14 +7774,21 @@ fn optimize_tail_loop(tail_loop: &TailLoop) -> TailLoop {
     }
 }
 
-fn optimize_lowered_clause(clause: &LoweredClause) -> LoweredClause {
+fn optimize_lowered_clause(
+    clause: &LoweredClause,
+    trivial_wrappers: &BTreeMap<String, TrivialWrapperCall>,
+) -> LoweredClause {
     LoweredClause {
         patterns: clause.patterns.clone(),
-        body: optimize_ir_expr(&clause.body),
+        body: optimize_ir_expr(&clause.body, trivial_wrappers, 0),
     }
 }
 
-fn optimize_ir_expr(expr: &IrExpr) -> IrExpr {
+fn optimize_ir_expr(
+    expr: &IrExpr,
+    trivial_wrappers: &BTreeMap<String, TrivialWrapperCall>,
+    depth: usize,
+) -> IrExpr {
     let kind = match &expr.kind {
         IrExprKind::Local(name) => IrExprKind::Local(name.clone()),
         IrExprKind::Int(value, prim) => IrExprKind::Int(*value, *prim),
@@ -7650,35 +7796,46 @@ fn optimize_ir_expr(expr: &IrExpr) -> IrExpr {
         IrExprKind::Record(fields) => IrExprKind::Record(
             fields
                 .iter()
-                .map(|(name, field)| (name.clone(), optimize_ir_expr(field)))
+                .map(|(name, field)| {
+                    (
+                        name.clone(),
+                        optimize_ir_expr(field, trivial_wrappers, depth),
+                    )
+                })
                 .collect(),
         ),
         IrExprKind::EnumCtor { ctor, args } => IrExprKind::EnumCtor {
             ctor: ctor.clone(),
-            args: args.iter().map(optimize_ir_expr).collect(),
+            args: args
+                .iter()
+                .map(|arg| optimize_ir_expr(arg, trivial_wrappers, depth))
+                .collect(),
         },
         IrExprKind::EnumTag { value } => IrExprKind::EnumTag {
-            value: Box::new(optimize_ir_expr(value)),
+            value: Box::new(optimize_ir_expr(value, trivial_wrappers, depth)),
         },
         IrExprKind::EnumChildBySlot { value, ctor, slot } => IrExprKind::EnumChildBySlot {
-            value: Box::new(optimize_ir_expr(value)),
+            value: Box::new(optimize_ir_expr(value, trivial_wrappers, depth)),
             ctor: ctor.clone(),
             slot: *slot,
         },
         IrExprKind::EnumNonRecField { value, ctor, field } => IrExprKind::EnumNonRecField {
-            value: Box::new(optimize_ir_expr(value)),
+            value: Box::new(optimize_ir_expr(value, trivial_wrappers, depth)),
             ctor: ctor.clone(),
             field: *field,
         },
         IrExprKind::Call { callee, args } => {
-            let args = args.iter().map(optimize_ir_expr).collect::<Vec<_>>();
+            let args = args
+                .iter()
+                .map(|arg| optimize_ir_expr(arg, trivial_wrappers, depth))
+                .collect::<Vec<_>>();
             fold_int_prim_call(expr.ty.clone(), callee.clone(), args)
         }
         IrExprKind::Let { bindings, body } => {
             let mut optimized_bindings = Vec::<IrLetBinding>::new();
             let mut alias = BTreeMap::<String, String>::new();
             for binding in bindings {
-                let mut binding_expr = optimize_ir_expr(&binding.expr);
+                let mut binding_expr = optimize_ir_expr(&binding.expr, trivial_wrappers, depth);
                 rewrite_locals(&mut binding_expr, &alias);
                 if let Some(existing) = optimized_bindings
                     .iter()
@@ -7693,7 +7850,7 @@ fn optimize_ir_expr(expr: &IrExpr) -> IrExpr {
                     expr: binding_expr,
                 });
             }
-            let mut optimized_body = optimize_ir_expr(body);
+            let mut optimized_body = optimize_ir_expr(body, trivial_wrappers, depth);
             rewrite_locals(&mut optimized_body, &alias);
             let pruned = prune_ir_let_bindings(optimized_bindings, &optimized_body);
             if pruned.is_empty() {
@@ -7705,9 +7862,77 @@ fn optimize_ir_expr(expr: &IrExpr) -> IrExpr {
             }
         }
     };
-    IrExpr {
+    let optimized = IrExpr {
         ty: expr.ty.clone(),
         kind,
+    };
+    inline_trivial_wrapper_call(optimized, trivial_wrappers, depth)
+}
+
+fn inline_trivial_wrapper_call(
+    expr: IrExpr,
+    trivial_wrappers: &BTreeMap<String, TrivialWrapperCall>,
+    depth: usize,
+) -> IrExpr {
+    if depth >= 8 {
+        return expr;
+    }
+    let IrExprKind::Call {
+        callee: Callee::Function(name),
+        args,
+    } = &expr.kind
+    else {
+        return expr;
+    };
+    let Some(wrapper) = trivial_wrappers.get(name) else {
+        return expr;
+    };
+    if wrapper.params.len() != args.len() {
+        return expr;
+    }
+    let mut inlined = wrapper.body.clone();
+    let subst = wrapper
+        .params
+        .iter()
+        .zip(args.iter())
+        .filter_map(|(param, arg)| param.clone().map(|param| (param, arg.clone())))
+        .collect::<BTreeMap<_, _>>();
+    substitute_ir_locals(&mut inlined, &subst);
+    optimize_ir_expr(&inlined, trivial_wrappers, depth + 1)
+}
+
+fn substitute_ir_locals(expr: &mut IrExpr, subst: &BTreeMap<String, IrExpr>) {
+    match &mut expr.kind {
+        IrExprKind::Local(name) => {
+            if let Some(replacement) = subst.get(name) {
+                *expr = replacement.clone();
+            }
+        }
+        IrExprKind::Record(fields) => {
+            for field in fields.values_mut() {
+                substitute_ir_locals(field, subst);
+            }
+        }
+        IrExprKind::EnumCtor { args, .. } => {
+            for arg in args {
+                substitute_ir_locals(arg, subst);
+            }
+        }
+        IrExprKind::EnumTag { value }
+        | IrExprKind::EnumChildBySlot { value, .. }
+        | IrExprKind::EnumNonRecField { value, .. } => substitute_ir_locals(value, subst),
+        IrExprKind::Call { args, .. } => {
+            for arg in args {
+                substitute_ir_locals(arg, subst);
+            }
+        }
+        IrExprKind::Let { bindings, body } => {
+            for binding in bindings {
+                substitute_ir_locals(&mut binding.expr, subst);
+            }
+            substitute_ir_locals(body, subst);
+        }
+        IrExprKind::Int(_, _) | IrExprKind::Float(_, _) => {}
     }
 }
 
@@ -7888,6 +8113,7 @@ fn analyze_grouped_function_intent(function: &GroupedLoweredFunction) -> KernelI
                 IntentClass::Fallback
             }
         }
+        GroupedLoweredKind::Structural { .. } => IntentClass::Structural,
         GroupedLoweredKind::Kernel { .. } if record_leaf_count > 1 => IntentClass::GroupedMap,
         GroupedLoweredKind::Kernel { .. } if lane_inputs == 1 && same_inputs == 0 => {
             IntentClass::MapUnary
@@ -7909,13 +8135,15 @@ fn analyze_grouped_function_intent(function: &GroupedLoweredFunction) -> KernelI
             });
             (rank, shape_size)
         }
-        GroupedLoweredKind::Scalar { .. } => (0, None),
+        GroupedLoweredKind::Scalar { .. } | GroupedLoweredKind::Structural { .. } => (0, None),
     };
     let op_count = function
         .leaves
         .iter()
         .flat_map(|leaf| match &leaf.kind {
-            LoweredKind::Scalar { clauses } | LoweredKind::Kernel { clauses, .. } => clauses,
+            LoweredKind::Scalar { clauses }
+            | LoweredKind::Structural { clauses }
+            | LoweredKind::Kernel { clauses, .. } => clauses,
         })
         .map(|clause| count_primitive_ops(&clause.body))
         .sum::<usize>();
@@ -7995,6 +8223,12 @@ fn lower_function(function: &NormalizedFunction) -> Result<LoweredFunction> {
         })
         .collect();
 
+    let tail_loop = if function.tailrec.loop_lowerable {
+        Some(lower_tail_loop(function)?)
+    } else {
+        None
+    };
+
     let kind = match &ret {
         Type::Bulk(prim, shape) => {
             let clauses = function
@@ -8015,7 +8249,11 @@ fn lower_function(function: &NormalizedFunction) -> Result<LoweredFunction> {
                 .iter()
                 .map(|clause| lower_clause(clause, &param_access, None))
                 .collect::<Result<Vec<_>>>()?;
-            LoweredKind::Scalar { clauses }
+            if uses_structural_lowering(function, &clauses) {
+                LoweredKind::Structural { clauses }
+            } else {
+                LoweredKind::Scalar { clauses }
+            }
         }
         Type::Record(_) => {
             return Err(SimdError::new(
@@ -8041,12 +8279,6 @@ fn lower_function(function: &NormalizedFunction) -> Result<LoweredFunction> {
         }
     };
 
-    let tail_loop = if function.tailrec.loop_lowerable {
-        Some(lower_tail_loop(function)?)
-    } else {
-        None
-    };
-
     Ok(LoweredFunction {
         name: function.name.clone(),
         param_access,
@@ -8054,6 +8286,64 @@ fn lower_function(function: &NormalizedFunction) -> Result<LoweredFunction> {
         kind,
         tail_loop,
     })
+}
+
+fn uses_structural_lowering(function: &NormalizedFunction, clauses: &[LoweredClause]) -> bool {
+    let (params, ret) = function.signature.ty.fun_parts();
+    params.iter().any(type_is_structural)
+        || type_is_structural(&ret)
+        || function
+            .clauses
+            .iter()
+            .flat_map(|clause| clause.patterns.iter())
+            .any(|pattern| pattern_is_structural(&pattern.pattern))
+        || clauses.iter().any(lowered_clause_is_structural)
+}
+
+fn type_is_structural(ty: &Type) -> bool {
+    match ty {
+        Type::Named(name, args) if name == "string" && args.is_empty() => true,
+        Type::Named(name, args) if name == "bool" && args.is_empty() => false,
+        Type::Named(_, _) => true,
+        _ => false,
+    }
+}
+
+fn pattern_is_structural(pattern: &Pattern) -> bool {
+    match pattern {
+        Pattern::Name(name) => is_constructor_name(name),
+        Pattern::Ctor(_, _) | Pattern::Slice { .. } => true,
+        Pattern::Int(_)
+        | Pattern::Float(_)
+        | Pattern::Bool(_)
+        | Pattern::Type(_)
+        | Pattern::Wildcard
+        | Pattern::Char(_) => false,
+    }
+}
+
+fn lowered_clause_is_structural(clause: &LoweredClause) -> bool {
+    clause
+        .patterns
+        .iter()
+        .any(|pattern| pattern_is_structural(&pattern.pattern))
+        || ir_expr_is_structural(&clause.body)
+}
+
+fn ir_expr_is_structural(expr: &IrExpr) -> bool {
+    match &expr.kind {
+        IrExprKind::EnumCtor { .. }
+        | IrExprKind::EnumTag { .. }
+        | IrExprKind::EnumChildBySlot { .. }
+        | IrExprKind::EnumNonRecField { .. } => true,
+        IrExprKind::Let { bindings, body } => {
+            bindings.iter().any(|binding| ir_expr_is_structural(&binding.expr))
+                || ir_expr_is_structural(body)
+        }
+        IrExprKind::Call { args, .. } => args.iter().any(ir_expr_is_structural),
+        IrExprKind::Record(fields) => fields.values().any(ir_expr_is_structural),
+        IrExprKind::Local(_) | IrExprKind::Int(_, _) | IrExprKind::Float(_, _) => false,
+    }
 }
 
 fn lower_clause(
@@ -8322,6 +8612,7 @@ enum Binding<'a> {
     Thunk {
         expr: &'a TypedExpr,
         env: Rc<Env<'a>>,
+        cached: Rc<RefCell<Option<EvalValue<'a>>>>,
     },
 }
 
@@ -8354,6 +8645,42 @@ pub fn run_main(source: &str, main: &str, args_json: &str) -> Result<Value> {
     let (_surface, _module, checked) = compile_frontend(source)?;
     let args = parse_host_args(args_json, &checked, main)?;
     Evaluator::new(&checked).run_function(main, args)
+}
+
+pub fn run_profile_main(source: &str, main: &str, args_json: &str) -> Result<EvalRunProfile> {
+    let total_start = Instant::now();
+
+    let start = Instant::now();
+    let (_surface, _module, checked) = compile_frontend(source)?;
+    let frontend_elapsed = start.elapsed();
+    let frontend_ms = frontend_elapsed.as_millis();
+    let frontend_us = frontend_elapsed.as_micros();
+
+    let start = Instant::now();
+    let args = parse_host_args(args_json, &checked, main)?;
+    let parse_args_elapsed = start.elapsed();
+    let parse_args_ms = parse_args_elapsed.as_millis();
+    let parse_args_us = parse_args_elapsed.as_micros();
+
+    let start = Instant::now();
+    let value = Evaluator::new(&checked).run_function(main, args)?;
+    let execute_elapsed = start.elapsed();
+    let execute_ms = execute_elapsed.as_millis();
+    let execute_us = execute_elapsed.as_micros();
+
+    let total_elapsed = total_start.elapsed();
+
+    Ok(EvalRunProfile {
+        result_json: value.to_json_string(),
+        frontend_ms,
+        frontend_us,
+        parse_args_ms,
+        parse_args_us,
+        execute_ms,
+        execute_us,
+        total_ms: total_elapsed.as_millis(),
+        total_us: total_elapsed.as_micros(),
+    })
 }
 
 pub fn run_compiled_main(compiled: &CompiledProgram, main: &str, args: &[Value]) -> Result<Value> {
@@ -8588,42 +8915,110 @@ impl<'a> Evaluator<'a> {
         };
         match value {
             Value::String(text) => {
-                let chars = text.chars().collect::<Vec<_>>();
                 let fixed = prefix.len() + suffix.len();
-                if chars.len() < fixed {
+                if text.is_ascii() {
+                    let bytes = text.as_bytes();
+                    let len = bytes.len();
+                    if len < fixed {
+                        return Ok(false);
+                    }
+                    if rest.is_none() && len != fixed {
+                        return Ok(false);
+                    }
+                    for (index, subpattern) in prefix.iter().enumerate() {
+                        let typed = TypedPattern {
+                            pattern: subpattern.clone(),
+                            ty: elem_ty.clone(),
+                        };
+                        let value = Value::Scalar(ScalarValue::Char(bytes[index] as char));
+                        if !self.match_pattern(&typed, &Binding::Ready(EvalValue::Host(value)), env)?
+                        {
+                            return Ok(false);
+                        }
+                    }
+                    for (offset, subpattern) in suffix.iter().enumerate() {
+                        let idx = len - suffix.len() + offset;
+                        let typed = TypedPattern {
+                            pattern: subpattern.clone(),
+                            ty: elem_ty.clone(),
+                        };
+                        let value = Value::Scalar(ScalarValue::Char(bytes[idx] as char));
+                        if !self.match_pattern(&typed, &Binding::Ready(EvalValue::Host(value)), env)?
+                        {
+                            return Ok(false);
+                        }
+                    }
+                    if let Some(SliceRest::Bind(name)) = rest {
+                        let start = prefix.len();
+                        let end = len - suffix.len();
+                        env.insert(
+                            name.clone(),
+                            Binding::Ready(EvalValue::Host(Value::String(
+                                text[start..end].to_string(),
+                            ))),
+                        );
+                    }
+                    return Ok(true);
+                }
+                let char_len = text.chars().count();
+                if char_len < fixed {
                     return Ok(false);
                 }
-                if rest.is_none() && chars.len() != fixed {
+                if rest.is_none() && char_len != fixed {
                     return Ok(false);
                 }
-                for (index, subpattern) in prefix.iter().enumerate() {
+                let mut prefix_iter = text.chars();
+                for subpattern in prefix {
+                    let Some(ch) = prefix_iter.next() else {
+                        return Ok(false);
+                    };
                     let typed = TypedPattern {
                         pattern: subpattern.clone(),
                         ty: elem_ty.clone(),
                     };
-                    let value = Value::Scalar(ScalarValue::Char(chars[index]));
+                    let value = Value::Scalar(ScalarValue::Char(ch));
                     if !self.match_pattern(&typed, &Binding::Ready(EvalValue::Host(value)), env)? {
                         return Ok(false);
                     }
                 }
-                for (offset, subpattern) in suffix.iter().enumerate() {
-                    let idx = chars.len() - suffix.len() + offset;
+                let mut suffix_iter = text.chars().rev();
+                for subpattern in suffix.iter().rev() {
+                    let Some(ch) = suffix_iter.next() else {
+                        return Ok(false);
+                    };
                     let typed = TypedPattern {
                         pattern: subpattern.clone(),
                         ty: elem_ty.clone(),
                     };
-                    let value = Value::Scalar(ScalarValue::Char(chars[idx]));
+                    let value = Value::Scalar(ScalarValue::Char(ch));
                     if !self.match_pattern(&typed, &Binding::Ready(EvalValue::Host(value)), env)? {
                         return Ok(false);
                     }
                 }
                 if let Some(SliceRest::Bind(name)) = rest {
-                    let start = prefix.len();
-                    let end = chars.len() - suffix.len();
-                    let rest_string = chars[start..end].iter().collect::<String>();
+                    let start_chars = prefix.len();
+                    let end_chars = char_len - suffix.len();
+                    let start_byte = if start_chars == 0 {
+                        0
+                    } else {
+                        text.char_indices()
+                            .nth(start_chars)
+                            .map(|(idx, _)| idx)
+                            .unwrap_or(text.len())
+                    };
+                    let end_byte = if end_chars == 0 {
+                        0
+                    } else {
+                        text.char_indices()
+                            .nth(end_chars)
+                            .map(|(idx, _)| idx)
+                            .unwrap_or(text.len())
+                    };
                     env.insert(
                         name.clone(),
-                        Binding::Ready(EvalValue::Host(Value::String(rest_string))),
+                        Binding::Ready(EvalValue::Host(Value::String(
+                            text[start_byte..end_byte].to_string(),
+                        ))),
                     );
                 }
                 Ok(true)
@@ -8754,7 +9149,14 @@ impl<'a> Evaluator<'a> {
     fn force_binding(&self, binding: &Binding<'a>) -> Result<EvalValue<'a>> {
         match binding {
             Binding::Ready(value) => Ok(value.clone()),
-            Binding::Thunk { expr, env } => self.eval_expr(expr, env),
+            Binding::Thunk { expr, env, cached } => {
+                if let Some(value) = cached.borrow().clone() {
+                    return Ok(value);
+                }
+                let value = self.eval_expr(expr, env)?;
+                *cached.borrow_mut() = Some(value.clone());
+                Ok(value)
+            }
         }
     }
 
@@ -8826,6 +9228,7 @@ impl<'a> Evaluator<'a> {
                         Binding::Thunk {
                             expr: &binding.expr,
                             env: snapshot,
+                            cached: Rc::new(RefCell::new(None)),
                         },
                     );
                 }
@@ -8886,6 +9289,7 @@ impl<'a> Evaluator<'a> {
                     Binding::Thunk {
                         expr: arg,
                         env: env.clone(),
+                        cached: Rc::new(RefCell::new(None)),
                     },
                 )
             }
@@ -8988,6 +9392,7 @@ impl<'a> Evaluator<'a> {
                     .map(|arg| Binding::Thunk {
                         expr: &arg.expr,
                         env: env.clone(),
+                        cached: Rc::new(RefCell::new(None)),
                     })
                     .collect();
                 self.call_function(function, bindings)
@@ -9465,9 +9870,12 @@ fn eval_builtin_family_scalar(kind: &BuiltinFamilyCallee, args: &[Value]) -> Res
                 return Err(SimdError::new("len\\string expects 1 argument"));
             }
             let value = expect_string_value(&args[0], "len\\string argument 1")?;
-            Ok(Value::Scalar(
-                ScalarValue::I64(value.chars().count() as i64),
-            ))
+            let len = if value.is_ascii() {
+                value.len()
+            } else {
+                value.chars().count()
+            };
+            Ok(Value::Scalar(ScalarValue::I64(len as i64)))
         }
         BuiltinFamilyCallee::SliceString => {
             if args.len() != 3 {
@@ -9478,6 +9886,11 @@ fn eval_builtin_family_scalar(kind: &BuiltinFamilyCallee, args: &[Value]) -> Res
             let len = expect_i64_scalar_value(&args[2], "slice\\string argument 3")?;
             let start = usize::try_from(start.max(0)).unwrap_or(usize::MAX);
             let len = usize::try_from(len.max(0)).unwrap_or(usize::MAX);
+            if source.is_ascii() {
+                let start_byte = start.min(source.len());
+                let end_byte = start_byte.saturating_add(len).min(source.len());
+                return Ok(Value::String(source[start_byte..end_byte].to_string()));
+            }
             let sliced = source.chars().skip(start).take(len).collect::<String>();
             Ok(Value::String(sliced))
         }
@@ -9724,6 +10137,7 @@ impl<'a> LoweredEvaluator<'a> {
             .ok_or_else(|| SimdError::new(format!("unknown lowered function '{}'", name)))?;
         match &function.kind {
             LoweredKind::Scalar { clauses } => self.run_scalar(function, clauses, args),
+            LoweredKind::Structural { clauses } => self.run_structural(function, clauses, args),
             LoweredKind::Kernel {
                 shape: _,
                 vector_width: _,
@@ -9751,6 +10165,15 @@ impl<'a> LoweredEvaluator<'a> {
             "no lowered clause of '{}' matched the provided arguments",
             function.name
         )))
+    }
+
+    fn run_structural(
+        &self,
+        function: &LoweredFunction,
+        clauses: &[LoweredClause],
+        args: Vec<Value>,
+    ) -> Result<Value> {
+        self.run_scalar(function, clauses, args)
     }
 
     fn run_tail_loop(&self, tail_loop: &TailLoop, mut state: Vec<Value>) -> Result<Value> {
@@ -10087,33 +10510,85 @@ impl<'a> LoweredEvaluator<'a> {
     ) -> Result<bool> {
         match value {
             Value::String(text) => {
-                let chars = text.chars().collect::<Vec<_>>();
                 let fixed = prefix.len() + suffix.len();
-                if chars.len() < fixed {
+                if text.is_ascii() {
+                    let bytes = text.as_bytes();
+                    let len = bytes.len();
+                    if len < fixed {
+                        return Ok(false);
+                    }
+                    if rest.is_none() && len != fixed {
+                        return Ok(false);
+                    }
+                    for (index, subpattern) in prefix.iter().enumerate() {
+                        let value = Value::Scalar(ScalarValue::Char(bytes[index] as char));
+                        if !self.match_lowered_pattern(subpattern, &value, env)? {
+                            return Ok(false);
+                        }
+                    }
+                    for (offset, subpattern) in suffix.iter().enumerate() {
+                        let idx = len - suffix.len() + offset;
+                        let value = Value::Scalar(ScalarValue::Char(bytes[idx] as char));
+                        if !self.match_lowered_pattern(subpattern, &value, env)? {
+                            return Ok(false);
+                        }
+                    }
+                    if let Some(SliceRest::Bind(name)) = rest {
+                        let start = prefix.len();
+                        let end = len - suffix.len();
+                        env.insert(name.clone(), Value::String(text[start..end].to_string()));
+                    }
+                    return Ok(true);
+                }
+                let char_len = text.chars().count();
+                if char_len < fixed {
                     return Ok(false);
                 }
-                if rest.is_none() && chars.len() != fixed {
+                if rest.is_none() && char_len != fixed {
                     return Ok(false);
                 }
-                for (index, subpattern) in prefix.iter().enumerate() {
-                    let value = Value::Scalar(ScalarValue::Char(chars[index]));
+                let mut prefix_iter = text.chars();
+                for subpattern in prefix {
+                    let Some(ch) = prefix_iter.next() else {
+                        return Ok(false);
+                    };
+                    let value = Value::Scalar(ScalarValue::Char(ch));
                     if !self.match_lowered_pattern(subpattern, &value, env)? {
                         return Ok(false);
                     }
                 }
-                for (offset, subpattern) in suffix.iter().enumerate() {
-                    let idx = chars.len() - suffix.len() + offset;
-                    let value = Value::Scalar(ScalarValue::Char(chars[idx]));
+                let mut suffix_iter = text.chars().rev();
+                for subpattern in suffix.iter().rev() {
+                    let Some(ch) = suffix_iter.next() else {
+                        return Ok(false);
+                    };
+                    let value = Value::Scalar(ScalarValue::Char(ch));
                     if !self.match_lowered_pattern(subpattern, &value, env)? {
                         return Ok(false);
                     }
                 }
                 if let Some(SliceRest::Bind(name)) = rest {
-                    let start = prefix.len();
-                    let end = chars.len() - suffix.len();
+                    let start_chars = prefix.len();
+                    let end_chars = char_len - suffix.len();
+                    let start_byte = if start_chars == 0 {
+                        0
+                    } else {
+                        text.char_indices()
+                            .nth(start_chars)
+                            .map(|(idx, _)| idx)
+                            .unwrap_or(text.len())
+                    };
+                    let end_byte = if end_chars == 0 {
+                        0
+                    } else {
+                        text.char_indices()
+                            .nth(end_chars)
+                            .map(|(idx, _)| idx)
+                            .unwrap_or(text.len())
+                    };
                     env.insert(
                         name.clone(),
-                        Value::String(chars[start..end].iter().collect::<String>()),
+                        Value::String(text[start_byte..end_byte].to_string()),
                     );
                 }
                 Ok(true)
@@ -10751,6 +11226,11 @@ pub fn run_command(path: &str, main: &str, args_json: &str) -> Result<String> {
     let source = read_source_file(path)?;
     let value = run_main(&source, main, args_json)?;
     Ok(value.to_json_string())
+}
+
+pub fn run_profile_command(path: &str, main: &str, args_json: &str) -> Result<String> {
+    let source = read_source_file(path)?;
+    Ok(run_profile_main(&source, main, args_json)?.to_kv_string())
 }
 
 pub fn inspect_html_command(out: Option<&str>) -> Result<String> {
@@ -11851,6 +12331,20 @@ mod tests {
     }
 
     #[test]
+    fn tail_recursive_function_with_constructor_clauses_lowers_to_loop() {
+        let compiled = compile(
+            "enum Step a =\n  | Done a\n\ncountdown : i64 -> Step i64\ncountdown 0 = Done 0\ncountdown n = countdown (n - 1)\n",
+        );
+        let function = compiled
+            .lowered
+            .functions
+            .iter()
+            .find(|function| function.name == "countdown")
+            .unwrap();
+        assert!(function.tail_loop.is_some());
+    }
+
+    #[test]
     fn non_tail_recursive_function_is_not_loop_lowered() {
         let compiled = compile("bad : i64 -> i64\nbad 0 = 0\nbad n = 1 + bad (n - 1)\n");
         let function = compiled
@@ -11860,6 +12354,42 @@ mod tests {
             .find(|function| function.name == "bad")
             .unwrap();
         assert!(function.tail_loop.is_none());
+    }
+
+    #[test]
+    fn recursive_enum_function_lowers_to_structural() {
+        let compiled = compile(
+            "enum List a =\n  | Nil\n  | Cons a (List a)\n\nlen : List i64 -> i64\nlen Nil = 0\nlen (Cons _ xs) = 1 + len xs\n",
+        );
+        let function = compiled
+            .lowered
+            .functions
+            .iter()
+            .find(|function| function.name == "len")
+            .unwrap();
+        assert!(matches!(function.kind, LoweredKind::Structural { .. }));
+    }
+
+    #[test]
+    fn slice_pattern_function_lowers_to_structural() {
+        let compiled = compile(
+            "starts : string -> i64\nstarts ['c', 'a', 'r', ...] = 1\nstarts _ = 0\n",
+        );
+        let function = compiled
+            .lowered
+            .functions
+            .iter()
+            .find(|function| function.name == "starts")
+            .unwrap();
+        assert!(matches!(function.kind, LoweredKind::Structural { .. }));
+    }
+
+    #[test]
+    fn lowered_recursive_enum_execution_matches_checked_execution() {
+        let src = "enum Tree a =\n  | Leaf a\n  | Bin (Tree a) (Tree a)\n\nsum : Tree i64 -> i64\nsum (Leaf x) = x\nsum (Bin l r) = sum l + sum r\n\nmain : i64\nmain = sum (Bin (Leaf 2) (Bin (Leaf 3) (Leaf 4)))\n";
+        let checked = run_main(src, "main", "[]").unwrap().to_json_string();
+        let lowered = run_lowered_main(src, "main", "[]").unwrap().to_json_string();
+        assert_eq!(checked, lowered);
     }
 
     #[test]

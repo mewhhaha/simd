@@ -3,6 +3,7 @@ use crate::wasm_backend::{
     LambdaLoweringMode, WasmHigherOrderReport, WasmLeafExport, WasmLeafResultAbi,
     WasmOptimizationReport,
 };
+use serde_json::Value as SerdeJsonValue;
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 use wasm_encoder::{
@@ -51,6 +52,7 @@ struct ExampleSpec {
     source: &'static str,
     build_input: fn(usize) -> BenchInput,
     rust_impl: fn(&[Value]) -> Result<Value>,
+    is_core_suite: bool,
 }
 
 struct MatrixSpec {
@@ -557,6 +559,7 @@ fn intent_label(intent: &IntentClass) -> &'static str {
         IntentClass::MapBinaryBroadcast => "MapBinaryBroadcast",
         IntentClass::MapTernaryBroadcast => "MapTernaryBroadcast",
         IntentClass::GroupedMap => "GroupedMap",
+        IntentClass::Structural => "Structural",
         IntentClass::ScalarTailRec => "ScalarTailRec",
         IntentClass::Fallback => "Fallback",
     }
@@ -731,6 +734,9 @@ fn render_core_contract_summary(
     let mut axpy_large_leaf = None::<f64>;
     let mut axpy2_large_leaf = None::<f64>;
     for spec in specs {
+        if !spec.is_core_suite {
+            continue;
+        }
         let input = (spec.build_input)(size);
         let compiled = compile_source(spec.source)?;
         let artifact = compile_wasm_main(spec.source, spec.main)?;
@@ -831,6 +837,9 @@ fn matrix_specs() -> Vec<MatrixSpec> {
 fn core_suite_matrix_specs(size_label: &'static str, size: usize) -> Vec<MatrixSpec> {
     let mut specs = Vec::new();
     for spec in benchmark_specs() {
+        if !spec.is_core_suite {
+            continue;
+        }
         let ExampleSpec {
             name,
             description,
@@ -839,6 +848,7 @@ fn core_suite_matrix_specs(size_label: &'static str, size: usize) -> Vec<MatrixS
             source,
             build_input,
             rust_impl,
+            is_core_suite: _,
         } = spec;
         specs.push(MatrixSpec {
             name: name.to_string(),
@@ -1899,6 +1909,87 @@ fn expect_record_bulk_prim_field<'a>(
     }
 }
 
+fn build_json_parser_adt_nested_input(size: usize) -> BenchInput {
+    let payload = build_json_parser_adt_nested_payload(size);
+    let logical_elements = payload.chars().count();
+    BenchInput {
+        args: vec![Value::String(payload)],
+        logical_elements,
+        leaf_elements: logical_elements,
+    }
+}
+
+fn build_json_parser_adt_nested_payload(size: usize) -> String {
+    let item_count = (size / 96).max(4);
+    let mut payload = String::from("{\"items\":[");
+    for index in 0..item_count {
+        if index != 0 {
+            payload.push(',');
+        }
+        let name_len = 8 + (index % 13);
+        let label = "abcdefghi".repeat(name_len.div_ceil(9));
+        payload.push_str("{\"id\":");
+        payload.push_str(&(index as i64).to_string());
+        payload.push_str(",\"flag\":");
+        payload.push_str(if index % 2 == 0 { "true" } else { "false" });
+        payload.push_str(",\"name\":\"");
+        payload.push_str(&label[..name_len]);
+        payload.push_str("\",\"nums\":[");
+        for inner in 0..4usize {
+            if inner != 0 {
+                payload.push(',');
+            }
+            payload.push_str(&((index * 7 + inner) as i64).to_string());
+        }
+        payload.push_str("],\"meta\":{\"depth\":");
+        payload.push_str(&((index % 5) as i64).to_string());
+        payload.push_str(",\"tag\":\"");
+        payload.push_str(if index % 3 == 0 { "leaf" } else { "branch" });
+        payload.push_str("\"}}");
+    }
+    payload.push_str("],\"summary\":{\"count\":");
+    payload.push_str(&(item_count as i64).to_string());
+    payload.push_str(",\"title\":\"json-bench\"}}");
+    payload
+}
+
+fn rust_json_parser_adt_nested(args: &[Value]) -> Result<Value> {
+    let Some(Value::String(payload)) = args.first() else {
+        return Err(SimdError::new(
+            "json parser adt nested benchmark expects one string argument",
+        ));
+    };
+    let json: SerdeJsonValue = serde_json::from_str(payload).map_err(|error| {
+        SimdError::new(format!(
+            "json parser adt nested benchmark could not parse payload: {}",
+            error
+        ))
+    })?;
+    Ok(Value::Scalar(ScalarValue::I64(
+        json_parser_adt_nested_weight(&json),
+    )))
+}
+
+fn json_parser_adt_nested_weight(value: &SerdeJsonValue) -> i64 {
+    match value {
+        SerdeJsonValue::Null => 10,
+        SerdeJsonValue::Bool(flag) => 20 + if *flag { 1 } else { 0 },
+        SerdeJsonValue::Number(number) => 100 + number.as_i64().unwrap_or(0),
+        SerdeJsonValue::String(text) => 200 + text.chars().count() as i64,
+        SerdeJsonValue::Array(items) => {
+            300 + items.iter().map(json_parser_adt_nested_weight).sum::<i64>()
+        }
+        SerdeJsonValue::Object(fields) => {
+            400 + fields
+                .iter()
+                .map(|(key, value)| {
+                    key.chars().count() as i64 + json_parser_adt_nested_weight(value)
+                })
+                .sum::<i64>()
+        }
+    }
+}
+
 fn benchmark_specs() -> Vec<ExampleSpec> {
     vec![
         ExampleSpec {
@@ -1909,6 +2000,7 @@ fn benchmark_specs() -> Vec<ExampleSpec> {
             source: include_str!("../examples/inc_i64.simd"),
             build_input: build_inc_i64_input,
             rust_impl: rust_inc_i64,
+            is_core_suite: true,
         },
         ExampleSpec {
             name: "square-f32",
@@ -1918,6 +2010,7 @@ fn benchmark_specs() -> Vec<ExampleSpec> {
             source: include_str!("../examples/square_f32.simd"),
             build_input: build_square_f32_input,
             rust_impl: rust_square_f32,
+            is_core_suite: true,
         },
         ExampleSpec {
             name: "axpy-i64",
@@ -1927,6 +2020,7 @@ fn benchmark_specs() -> Vec<ExampleSpec> {
             source: include_str!("../examples/axpy_i64.simd"),
             build_input: build_axpy_i64_input,
             rust_impl: rust_axpy_i64,
+            is_core_suite: true,
         },
         ExampleSpec {
             name: "axpy2-record-i64",
@@ -1936,6 +2030,7 @@ fn benchmark_specs() -> Vec<ExampleSpec> {
             source: include_str!("../examples/axpy2_record_i64.simd"),
             build_input: build_axpy2_record_i64_input,
             rust_impl: rust_axpy2_record_i64,
+            is_core_suite: true,
         },
         ExampleSpec {
             name: "pow2-i64",
@@ -1945,6 +2040,17 @@ fn benchmark_specs() -> Vec<ExampleSpec> {
             source: include_str!("../examples/pow2_i64.simd"),
             build_input: build_pow2_i64_input,
             rust_impl: rust_pow2_i64,
+            is_core_suite: true,
+        },
+        ExampleSpec {
+            name: "json-parser-adt-nested",
+            description: "Nested JSON parse-and-weight over recursive ADTs and string slice patterns.",
+            file: "examples/json_parser_adt.simd",
+            main: "main",
+            source: include_str!("../examples/json_parser_adt.simd"),
+            build_input: build_json_parser_adt_nested_input,
+            rust_impl: rust_json_parser_adt_nested,
+            is_core_suite: false,
         },
     ]
 }
@@ -2230,6 +2336,7 @@ fn handcrafted_matrix_axpy2_record_artifact(prim: Prim) -> Result<WasmArtifact> 
         grouped_export: None,
         result_type: Type::Scalar(Prim::I64),
         enum_ctors: BTreeMap::new(),
+        wasm_enum_layouts: BTreeMap::new(),
         leaf_exports,
         optimizer_reports: vec![WasmOptimizationReport {
             function: format!("handcrafted_matrix_axpy2_record_{}", prim_label(prim)),
@@ -2319,6 +2426,7 @@ fn handcrafted_matrix_image_tone_rgb_f32_artifact() -> Result<WasmArtifact> {
         grouped_export: None,
         result_type: Type::Scalar(Prim::I64),
         enum_ctors: BTreeMap::new(),
+        wasm_enum_layouts: BTreeMap::new(),
         leaf_exports: vec![
             WasmLeafExport {
                 leaf_path: LeafPath(vec!["r".to_string()]),
@@ -2472,6 +2580,7 @@ fn handcrafted_matrix_image_blend_rgb_f32_artifact() -> Result<WasmArtifact> {
         grouped_export: None,
         result_type: Type::Scalar(Prim::I64),
         enum_ctors: BTreeMap::new(),
+        wasm_enum_layouts: BTreeMap::new(),
         leaf_exports: vec![
             WasmLeafExport {
                 leaf_path: LeafPath(vec!["r".to_string()]),
@@ -2539,6 +2648,7 @@ fn build_handcrafted_single_leaf_artifact(
         grouped_export: None,
         result_type: Type::Scalar(Prim::I64),
         enum_ctors: BTreeMap::new(),
+        wasm_enum_layouts: BTreeMap::new(),
         leaf_exports: vec![WasmLeafExport {
             leaf_path: LeafPath::root(),
             export_name: "main".to_string(),
@@ -3396,6 +3506,7 @@ fn handcrafted_unary_i64_artifact(
         grouped_export: None,
         result_type: Type::Scalar(Prim::I64),
         enum_ctors: BTreeMap::new(),
+        wasm_enum_layouts: BTreeMap::new(),
         leaf_exports: vec![WasmLeafExport {
             leaf_path: LeafPath::root(),
             export_name: "main".to_string(),
@@ -3545,6 +3656,7 @@ fn handcrafted_square_f32_artifact() -> Result<WasmArtifact> {
         grouped_export: None,
         result_type: Type::Scalar(Prim::I64),
         enum_ctors: BTreeMap::new(),
+        wasm_enum_layouts: BTreeMap::new(),
         leaf_exports: vec![WasmLeafExport {
             leaf_path: LeafPath::root(),
             export_name: "main".to_string(),
@@ -3742,6 +3854,7 @@ fn handcrafted_axpy_i64_artifact() -> Result<WasmArtifact> {
         grouped_export: None,
         result_type: Type::Scalar(Prim::I64),
         enum_ctors: BTreeMap::new(),
+        wasm_enum_layouts: BTreeMap::new(),
         leaf_exports: vec![WasmLeafExport {
             leaf_path: LeafPath::root(),
             export_name: "main".to_string(),
@@ -3871,6 +3984,7 @@ fn handcrafted_axpy2_record_i64_artifact() -> Result<WasmArtifact> {
         grouped_export: None,
         result_type: Type::Scalar(Prim::I64),
         enum_ctors: BTreeMap::new(),
+        wasm_enum_layouts: BTreeMap::new(),
         leaf_exports: leafs,
         optimizer_reports: vec![WasmOptimizationReport {
             function: "handcrafted_axpy2_record_i64".to_string(),

@@ -1,5 +1,42 @@
 # simd
 
+`simd` is a semantics-first functional SIMD language prototype with:
+
+- scalar and bulk numerics
+- records with internal SoA lowering
+- `char`, `string`, and slice-view clause patterns
+- recursive fixed-arity enums/ADTs
+- evaluator, lowered execution, and Wasm execution paths
+- prepared hot-path execution and profiling commands
+
+Current recursive enum status:
+
+- recursive fixed-arity self-recursive enums work through the evaluator, structural lowering, and Wasm
+- evaluator, lowered execution, and Wasm all use preorder interval-tape semantics for enum trees
+- Wasm enum values now use native tape-backed handles rather than the older pointer-node layout
+- host JSON enum input is still unsupported
+
+Useful commands:
+
+```sh
+cargo run -- run examples/json_parser_adt.simd --main main --args '["{\"a\":[1,2,3]}"]'
+cargo run -- run-wasm examples/json_parser_adt.simd --main main --args '["{\"a\":[1,2,3]}"]'
+cargo run -- run-wasm-prepared examples/json_parser_adt.simd --main main --args '["{\"a\":[1,2,3]}"]' --iters 10
+cargo run -- run-profile examples/json_parser_adt.simd --main main --args '["{\"a\":[1,2,3]}"]'
+cargo run -- run-wasm-profile examples/json_parser_adt.simd --main main --args '["{\"a\":[1,2,3]}"]'
+```
+
+Implementation notes:
+
+- repeated Wasm CLI runs use a local Wasmtime compilation cache under `.tmp/wasmtime-cache`
+- `run-wasm-profile` reports cold-vs-cached Wasm stage timings
+- `run-profile` reports evaluator frontend/arg-parse/execute timings
+
+Example programs:
+
+- [JSON parser ADT notes](./examples/README.md)
+- [JSON parser ADT source](./examples/json_parser_adt.simd)
+
 ## Benchmark Tracking
 
 This file tracks benchmark snapshots so we can compare progress over time.
@@ -87,3 +124,31 @@ cargo run -- run examples/type_dispatch.simd --main main --args '["i64", 41]'
 Current backend status:
 - evaluator path supports `Type t` witness arguments and type-pattern clauses
 - normalization/lowering/Wasm still reject `Type t` programs in this milestone
+
+## Current Language Surface
+
+The current source language includes:
+
+- primitive numeric scalars: `i32`, `i64`, `f32`, `f64`
+- `char`
+- shaped bulks
+- `string`
+- records
+- recursive fixed-arity enums
+- clause patterns for literals, constructors, strings, chars, and prefix/suffix slice views
+
+Examples:
+
+```simd
+my_char : char -> i64
+my_char 'a' = 1
+my_char _ = 0
+
+starts_car : string -> i64
+starts_car ['c', 'a', 'r', ...rest] = len rest
+starts_car _ = 0
+
+enum List a =
+  | Nil
+  | Cons a (List a)
+```

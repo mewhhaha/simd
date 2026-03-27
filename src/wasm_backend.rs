@@ -2,14 +2,18 @@ use super::*;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
+use std::hash::{Hash, Hasher};
+use std::path::PathBuf;
 use std::rc::Rc;
+use std::time::Instant;
 
 use wasm_encoder::{
     BlockType, CodeSection, ExportKind, ExportSection, Function, FunctionSection, Instruction,
     MemArg, MemorySection, MemoryType, Module, TypeSection, ValType,
 };
 use wasmtime::{
-    Config, Engine, Func, Instance, Memory, Module as WasmtimeModule, OptLevel, Store, Val,
+    Cache, Config, Engine, Func, Instance, Memory, Module as WasmtimeModule, OptLevel, Store,
+    Val,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -20,6 +24,7 @@ pub struct WasmArtifact {
     pub result: WasmResultAbi,
     pub result_type: Type,
     pub enum_ctors: BTreeMap<String, EnumCtorInfo>,
+    pub wasm_enum_layouts: BTreeMap<String, WasmEnumLayout>,
     pub grouped_export: Option<WasmGroupedExport>,
     pub leaf_exports: Vec<WasmLeafExport>,
     pub optimizer_reports: Vec<WasmOptimizationReport>,
@@ -74,6 +79,90 @@ pub struct WasmLeafExport {
 pub struct WasmExecutable {
     artifact: WasmArtifact,
     runtime: RefCell<WasmRuntime>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WasmRunProfile {
+    pub result_json: String,
+    pub artifact_bytes: usize,
+    pub frontend_ms: u128,
+    pub frontend_us: u128,
+    pub specialize_ms: u128,
+    pub specialize_us: u128,
+    pub lambda_lower_ms: u128,
+    pub lambda_lower_us: u128,
+    pub canonicalize_ms: u128,
+    pub canonicalize_us: u128,
+    pub parse_args_ms: u128,
+    pub parse_args_us: u128,
+    pub compile_artifact_ms: u128,
+    pub compile_artifact_us: u128,
+    pub compile_enum_layouts_ms: u128,
+    pub compile_enum_layouts_us: u128,
+    pub compile_plan_ms: u128,
+    pub compile_plan_us: u128,
+    pub compile_normalize_ms: u128,
+    pub compile_normalize_us: u128,
+    pub compile_lower_ms: u128,
+    pub compile_lower_us: u128,
+    pub compile_group_ms: u128,
+    pub compile_group_us: u128,
+    pub compile_intents_ms: u128,
+    pub compile_intents_us: u128,
+    pub engine_ms: u128,
+    pub engine_us: u128,
+    pub module_compile_ms: u128,
+    pub module_compile_us: u128,
+    pub runtime_build_ms: u128,
+    pub runtime_build_us: u128,
+    pub execute_ms: u128,
+    pub execute_us: u128,
+    pub total_ms: u128,
+    pub total_us: u128,
+}
+
+impl WasmRunProfile {
+    fn to_kv_string(&self) -> String {
+        [
+            format!("result_json={}", self.result_json),
+            format!("artifact_bytes={}", self.artifact_bytes),
+            format!("frontend_ms={}", self.frontend_ms),
+            format!("frontend_us={}", self.frontend_us),
+            format!("specialize_ms={}", self.specialize_ms),
+            format!("specialize_us={}", self.specialize_us),
+            format!("lambda_lower_ms={}", self.lambda_lower_ms),
+            format!("lambda_lower_us={}", self.lambda_lower_us),
+            format!("canonicalize_ms={}", self.canonicalize_ms),
+            format!("canonicalize_us={}", self.canonicalize_us),
+            format!("parse_args_ms={}", self.parse_args_ms),
+            format!("parse_args_us={}", self.parse_args_us),
+            format!("compile_artifact_ms={}", self.compile_artifact_ms),
+            format!("compile_artifact_us={}", self.compile_artifact_us),
+            format!("compile_enum_layouts_ms={}", self.compile_enum_layouts_ms),
+            format!("compile_enum_layouts_us={}", self.compile_enum_layouts_us),
+            format!("compile_plan_ms={}", self.compile_plan_ms),
+            format!("compile_plan_us={}", self.compile_plan_us),
+            format!("compile_normalize_ms={}", self.compile_normalize_ms),
+            format!("compile_normalize_us={}", self.compile_normalize_us),
+            format!("compile_lower_ms={}", self.compile_lower_ms),
+            format!("compile_lower_us={}", self.compile_lower_us),
+            format!("compile_group_ms={}", self.compile_group_ms),
+            format!("compile_group_us={}", self.compile_group_us),
+            format!("compile_intents_ms={}", self.compile_intents_ms),
+            format!("compile_intents_us={}", self.compile_intents_us),
+            format!("engine_ms={}", self.engine_ms),
+            format!("engine_us={}", self.engine_us),
+            format!("module_compile_ms={}", self.module_compile_ms),
+            format!("module_compile_us={}", self.module_compile_us),
+            format!("runtime_build_ms={}", self.runtime_build_ms),
+            format!("runtime_build_us={}", self.runtime_build_us),
+            format!("execute_ms={}", self.execute_ms),
+            format!("execute_us={}", self.execute_us),
+            format!("total_ms={}", self.total_ms),
+            format!("total_us={}", self.total_us),
+        ]
+        .join("\n")
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -255,6 +344,123 @@ pub enum WasmLeafResultAbi {
     Bulk { prim: Prim },
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct WasmEnumLayout {
+    pub enum_name: String,
+    pub enum_id: u32,
+    pub max_tag: u16,
+    pub ctors: BTreeMap<String, WasmEnumCtorLayout>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct WasmEnumCtorLayout {
+    pub ctor_name: String,
+    pub tag: u16,
+    pub row_stride: u32,
+    pub recursive_field_indices: Vec<usize>,
+    pub non_recursive_fields: Vec<WasmEnumFieldLayout>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct WasmEnumFieldLayout {
+    pub source_index: usize,
+    pub row_index: usize,
+    pub offset: u32,
+    pub ty: Type,
+}
+
+const WASM_ARTIFACT_BYTE_CACHE_VERSION: &str = "wasm-artifact-bytes-v1";
+
+fn build_wasm_execution_artifact_checked(
+    checked_program: &CheckedProgram,
+    main: &str,
+    origins: &BTreeMap<String, String>,
+    bytes: Vec<u8>,
+) -> Result<WasmArtifact> {
+    let higher_order_reports = collect_higher_order_reports(checked_program, origins);
+    ensure_backend_first_order_compatibility(&higher_order_reports)?;
+    let wasm_enum_layouts = build_precomputed_wasm_enum_layouts(checked_program)?;
+    let entry_result_type = checked_program
+        .functions
+        .iter()
+        .find(|function| function.name == main)
+        .map(|function| function.signature.ty.fun_parts().1)
+        .ok_or_else(|| SimdError::new(format!("unknown entry function '{}'", main)))?;
+    let plan = build_wasm_plan(checked_program, main)?;
+    let grouped_export = if matches!(plan.result, WasmResultAbi::Record { .. })
+        && !plan.leaf_exports.is_empty()
+    {
+        Some(WasmGroupedExport {
+            export_name: main.to_string(),
+            leaf_exports: plan.leaf_exports.clone(),
+        })
+    } else {
+        None
+    };
+    Ok(WasmArtifact {
+        bytes,
+        export_name: main.to_string(),
+        params: plan.params,
+        result: plan.result,
+        result_type: entry_result_type,
+        enum_ctors: checked_program.enum_ctors.clone(),
+        wasm_enum_layouts,
+        grouped_export,
+        leaf_exports: plan.leaf_exports,
+        optimizer_reports: Vec::new(),
+        higher_order_reports,
+    })
+}
+
+fn ensure_wasm_artifact_byte_cache_dir() -> Result<PathBuf> {
+    let cwd = std::env::current_dir()
+        .map_err(|error| SimdError::new(format!("failed to read current directory: {}", error)))?;
+    let cache_dir = cwd.join(".tmp/wasm-artifact-cache");
+    fs::create_dir_all(&cache_dir).map_err(|error| {
+        SimdError::new(format!(
+            "failed to create Wasm artifact cache directory '{}': {}",
+            cache_dir.display(),
+            error
+        ))
+    })?;
+    Ok(cache_dir)
+}
+
+fn wasm_artifact_byte_cache_path(source: &str, main: &str) -> Result<PathBuf> {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    WASM_ARTIFACT_BYTE_CACHE_VERSION.hash(&mut hasher);
+    main.hash(&mut hasher);
+    source.hash(&mut hasher);
+    let key = hasher.finish();
+    Ok(ensure_wasm_artifact_byte_cache_dir()?.join(format!("{key:016x}.wasm")))
+}
+
+fn load_or_compile_wasm_command_artifact(
+    path: &str,
+    main: &str,
+) -> Result<(CheckedProgram, WasmArtifact, bool)> {
+    let source = read_source_file(path)?;
+    let (_surface, _module, checked) = compile_frontend(&source)?;
+    let specialized = specialize_checked_program_for_main(&checked, main)?;
+    let lowered_ready = eliminate_non_escaping_lambdas_program(&specialized.checked)?;
+    let canonical = canonicalize_backend_higher_order_program(&lowered_ready)?;
+    let cache_path = wasm_artifact_byte_cache_path(&source, main)?;
+    if let Ok(bytes) = fs::read(&cache_path) {
+        let artifact =
+            build_wasm_execution_artifact_checked(&canonical, main, &specialized.origins, bytes)?;
+        return Ok((canonical, artifact, true));
+    }
+    let artifact = compile_wasm_artifact_checked(&canonical, main, &specialized.origins)?;
+    fs::write(&cache_path, &artifact.bytes).map_err(|error| {
+        SimdError::new(format!(
+            "failed to write Wasm artifact cache '{}': {}",
+            cache_path.display(),
+            error
+        ))
+    })?;
+    Ok((canonical, artifact, false))
+}
+
 pub fn compile_wasm_main(source: &str, main: &str) -> Result<WasmArtifact> {
     let (_surface, _module, checked) = compile_frontend(source)?;
     let specialized = specialize_checked_program_for_main(&checked, main)?;
@@ -312,9 +518,50 @@ pub fn run_wasm_main(source: &str, main: &str, args_json: &str) -> Result<Value>
     prepare_wasm_artifact(artifact)?.run(&args)
 }
 
+pub fn run_wasm_prepared_main(
+    source: &str,
+    main: &str,
+    args_json: &str,
+    iters: usize,
+) -> Result<Value> {
+    if iters == 0 {
+        return Err(SimdError::new(
+            "run-wasm-prepared requires --iters >= 1",
+        ));
+    }
+    let (_surface, _module, checked) = compile_frontend(source)?;
+    let specialized = specialize_checked_program_for_main(&checked, main)?;
+    let lowered_ready = eliminate_non_escaping_lambdas_program(&specialized.checked)?;
+    let canonical = canonicalize_backend_higher_order_program(&lowered_ready)?;
+    let args = parse_host_args(args_json, &canonical, main)?;
+    let plan = build_wasm_plan(&canonical, main)?;
+    let artifact = compile_wasm_artifact_checked(&canonical, main, &specialized.origins)?;
+    let flat_param_abis = flatten_wasm_param_abis(&plan.params)?;
+    let input_templates = prepared_input_templates(&plan.params)?;
+    let output_templates = prepared_output_templates(&plan.result, &artifact, &input_templates)?;
+    let engine = build_engine()?;
+    let module = WasmtimeModule::from_binary(&engine, &artifact.bytes)
+        .map_err(|error| SimdError::new(format!("failed to compile Wasm module: {error:#}")))?;
+    let runtime = build_runtime(&engine, &module, &artifact)?;
+    let prepared = PreparedWasmMain {
+        artifact,
+        params: plan.params,
+        flat_param_abis,
+        input_templates,
+        output_templates,
+        runtime: Rc::new(RefCell::new(runtime)),
+    };
+    let layout = prepared.layout_from_args(&args)?;
+    let mut bound = prepared.bind(layout)?;
+    for _ in 0..iters {
+        bound.load_args(&args)?;
+        bound.run()?;
+    }
+    bound.read_result()
+}
+
 pub fn wasm_command(path: &str, main: &str, out: Option<&str>) -> Result<String> {
-    let source = read_source_file(path)?;
-    let artifact = compile_wasm_main(&source, main)?;
+    let (_canonical, artifact, _cache_hit) = load_or_compile_wasm_command_artifact(path, main)?;
     if let Some(path) = out {
         fs::write(path, &artifact.bytes)
             .map_err(|error| SimdError::new(format!("failed to write '{path}': {error}")))?;
@@ -340,9 +587,185 @@ pub fn wat_command(path: &str, main: &str) -> Result<String> {
 }
 
 pub fn run_wasm_command(path: &str, main: &str, args_json: &str) -> Result<String> {
-    let source = read_source_file(path)?;
-    let value = run_wasm_main(&source, main, args_json)?;
+    let (canonical, artifact, _cache_hit) = load_or_compile_wasm_command_artifact(path, main)?;
+    let args = parse_host_args(args_json, &canonical, main)?;
+    let value = prepare_wasm_artifact(artifact)?.run(&args)?;
     Ok(value.to_json_string())
+}
+
+pub fn run_wasm_prepared_command(
+    path: &str,
+    main: &str,
+    args_json: &str,
+    iters: usize,
+) -> Result<String> {
+    if iters == 0 {
+        return Err(SimdError::new(
+            "run-wasm-prepared requires --iters >= 1",
+        ));
+    }
+    let (canonical, artifact, _cache_hit) = load_or_compile_wasm_command_artifact(path, main)?;
+    let args = parse_host_args(args_json, &canonical, main)?;
+    let executable = prepare_wasm_artifact(artifact)?;
+    let mut last = None;
+    for _ in 0..iters {
+        last = Some(executable.run(&args)?);
+    }
+    let value = last.ok_or_else(|| SimdError::new("missing prepared Wasm result"))?;
+    Ok(value.to_json_string())
+}
+
+pub fn run_wasm_profile_main(source: &str, main: &str, args_json: &str) -> Result<WasmRunProfile> {
+    let total_start = Instant::now();
+
+    let start = Instant::now();
+    let (_surface, _module, checked) = compile_frontend(source)?;
+    let frontend_elapsed = start.elapsed();
+    let frontend_ms = frontend_elapsed.as_millis();
+    let frontend_us = frontend_elapsed.as_micros();
+
+    let start = Instant::now();
+    let specialized = specialize_checked_program_for_main(&checked, main)?;
+    let specialize_elapsed = start.elapsed();
+    let specialize_ms = specialize_elapsed.as_millis();
+    let specialize_us = specialize_elapsed.as_micros();
+
+    let start = Instant::now();
+    let lowered_ready = eliminate_non_escaping_lambdas_program(&specialized.checked)?;
+    let lambda_lower_elapsed = start.elapsed();
+    let lambda_lower_ms = lambda_lower_elapsed.as_millis();
+    let lambda_lower_us = lambda_lower_elapsed.as_micros();
+
+    let start = Instant::now();
+    let canonical = canonicalize_backend_higher_order_program(&lowered_ready)?;
+    let canonicalize_elapsed = start.elapsed();
+    let canonicalize_ms = canonicalize_elapsed.as_millis();
+    let canonicalize_us = canonicalize_elapsed.as_micros();
+
+    let start = Instant::now();
+    let args = parse_host_args(args_json, &canonical, main)?;
+    let parse_args_elapsed = start.elapsed();
+    let parse_args_ms = parse_args_elapsed.as_millis();
+    let parse_args_us = parse_args_elapsed.as_micros();
+
+    let start = Instant::now();
+    let _profiled_wasm_enum_layouts = build_precomputed_wasm_enum_layouts(&canonical)?;
+    let compile_enum_layouts_elapsed = start.elapsed();
+    let compile_enum_layouts_ms = compile_enum_layouts_elapsed.as_millis();
+    let compile_enum_layouts_us = compile_enum_layouts_elapsed.as_micros();
+
+    let start = Instant::now();
+    let profiled_plan = build_wasm_plan(&canonical, main)?;
+    let compile_plan_elapsed = start.elapsed();
+    let compile_plan_ms = compile_plan_elapsed.as_millis();
+    let compile_plan_us = compile_plan_elapsed.as_micros();
+
+    let start = Instant::now();
+    let profiled_normalized = normalize_records(&profiled_plan.checked)?;
+    let compile_normalize_elapsed = start.elapsed();
+    let compile_normalize_ms = compile_normalize_elapsed.as_millis();
+    let compile_normalize_us = compile_normalize_elapsed.as_micros();
+
+    let start = Instant::now();
+    let profiled_lowered = optimize_lowered_program(&lower_program(&profiled_normalized)?);
+    let compile_lower_elapsed = start.elapsed();
+    let compile_lower_ms = compile_lower_elapsed.as_millis();
+    let compile_lower_us = compile_lower_elapsed.as_micros();
+
+    let start = Instant::now();
+    let profiled_grouped = group_lowered_program(&profiled_normalized, &profiled_lowered)?;
+    let compile_group_elapsed = start.elapsed();
+    let compile_group_ms = compile_group_elapsed.as_millis();
+    let compile_group_us = compile_group_elapsed.as_micros();
+
+    let start = Instant::now();
+    let _profiled_intents = analyze_intents(&profiled_grouped);
+    let compile_intents_elapsed = start.elapsed();
+    let compile_intents_ms = compile_intents_elapsed.as_millis();
+    let compile_intents_us = compile_intents_elapsed.as_micros();
+
+    let start = Instant::now();
+    let artifact = compile_wasm_artifact_checked(&canonical, main, &specialized.origins)?;
+    let compile_artifact_elapsed = start.elapsed();
+    let compile_artifact_ms = compile_artifact_elapsed.as_millis();
+    let compile_artifact_us = compile_artifact_elapsed.as_micros();
+    let artifact_bytes = artifact.bytes.len();
+
+    let start = Instant::now();
+    let engine = build_engine()?;
+    let engine_elapsed = start.elapsed();
+    let engine_ms = engine_elapsed.as_millis();
+    let engine_us = engine_elapsed.as_micros();
+
+    let start = Instant::now();
+    let module = WasmtimeModule::from_binary(&engine, &artifact.bytes)
+        .map_err(|error| SimdError::new(format!("failed to compile Wasm module: {error:#}")))?;
+    let module_compile_elapsed = start.elapsed();
+    let module_compile_ms = module_compile_elapsed.as_millis();
+    let module_compile_us = module_compile_elapsed.as_micros();
+
+    let start = Instant::now();
+    let runtime = build_runtime(&engine, &module, &artifact)?;
+    let runtime_build_elapsed = start.elapsed();
+    let runtime_build_ms = runtime_build_elapsed.as_millis();
+    let runtime_build_us = runtime_build_elapsed.as_micros();
+
+    let executable = WasmExecutable {
+        artifact,
+        runtime: RefCell::new(runtime),
+    };
+
+    let start = Instant::now();
+    let value = executable.run(&args)?;
+    let execute_elapsed = start.elapsed();
+    let execute_ms = execute_elapsed.as_millis();
+    let execute_us = execute_elapsed.as_micros();
+
+    let total_elapsed = total_start.elapsed();
+
+    Ok(WasmRunProfile {
+        result_json: value.to_json_string(),
+        artifact_bytes,
+        frontend_ms,
+        frontend_us,
+        specialize_ms,
+        specialize_us,
+        lambda_lower_ms,
+        lambda_lower_us,
+        canonicalize_ms,
+        canonicalize_us,
+        parse_args_ms,
+        parse_args_us,
+        compile_artifact_ms,
+        compile_artifact_us,
+        compile_enum_layouts_ms,
+        compile_enum_layouts_us,
+        compile_plan_ms,
+        compile_plan_us,
+        compile_normalize_ms,
+        compile_normalize_us,
+        compile_lower_ms,
+        compile_lower_us,
+        compile_group_ms,
+        compile_group_us,
+        compile_intents_ms,
+        compile_intents_us,
+        engine_ms,
+        engine_us,
+        module_compile_ms,
+        module_compile_us,
+        runtime_build_ms,
+        runtime_build_us,
+        execute_ms,
+        execute_us,
+        total_ms: total_elapsed.as_millis(),
+        total_us: total_elapsed.as_micros(),
+    })
+}
+
+pub fn run_wasm_profile_command(path: &str, main: &str, args_json: &str) -> Result<String> {
+    let source = read_source_file(path)?;
+    Ok(run_wasm_profile_main(&source, main, args_json)?.to_kv_string())
 }
 
 fn render_optimizer_report_comments(reports: &[WasmOptimizationReport]) -> String {
@@ -1147,6 +1570,7 @@ fn run_prepared_bound(bound: &mut BoundPreparedRun) -> Result<()> {
             prim,
         } => {
             let func = runtime_func(&runtime, func_name)?;
+            runtime.sync_enum_heap_ptr()?;
             func.call(&mut runtime.store, &input_args, &mut scratch_results)
                 .map_err(|error| {
                     SimdError::new(format!("Wasm prepared execution failed: {error}"))
@@ -1175,6 +1599,7 @@ fn run_prepared_bound(bound: &mut BoundPreparedRun) -> Result<()> {
                 SimdError::new("prepared output length does not fit in i32")
             })?));
             let func = runtime_func(&runtime, func_name)?;
+            runtime.sync_enum_heap_ptr()?;
             func.call(&mut runtime.store, &args, &mut [])
                 .map_err(|error| {
                     SimdError::new(format!("Wasm prepared execution failed: {error}"))
@@ -1205,6 +1630,7 @@ fn run_prepared_bound(bound: &mut BoundPreparedRun) -> Result<()> {
                 }
             }
             let func = runtime_func(&runtime, func_name)?;
+            runtime.sync_enum_heap_ptr()?;
             func.call(&mut runtime.store, &args, &mut [])
                 .map_err(|error| {
                     SimdError::new(format!("Wasm prepared execution failed: {error}"))
@@ -1228,6 +1654,7 @@ fn run_prepared_bound(bound: &mut BoundPreparedRun) -> Result<()> {
                     })?));
                 }
                 let func = runtime_func(&runtime, &leaf.func_name)?;
+                runtime.sync_enum_heap_ptr()?;
                 func.call(&mut runtime.store, &args, &mut results)
                     .map_err(|error| {
                         SimdError::new(format!("Wasm prepared execution failed: {error}"))
@@ -1529,7 +1956,9 @@ impl WasmRuntime {
     }
 
     fn alloc_pinned(&mut self, bytes: usize) -> Result<usize> {
-        let ptr = align_to(self.arena_pinned_end, 16);
+        let pinned_floor = usize::try_from(ENUM_HEAP_START)
+            .map_err(|_| SimdError::new("enum heap start did not fit in usize"))?;
+        let ptr = align_to(self.arena_pinned_end.max(pinned_floor), 16);
         let end = ptr
             .checked_add(bytes)
             .ok_or_else(|| SimdError::new("Wasm arena pinned allocation overflowed"))?;
@@ -1537,6 +1966,26 @@ impl WasmRuntime {
         self.arena_pinned_end = end;
         self.arena_cursor = self.arena_cursor.max(end);
         Ok(ptr)
+    }
+
+    fn sync_enum_heap_ptr(&mut self) -> Result<()> {
+        let pinned_floor = usize::try_from(ENUM_HEAP_START)
+            .map_err(|_| SimdError::new("enum heap start did not fit in usize"))?;
+        let heap_start = align_to(self.arena_pinned_end.max(pinned_floor), 16);
+        ensure_memory_size(
+            &self.memory,
+            &mut self.store,
+            (ENUM_SAVE_STACK_PTR_ADDR as usize) + 4,
+        )?;
+        let heap_start_i32 = i32::try_from(heap_start)
+            .map_err(|_| SimdError::new("enum heap pointer did not fit in i32"))?;
+        let data = self.memory.data_mut(&mut self.store);
+        data[(ENUM_HEAP_PTR_ADDR as usize)..((ENUM_HEAP_PTR_ADDR as usize) + 4)]
+            .copy_from_slice(&heap_start_i32.to_le_bytes());
+        data[(ENUM_SAVE_STACK_PTR_ADDR as usize)..((ENUM_SAVE_STACK_PTR_ADDR as usize) + 4)]
+            .copy_from_slice(&ENUM_SAVE_STACK_START.to_le_bytes());
+        self.arena_cursor = heap_start;
+        Ok(())
     }
 }
 
@@ -4269,6 +4718,7 @@ fn compile_wasm_artifact_checked(
 ) -> Result<WasmArtifact> {
     let higher_order_reports = collect_higher_order_reports(checked_program, origins);
     ensure_backend_first_order_compatibility(&higher_order_reports)?;
+    let wasm_enum_layouts = build_precomputed_wasm_enum_layouts(checked_program)?;
     let entry_result_type = checked_program
         .functions
         .iter()
@@ -4322,7 +4772,7 @@ fn compile_wasm_artifact_checked(
             lowered_map
                 .get(&function.name)
                 .map(|function| &function.kind),
-            Some(LoweredKind::Scalar { .. })
+            Some(LoweredKind::Scalar { .. } | LoweredKind::Structural { .. })
         ) {
             scalar_indices.insert(function.name.clone(), index as u32);
         }
@@ -4348,7 +4798,9 @@ fn compile_wasm_artifact_checked(
             SimdError::new(format!("missing lowered function '{}'", function.name))
         })?;
         let (params, result) = match lowered.kind {
-            LoweredKind::Scalar { .. } => scalar_signature(function)?,
+            LoweredKind::Scalar { .. } | LoweredKind::Structural { .. } => {
+                scalar_signature(function)?
+            }
             LoweredKind::Kernel { .. } => entry_signature(function)?,
         };
         let type_index = add_function_type(&mut types, &params, result.as_ref());
@@ -4379,7 +4831,7 @@ fn compile_wasm_artifact_checked(
             .map(|report| report.intent.clone())
             .unwrap_or(IntentClass::Fallback);
         let wasm_function = match lowered.kind {
-            LoweredKind::Scalar { .. } => {
+            LoweredKind::Scalar { .. } | LoweredKind::Structural { .. } => {
                 optimizer_reports.push(WasmOptimizationReport {
                     function: function.name.clone(),
                     intent: if lowered.tail_loop.is_some() {
@@ -4395,6 +4847,7 @@ fn compile_wasm_artifact_checked(
                     lowered,
                     function,
                     &plan.checked.enum_ctors,
+                    &wasm_enum_layouts,
                     &scalar_indices,
                     &signatures,
                 )?
@@ -4491,6 +4944,7 @@ fn compile_wasm_artifact_checked(
         result: plan.result,
         result_type: entry_result_type,
         enum_ctors: checked_program.enum_ctors.clone(),
+        wasm_enum_layouts,
         grouped_export,
         leaf_exports: plan.leaf_exports,
         optimizer_reports,
@@ -4834,7 +5288,7 @@ fn compile_grouped_kernel_function(
                     }))
                 })
                 .collect::<Result<Option<Vec<_>>>>()?,
-            LoweredKind::Scalar { .. } => None,
+            LoweredKind::Scalar { .. } | LoweredKind::Structural { .. } => None,
         };
         let Some(clauses) = clauses else {
             return Ok(None);
@@ -5340,6 +5794,7 @@ fn compile_grouped_kernel_function(
 
     let scalar_locals = kernel_scalar_local_map(&reference.clauses, &abi_params, &lane_locals);
     let empty_enum_ctors = BTreeMap::<String, EnumCtorInfo>::new();
+    let empty_wasm_enum_layouts = BTreeMap::<String, WasmEnumLayout>::new();
 
     for clause_index in 0..reference.clauses.len() {
         let reference_clause = &reference.clauses[clause_index];
@@ -5350,6 +5805,7 @@ fn compile_grouped_kernel_function(
                 &mut function,
                 &reference_clause.patterns,
                 &empty_enum_ctors,
+                &empty_wasm_enum_layouts,
                 None,
             )?;
             for ((leaf, output), output_ptr_loop_local) in prepared_leaves
@@ -5365,6 +5821,7 @@ fn compile_grouped_kernel_function(
                     scalar_indices,
                     signatures,
                     &empty_enum_ctors,
+                    &empty_wasm_enum_layouts,
                     None,
                     &cleanup_hoisted_locals,
                     &cleanup_inline_bindings,
@@ -5403,6 +5860,7 @@ fn compile_grouped_kernel_function(
                     scalar_indices,
                     signatures,
                     &empty_enum_ctors,
+                    &empty_wasm_enum_layouts,
                     None,
                     &cleanup_hoisted_locals,
                     &cleanup_inline_bindings,
@@ -5603,7 +6061,9 @@ fn try_inline_grouped_leaf_call(
         return Ok(None);
     }
     let clauses = match &lowered.kind {
-        LoweredKind::Scalar { clauses } | LoweredKind::Kernel { clauses, .. } => clauses,
+        LoweredKind::Scalar { clauses }
+        | LoweredKind::Structural { clauses }
+        | LoweredKind::Kernel { clauses, .. } => clauses,
     };
     if clauses.len() != 1 {
         return Ok(None);
@@ -5930,15 +6390,12 @@ fn compile_scalar_function(
     lowered: &LoweredFunction,
     checked: &CheckedFunction,
     enum_ctors: &BTreeMap<String, EnumCtorInfo>,
+    wasm_enum_layouts: &BTreeMap<String, WasmEnumLayout>,
     scalar_indices: &BTreeMap<String, u32>,
     signatures: &BTreeMap<String, &CheckedFunction>,
 ) -> Result<Function> {
     let (param_types, result_ty) = checked.signature.ty.fun_parts();
-    let tail_loop = if param_types.iter().any(is_wasm_bulk_like_type) {
-        None
-    } else {
-        lowered.tail_loop.as_ref()
-    };
+    let tail_loop = lowered.tail_loop.as_ref();
     let result_val_type = match result_ty {
         Type::Scalar(prim) => wasm_val_type(prim),
         Type::Named(name, args) if is_wasm_enum_named_type(&name, &args) => ValType::I32,
@@ -5951,27 +6408,37 @@ fn compile_scalar_function(
     };
     let mut locals = Vec::<(u32, ValType)>::new();
     let mut next_local = 0u32;
+    let mut param_local_ranges = Vec::<(u32, u32)>::new();
     for ty in &param_types {
-        next_local += if is_wasm_bulk_like_type(ty) { 2 } else { 1 };
+        let width = if is_wasm_bulk_like_type(ty) { 2 } else { 1 };
+        param_local_ranges.push((next_local, width));
+        next_local += width;
     }
     let temp_locals = if tail_loop.is_some() {
         let mut temp = Vec::new();
-        for val_type in param_types.iter().map(|ty| match ty {
-            Type::Scalar(prim) => Ok(wasm_val_type(*prim)),
-            Type::Named(name, args) if is_wasm_enum_named_type(name, args) => Ok(ValType::I32),
-            Type::Record(_) => Err(SimdError::new(format!(
-                "scalar function '{}' has unsupported record parameters",
-                checked.name
-            ))),
-            other => Err(SimdError::new(format!(
-                "scalar function '{}' has unsupported parameter {:?}",
-                checked.name, other
-            ))),
-        }) {
-            let val_type = val_type?;
-            temp.push(next_local);
+        for ty in &param_types {
+            let start_local = next_local;
+            if is_wasm_bulk_like_type(ty) {
+                next_local += 2;
+                locals.push((2, ValType::I32));
+                temp.push((start_local, 2));
+                continue;
+            }
+            let val_type = match ty {
+                Type::Scalar(prim) => Ok(wasm_val_type(*prim)),
+                Type::Named(name, args) if is_wasm_enum_named_type(name, args) => Ok(ValType::I32),
+                Type::Record(_) => Err(SimdError::new(format!(
+                    "scalar function '{}' has unsupported record parameters",
+                    checked.name
+                ))),
+                other => Err(SimdError::new(format!(
+                    "scalar function '{}' has unsupported parameter {:?}",
+                    checked.name, other
+                ))),
+            }?;
             next_local += 1;
             locals.push((1, val_type));
+            temp.push((start_local, 1));
         }
         temp
     } else {
@@ -5997,17 +6464,77 @@ fn compile_scalar_function(
     let enum_base_tmp_local = next_local;
     next_local += 1;
     locals.push((1, ValType::I32));
+    let enum_scratch_sp_local = next_local;
+    next_local += 1;
+    locals.push((1, ValType::I32));
+    let enum_alloc_end_local = next_local;
+    next_local += 1;
+    locals.push((1, ValType::I32));
+    let enum_alloc_capacity_local = next_local;
+    next_local += 1;
+    locals.push((1, ValType::I32));
+    let enum_alloc_delta_local = next_local;
+    next_local += 1;
+    locals.push((1, ValType::I32));
+    let enum_aux0_local = next_local;
+    next_local += 1;
+    locals.push((1, ValType::I32));
+    let enum_aux1_local = next_local;
+    next_local += 1;
+    locals.push((1, ValType::I32));
+    let enum_aux2_local = next_local;
+    next_local += 1;
+    locals.push((1, ValType::I32));
+    let enum_aux3_local = next_local;
+    next_local += 1;
+    locals.push((1, ValType::I32));
+    let enum_aux4_local = next_local;
+    next_local += 1;
+    locals.push((1, ValType::I32));
+    let enum_aux5_local = next_local;
+    next_local += 1;
+    locals.push((1, ValType::I32));
+    let enum_aux6_local = next_local;
+    next_local += 1;
+    locals.push((1, ValType::I32));
+    let enum_aux7_local = next_local;
+    next_local += 1;
+    locals.push((1, ValType::I32));
+    let enum_aux8_local = next_local;
+    next_local += 1;
+    locals.push((1, ValType::I32));
+    let mut enum_child_locals = [0u32; 8];
+    for local in &mut enum_child_locals {
+        *local = next_local;
+        next_local += 1;
+        locals.push((1, ValType::I32));
+    }
     let enum_state = EnumWasmState {
         ptr_local: enum_ptr_local,
         base_local: enum_base_local,
         save_sp_local: enum_save_sp_local,
         base_tmp_local: enum_base_tmp_local,
+        scratch_sp_local: enum_scratch_sp_local,
+        alloc_end_local: enum_alloc_end_local,
+        alloc_capacity_local: enum_alloc_capacity_local,
+        alloc_delta_local: enum_alloc_delta_local,
+        aux0_local: enum_aux0_local,
+        aux1_local: enum_aux1_local,
+        aux2_local: enum_aux2_local,
+        aux3_local: enum_aux3_local,
+        aux4_local: enum_aux4_local,
+        aux5_local: enum_aux5_local,
+        aux6_local: enum_aux6_local,
+        aux7_local: enum_aux7_local,
+        aux8_local: enum_aux8_local,
+        child_locals: enum_child_locals,
     };
 
     let mut clause_locals = BTreeMap::<usize, BTreeMap<String, u32>>::new();
     let mut shared_named_locals = BTreeMap::<String, (u32, Type)>::new();
     match (&lowered.kind, tail_loop) {
-        (LoweredKind::Scalar { clauses: _ }, Some(tail_loop)) => {
+        (LoweredKind::Scalar { clauses: _ }, Some(tail_loop))
+        | (LoweredKind::Structural { clauses: _ }, Some(tail_loop)) => {
             for clause in &tail_loop.clauses {
                 let map = build_clause_local_map(
                     &clause.patterns,
@@ -6019,7 +6546,8 @@ fn compile_scalar_function(
                 clause_locals.insert(clause as *const _ as usize, map);
             }
         }
-        (LoweredKind::Scalar { clauses }, None) => {
+        (LoweredKind::Scalar { clauses }, None)
+        | (LoweredKind::Structural { clauses }, None) => {
             for clause in clauses {
                 let map = build_clause_local_map(
                     &clause.patterns,
@@ -6039,11 +6567,18 @@ fn compile_scalar_function(
         }
     }
     let mut function = Function::new(locals);
+    function.instruction(&Instruction::I32Const(ENUM_SAVE_STACK_PTR_ADDR as i32));
+    function.instruction(&Instruction::I32Load(memarg(0, 2)));
+    function.instruction(&Instruction::LocalTee(enum_state.scratch_sp_local));
+    function.instruction(&Instruction::I32Eqz);
+    function.instruction(&Instruction::If(BlockType::Empty));
     function.instruction(&Instruction::I32Const(ENUM_SAVE_STACK_START));
-    function.instruction(&Instruction::LocalSet(enum_state.save_sp_local));
+    function.instruction(&Instruction::LocalSet(enum_state.scratch_sp_local));
+    function.instruction(&Instruction::End);
 
     match (&lowered.kind, tail_loop) {
-        (LoweredKind::Scalar { clauses: _ }, Some(tail_loop)) => {
+        (LoweredKind::Scalar { clauses: _ }, Some(tail_loop))
+        | (LoweredKind::Structural { clauses: _ }, Some(tail_loop)) => {
             let result_local =
                 result_local.ok_or_else(|| SimdError::new("missing tail-loop result local"))?;
             function.instruction(&Instruction::Block(BlockType::Empty));
@@ -6057,6 +6592,7 @@ fn compile_scalar_function(
                     &mut function,
                     &clause.patterns,
                     enum_ctors,
+                    wasm_enum_layouts,
                     Some(enum_state),
                 )?;
                 emit_clause_bindings(
@@ -6064,11 +6600,12 @@ fn compile_scalar_function(
                     &clause.patterns,
                     &locals,
                     enum_ctors,
+                    wasm_enum_layouts,
                     Some(enum_state),
                 )?;
                 match &clause.action {
                     TailAction::Continue { args } => {
-                        for (temp_local, arg) in temp_locals.iter().zip(args) {
+                        for ((temp_local, width), arg) in temp_locals.iter().zip(args) {
                             compile_scalar_ir_expr(
                                 &mut function,
                                 arg,
@@ -6076,13 +6613,23 @@ fn compile_scalar_function(
                                 scalar_indices,
                                 signatures,
                                 enum_ctors,
+                                wasm_enum_layouts,
                                 Some(enum_state),
                             )?;
+                            if *width == 2 {
+                                function.instruction(&Instruction::LocalSet(*temp_local + 1));
+                            }
                             function.instruction(&Instruction::LocalSet(*temp_local));
                         }
-                        for (index, temp_local) in temp_locals.iter().enumerate() {
+                        for ((temp_local, width), (param_local, _)) in
+                            temp_locals.iter().zip(param_local_ranges.iter())
+                        {
                             function.instruction(&Instruction::LocalGet(*temp_local));
-                            function.instruction(&Instruction::LocalSet(index as u32));
+                            function.instruction(&Instruction::LocalSet(*param_local));
+                            if *width == 2 {
+                                function.instruction(&Instruction::LocalGet(*temp_local + 1));
+                                function.instruction(&Instruction::LocalSet(*param_local + 1));
+                            }
                         }
                         function.instruction(&Instruction::Br(1));
                     }
@@ -6094,6 +6641,7 @@ fn compile_scalar_function(
                             scalar_indices,
                             signatures,
                             enum_ctors,
+                            wasm_enum_layouts,
                             Some(enum_state),
                         )?;
                     }
@@ -6105,7 +6653,8 @@ fn compile_scalar_function(
             function.instruction(&Instruction::End);
             function.instruction(&Instruction::LocalGet(result_local));
         }
-        (LoweredKind::Scalar { clauses }, None) => {
+        (LoweredKind::Scalar { clauses }, None)
+        | (LoweredKind::Structural { clauses }, None) => {
             for clause in clauses {
                 let locals = clause_locals
                     .get(&(clause as *const _ as usize))
@@ -6116,6 +6665,7 @@ fn compile_scalar_function(
                         &mut function,
                         &clause.patterns,
                         enum_ctors,
+                        wasm_enum_layouts,
                         Some(enum_state),
                     )?;
                     emit_clause_bindings(
@@ -6123,6 +6673,7 @@ fn compile_scalar_function(
                         &clause.patterns,
                         &locals,
                         enum_ctors,
+                        wasm_enum_layouts,
                         Some(enum_state),
                     )?;
                     emit_tail_position_scalar_return(
@@ -6132,6 +6683,7 @@ fn compile_scalar_function(
                         scalar_indices,
                         signatures,
                         enum_ctors,
+                        wasm_enum_layouts,
                         Some(enum_state),
                     )?;
                     function.instruction(&Instruction::End);
@@ -6141,6 +6693,7 @@ fn compile_scalar_function(
                         &clause.patterns,
                         &locals,
                         enum_ctors,
+                        wasm_enum_layouts,
                         Some(enum_state),
                     )?;
                     emit_tail_position_scalar_return(
@@ -6150,6 +6703,7 @@ fn compile_scalar_function(
                         scalar_indices,
                         signatures,
                         enum_ctors,
+                        wasm_enum_layouts,
                         Some(enum_state),
                     )?;
                     break;
@@ -6654,6 +7208,7 @@ fn compile_kernel_entry(
 
     let scalar_locals = kernel_scalar_local_map(&clauses, &abi_params, &lane_locals);
     let empty_enum_ctors = BTreeMap::<String, EnumCtorInfo>::new();
+    let empty_wasm_enum_layouts = BTreeMap::<String, WasmEnumLayout>::new();
     for clause in &clauses {
         let clause_key = clause as *const _ as usize;
         let locals = scalar_locals.get(&clause_key).cloned().unwrap_or_default();
@@ -6662,6 +7217,7 @@ fn compile_kernel_entry(
                 &mut function,
                 &clause.patterns,
                 &empty_enum_ctors,
+                &empty_wasm_enum_layouts,
                 None,
             )?;
             function.instruction(&Instruction::LocalGet(output_ptr_loop_local));
@@ -6672,6 +7228,7 @@ fn compile_kernel_entry(
                 scalar_indices,
                 signatures,
                 &empty_enum_ctors,
+                &empty_wasm_enum_layouts,
                 None,
                 &cleanup_hoisted_locals,
                 &cleanup_inline_bindings,
@@ -6702,6 +7259,7 @@ fn compile_kernel_entry(
                 scalar_indices,
                 signatures,
                 &empty_enum_ctors,
+                &empty_wasm_enum_layouts,
                 None,
                 &cleanup_hoisted_locals,
                 &cleanup_inline_bindings,
@@ -7077,6 +7635,7 @@ fn emit_scalar_hoists(
             scalar_indices,
             signatures,
             &empty_enum_ctors,
+            &BTreeMap::new(),
             None,
             &emitted,
             &inline_bindings,
@@ -7093,22 +7652,498 @@ struct EnumWasmState {
     base_local: u32,
     save_sp_local: u32,
     base_tmp_local: u32,
+    scratch_sp_local: u32,
+    alloc_end_local: u32,
+    alloc_capacity_local: u32,
+    alloc_delta_local: u32,
+    aux0_local: u32,
+    aux1_local: u32,
+    aux2_local: u32,
+    aux3_local: u32,
+    aux4_local: u32,
+    aux5_local: u32,
+    aux6_local: u32,
+    aux7_local: u32,
+    aux8_local: u32,
+    child_locals: [u32; 8],
 }
 
 const ENUM_HEAP_PTR_ADDR: u32 = 0;
+const ENUM_SAVE_STACK_PTR_ADDR: u32 = 4;
 const ENUM_HEAP_START: i32 = 4096;
 const ENUM_SAVE_STACK_START: i32 = 2048;
-const ENUM_NODE_HEADER_BYTES: i32 = 8;
-const ENUM_FIELD_SLOT_BYTES: i32 = 8;
+const ENUM_REF_CELL_BYTES: i32 = 8;
+const ENUM_REF_HEADER_OFFSET: u64 = 0;
+const ENUM_REF_ROOT_OFFSET: u64 = 4;
+const ENUM_HEADER_ENUM_ID_OFFSET: u64 = 0;
+const ENUM_HEADER_NODE_COUNT_OFFSET: u64 = 4;
+const ENUM_HEADER_TAGS_PTR_OFFSET: u64 = 8;
+const ENUM_HEADER_ENDS_PTR_OFFSET: u64 = 12;
+const ENUM_HEADER_SLOTS_PTR_OFFSET: u64 = 16;
+const ENUM_HEADER_CTOR_TABLE_PTR_OFFSET: u64 = 20;
+const ENUM_HEADER_BYTES: i32 = 24;
+const ENUM_CTOR_TABLE_ENTRY_BYTES: i32 = 8;
+const ENUM_CTOR_TABLE_ROWS_PTR_OFFSET: u64 = 0;
+const ENUM_CTOR_TABLE_ROW_COUNT_OFFSET: u64 = 4;
+const ENUM_TAG_BYTES: i32 = 2;
+const ENUM_END_BYTES: i32 = 4;
+const ENUM_SLOT_BYTES: i32 = 4;
 
-fn enum_field_slot_offset(field_index: usize) -> Result<u64> {
-    let index = u64::try_from(field_index).map_err(|_| {
-        SimdError::new(format!(
-            "enum field index {} does not fit Wasm addressing",
-            field_index
-        ))
-    })?;
-    Ok(8 + index * 8)
+fn emit_enum_alloc(function: &mut Function, enum_state: EnumWasmState, bytes: i32) {
+    function.instruction(&Instruction::I32Const(ENUM_HEAP_PTR_ADDR as i32));
+    function.instruction(&Instruction::I32Load(memarg(0, 2)));
+    function.instruction(&Instruction::LocalSet(enum_state.ptr_local));
+    function.instruction(&Instruction::LocalGet(enum_state.ptr_local));
+    function.instruction(&Instruction::I32Eqz);
+    function.instruction(&Instruction::If(BlockType::Empty));
+    function.instruction(&Instruction::I32Const(ENUM_HEAP_START));
+    function.instruction(&Instruction::LocalSet(enum_state.ptr_local));
+    function.instruction(&Instruction::End);
+    function.instruction(&Instruction::LocalGet(enum_state.ptr_local));
+    function.instruction(&Instruction::I32Const(bytes));
+    function.instruction(&Instruction::I32Add);
+    function.instruction(&Instruction::LocalSet(enum_state.alloc_end_local));
+    function.instruction(&Instruction::MemorySize(0));
+    function.instruction(&Instruction::I32Const(16));
+    function.instruction(&Instruction::I32Shl);
+    function.instruction(&Instruction::LocalSet(enum_state.alloc_capacity_local));
+    function.instruction(&Instruction::LocalGet(enum_state.alloc_end_local));
+    function.instruction(&Instruction::LocalGet(enum_state.alloc_capacity_local));
+    function.instruction(&Instruction::I32GtU);
+    function.instruction(&Instruction::If(BlockType::Empty));
+    function.instruction(&Instruction::LocalGet(enum_state.alloc_end_local));
+    function.instruction(&Instruction::LocalGet(enum_state.alloc_capacity_local));
+    function.instruction(&Instruction::I32Sub);
+    function.instruction(&Instruction::I32Const(65535));
+    function.instruction(&Instruction::I32Add);
+    function.instruction(&Instruction::I32Const(16));
+    function.instruction(&Instruction::I32ShrU);
+    function.instruction(&Instruction::LocalSet(enum_state.alloc_delta_local));
+    function.instruction(&Instruction::LocalGet(enum_state.alloc_delta_local));
+    function.instruction(&Instruction::MemoryGrow(0));
+    function.instruction(&Instruction::I32Const(-1));
+    function.instruction(&Instruction::I32Eq);
+    function.instruction(&Instruction::If(BlockType::Empty));
+    function.instruction(&Instruction::Unreachable);
+    function.instruction(&Instruction::End);
+    function.instruction(&Instruction::End);
+    function.instruction(&Instruction::I32Const(ENUM_HEAP_PTR_ADDR as i32));
+    function.instruction(&Instruction::LocalGet(enum_state.alloc_end_local));
+    function.instruction(&Instruction::I32Store(memarg(0, 2)));
+}
+
+fn emit_enum_alloc_dynamic(function: &mut Function, enum_state: EnumWasmState, bytes_local: u32) {
+    function.instruction(&Instruction::I32Const(ENUM_HEAP_PTR_ADDR as i32));
+    function.instruction(&Instruction::I32Load(memarg(0, 2)));
+    function.instruction(&Instruction::LocalSet(enum_state.ptr_local));
+    function.instruction(&Instruction::LocalGet(enum_state.ptr_local));
+    function.instruction(&Instruction::I32Eqz);
+    function.instruction(&Instruction::If(BlockType::Empty));
+    function.instruction(&Instruction::I32Const(ENUM_HEAP_START));
+    function.instruction(&Instruction::LocalSet(enum_state.ptr_local));
+    function.instruction(&Instruction::End);
+    function.instruction(&Instruction::LocalGet(enum_state.ptr_local));
+    function.instruction(&Instruction::LocalGet(bytes_local));
+    function.instruction(&Instruction::I32Add);
+    function.instruction(&Instruction::LocalSet(enum_state.alloc_end_local));
+    function.instruction(&Instruction::MemorySize(0));
+    function.instruction(&Instruction::I32Const(16));
+    function.instruction(&Instruction::I32Shl);
+    function.instruction(&Instruction::LocalSet(enum_state.alloc_capacity_local));
+    function.instruction(&Instruction::LocalGet(enum_state.alloc_end_local));
+    function.instruction(&Instruction::LocalGet(enum_state.alloc_capacity_local));
+    function.instruction(&Instruction::I32GtU);
+    function.instruction(&Instruction::If(BlockType::Empty));
+    function.instruction(&Instruction::LocalGet(enum_state.alloc_end_local));
+    function.instruction(&Instruction::LocalGet(enum_state.alloc_capacity_local));
+    function.instruction(&Instruction::I32Sub);
+    function.instruction(&Instruction::I32Const(65535));
+    function.instruction(&Instruction::I32Add);
+    function.instruction(&Instruction::I32Const(16));
+    function.instruction(&Instruction::I32ShrU);
+    function.instruction(&Instruction::LocalSet(enum_state.alloc_delta_local));
+    function.instruction(&Instruction::LocalGet(enum_state.alloc_delta_local));
+    function.instruction(&Instruction::MemoryGrow(0));
+    function.instruction(&Instruction::I32Const(-1));
+    function.instruction(&Instruction::I32Eq);
+    function.instruction(&Instruction::If(BlockType::Empty));
+    function.instruction(&Instruction::Unreachable);
+    function.instruction(&Instruction::End);
+    function.instruction(&Instruction::End);
+    function.instruction(&Instruction::I32Const(ENUM_HEAP_PTR_ADDR as i32));
+    function.instruction(&Instruction::LocalGet(enum_state.alloc_end_local));
+    function.instruction(&Instruction::I32Store(memarg(0, 2)));
+}
+
+fn emit_enum_load_header_root(
+    function: &mut Function,
+    value_local: u32,
+    enum_state: EnumWasmState,
+) {
+    function.instruction(&Instruction::LocalGet(value_local));
+    function.instruction(&Instruction::I32Load(memarg(ENUM_REF_HEADER_OFFSET, 2)));
+    function.instruction(&Instruction::LocalSet(enum_state.base_local));
+    function.instruction(&Instruction::LocalGet(value_local));
+    function.instruction(&Instruction::I32Load(memarg(ENUM_REF_ROOT_OFFSET, 2)));
+    function.instruction(&Instruction::LocalSet(enum_state.save_sp_local));
+}
+
+fn emit_enum_tag_load_from_value(
+    function: &mut Function,
+    value_local: u32,
+    enum_state: EnumWasmState,
+) {
+    emit_enum_load_header_root(function, value_local, enum_state);
+    function.instruction(&Instruction::LocalGet(enum_state.base_local));
+    function.instruction(&Instruction::I32Load(memarg(ENUM_HEADER_TAGS_PTR_OFFSET, 2)));
+    function.instruction(&Instruction::LocalGet(enum_state.save_sp_local));
+    function.instruction(&Instruction::I32Const(ENUM_TAG_BYTES));
+    function.instruction(&Instruction::I32Mul);
+    function.instruction(&Instruction::I32Add);
+    function.instruction(&Instruction::I32Load16U(memarg(0, 1)));
+}
+
+fn emit_enum_child_root(
+    function: &mut Function,
+    value_local: u32,
+    recursive_slot: usize,
+    enum_state: EnumWasmState,
+) -> Result<()> {
+    emit_enum_load_header_root(function, value_local, enum_state);
+    function.instruction(&Instruction::LocalGet(enum_state.save_sp_local));
+    function.instruction(&Instruction::I32Const(1));
+    function.instruction(&Instruction::I32Add);
+    function.instruction(&Instruction::LocalSet(enum_state.base_tmp_local));
+    for _ in 0..recursive_slot {
+        function.instruction(&Instruction::LocalGet(enum_state.base_local));
+        function.instruction(&Instruction::I32Load(memarg(ENUM_HEADER_ENDS_PTR_OFFSET, 2)));
+        function.instruction(&Instruction::LocalGet(enum_state.base_tmp_local));
+        function.instruction(&Instruction::I32Const(ENUM_END_BYTES));
+        function.instruction(&Instruction::I32Mul);
+        function.instruction(&Instruction::I32Add);
+        function.instruction(&Instruction::I32Load(memarg(0, 2)));
+        function.instruction(&Instruction::LocalSet(enum_state.base_tmp_local));
+    }
+    Ok(())
+}
+
+fn emit_enum_ref_from_header_root(function: &mut Function, enum_state: EnumWasmState) {
+    emit_enum_alloc(function, enum_state, ENUM_REF_CELL_BYTES);
+    function.instruction(&Instruction::LocalGet(enum_state.ptr_local));
+    function.instruction(&Instruction::LocalGet(enum_state.base_local));
+    function.instruction(&Instruction::I32Store(memarg(ENUM_REF_HEADER_OFFSET, 2)));
+    function.instruction(&Instruction::LocalGet(enum_state.ptr_local));
+    function.instruction(&Instruction::LocalGet(enum_state.base_tmp_local));
+    function.instruction(&Instruction::I32Store(memarg(ENUM_REF_ROOT_OFFSET, 2)));
+    function.instruction(&Instruction::LocalGet(enum_state.ptr_local));
+}
+
+fn emit_enum_row_base_ptr_from_header(
+    function: &mut Function,
+    header_local: u32,
+    _enum_layout: &WasmEnumLayout,
+    ctor_layout: &WasmEnumCtorLayout,
+    _enum_state: EnumWasmState,
+) {
+    function.instruction(&Instruction::LocalGet(header_local));
+    function.instruction(&Instruction::I32Load(memarg(ENUM_HEADER_CTOR_TABLE_PTR_OFFSET, 2)));
+    function.instruction(&Instruction::I32Const(
+        i32::from(ctor_layout.tag) * ENUM_CTOR_TABLE_ENTRY_BYTES
+            + ENUM_CTOR_TABLE_ROWS_PTR_OFFSET as i32,
+    ));
+    function.instruction(&Instruction::I32Add);
+    function.instruction(&Instruction::I32Load(memarg(0, 2)));
+}
+
+fn emit_store_type_at_address(
+    function: &mut Function,
+    ty: &Type,
+    enum_state: EnumWasmState,
+) -> Result<()> {
+    match ty {
+        Type::Scalar(Prim::I32 | Prim::Char) => {
+            function.instruction(&Instruction::I32Store(memarg(0, 2)));
+        }
+        Type::Scalar(Prim::I64) => {
+            function.instruction(&Instruction::I64Store(memarg(0, 3)));
+        }
+        Type::Scalar(Prim::F32) => {
+            function.instruction(&Instruction::F32Store(memarg(0, 2)));
+        }
+        Type::Scalar(Prim::F64) => {
+            function.instruction(&Instruction::F64Store(memarg(0, 3)));
+        }
+        Type::Named(name, args) if is_wasm_enum_named_type(name, args) => {
+            function.instruction(&Instruction::I32Store(memarg(0, 2)));
+        }
+        Type::Named(name, args) if is_wasm_string_named_type(name, args) => {
+            function.instruction(&Instruction::LocalSet(enum_state.ptr_local));
+            function.instruction(&Instruction::LocalSet(enum_state.base_local));
+            function.instruction(&Instruction::LocalTee(enum_state.base_tmp_local));
+            function.instruction(&Instruction::LocalGet(enum_state.base_local));
+            function.instruction(&Instruction::I32Store(memarg(0, 2)));
+            function.instruction(&Instruction::LocalGet(enum_state.base_tmp_local));
+            function.instruction(&Instruction::LocalGet(enum_state.ptr_local));
+            function.instruction(&Instruction::I32Store(memarg(4, 2)));
+        }
+        other => {
+            return Err(SimdError::new(format!(
+                "Wasm scratch store does not support value type {:?}",
+                other
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn emit_load_type_from_address(
+    function: &mut Function,
+    ty: &Type,
+    enum_state: EnumWasmState,
+) -> Result<()> {
+    match ty {
+        Type::Scalar(Prim::I32 | Prim::Char) => {
+            function.instruction(&Instruction::I32Load(memarg(0, 2)));
+        }
+        Type::Scalar(Prim::I64) => {
+            function.instruction(&Instruction::I64Load(memarg(0, 3)));
+        }
+        Type::Scalar(Prim::F32) => {
+            function.instruction(&Instruction::F32Load(memarg(0, 2)));
+        }
+        Type::Scalar(Prim::F64) => {
+            function.instruction(&Instruction::F64Load(memarg(0, 3)));
+        }
+        Type::Named(name, args) if is_wasm_enum_named_type(name, args) => {
+            function.instruction(&Instruction::I32Load(memarg(0, 2)));
+        }
+        Type::Named(name, args) if is_wasm_string_named_type(name, args) => {
+            function.instruction(&Instruction::LocalTee(enum_state.base_tmp_local));
+            function.instruction(&Instruction::I32Load(memarg(0, 2)));
+            function.instruction(&Instruction::LocalGet(enum_state.base_tmp_local));
+            function.instruction(&Instruction::I32Load(memarg(4, 2)));
+        }
+        other => {
+            return Err(SimdError::new(format!(
+                "Wasm scratch load does not support value type {:?}",
+                other
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn wasm_saved_value_bytes(ty: &Type) -> Result<i32> {
+    match ty {
+        Type::Scalar(Prim::I32 | Prim::Char) => Ok(4),
+        Type::Scalar(Prim::I64 | Prim::F64) => Ok(8),
+        Type::Scalar(Prim::F32) => Ok(4),
+        Type::Named(name, args) if is_wasm_enum_named_type(name, args) => Ok(4),
+        Type::Named(name, args) if is_wasm_string_named_type(name, args) => Ok(8),
+        other => Err(SimdError::new(format!(
+            "Wasm scratch storage does not support value type {:?}",
+            other
+        ))),
+    }
+}
+
+fn emit_tape_enum_field_store(
+    function: &mut Function,
+    field_layout: &WasmEnumFieldLayout,
+    enum_state: EnumWasmState,
+) -> Result<()> {
+    match &field_layout.ty {
+        Type::Scalar(Prim::I32 | Prim::Char) => {
+            function.instruction(&Instruction::I32Store(memarg(0, 2)));
+        }
+        Type::Scalar(Prim::I64) => {
+            function.instruction(&Instruction::I64Store(memarg(0, 3)));
+        }
+        Type::Scalar(Prim::F32) => {
+            function.instruction(&Instruction::F32Store(memarg(0, 2)));
+        }
+        Type::Scalar(Prim::F64) => {
+            function.instruction(&Instruction::F64Store(memarg(0, 3)));
+        }
+        Type::Named(name, args) if is_wasm_enum_named_type(name, args) => {
+            function.instruction(&Instruction::I32Store(memarg(0, 2)));
+        }
+        Type::Named(name, args) if is_wasm_string_named_type(name, args) => {
+            function.instruction(&Instruction::LocalSet(enum_state.ptr_local));
+            function.instruction(&Instruction::LocalSet(enum_state.base_local));
+            function.instruction(&Instruction::LocalTee(enum_state.base_tmp_local));
+            function.instruction(&Instruction::LocalGet(enum_state.base_local));
+            function.instruction(&Instruction::I32Store(memarg(0, 2)));
+            function.instruction(&Instruction::LocalGet(enum_state.base_tmp_local));
+            function.instruction(&Instruction::LocalGet(enum_state.ptr_local));
+            function.instruction(&Instruction::I32Store(memarg(4, 2)));
+        }
+        other => {
+            return Err(SimdError::new(format!(
+                "Wasm enum field store does not support field type {:?}",
+                other
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn emit_enum_field_load_with_layout(
+    function: &mut Function,
+    value_local: u32,
+    enum_layout: &WasmEnumLayout,
+    ctor_layout: &WasmEnumCtorLayout,
+    field_index: usize,
+    field_ty: &Type,
+    enum_state: EnumWasmState,
+) -> Result<()> {
+    if let Some(recursive_slot) = ctor_layout
+        .recursive_field_indices
+        .iter()
+        .position(|index| *index == field_index)
+    {
+        emit_enum_child_root(function, value_local, recursive_slot, enum_state)?;
+        emit_enum_ref_from_header_root(function, enum_state);
+        return Ok(());
+    }
+    let field_layout = ctor_layout
+        .non_recursive_fields
+        .iter()
+        .find(|layout| layout.source_index == field_index)
+        .ok_or_else(|| {
+            SimdError::new(format!(
+                "constructor '{}' is missing Wasm field layout for source field {}",
+                ctor_layout.ctor_name, field_index
+            ))
+        })?;
+    emit_enum_load_header_root(function, value_local, enum_state);
+    function.instruction(&Instruction::LocalGet(enum_state.base_local));
+    function.instruction(&Instruction::I32Load(memarg(ENUM_HEADER_SLOTS_PTR_OFFSET, 2)));
+    function.instruction(&Instruction::LocalGet(enum_state.save_sp_local));
+    function.instruction(&Instruction::I32Const(ENUM_SLOT_BYTES));
+    function.instruction(&Instruction::I32Mul);
+    function.instruction(&Instruction::I32Add);
+    function.instruction(&Instruction::I32Load(memarg(0, 2)));
+    function.instruction(&Instruction::LocalSet(enum_state.base_tmp_local));
+    function.instruction(&Instruction::LocalGet(enum_state.base_tmp_local));
+    function.instruction(&Instruction::LocalSet(enum_state.aux2_local));
+    emit_enum_row_base_ptr_from_header(
+        function,
+        enum_state.base_local,
+        enum_layout,
+        ctor_layout,
+        enum_state,
+    );
+    function.instruction(&Instruction::LocalGet(enum_state.aux2_local));
+    function.instruction(&Instruction::I32Const(ctor_layout.row_stride as i32));
+    function.instruction(&Instruction::I32Mul);
+    function.instruction(&Instruction::I32Add);
+    if field_layout.offset != 0 {
+        function.instruction(&Instruction::I32Const(field_layout.offset as i32));
+        function.instruction(&Instruction::I32Add);
+    }
+    match field_ty {
+        Type::Scalar(Prim::I32 | Prim::Char) => {
+            function.instruction(&Instruction::I32Load(memarg(0, 2)));
+        }
+        Type::Scalar(Prim::I64) => {
+            function.instruction(&Instruction::I64Load(memarg(0, 3)));
+        }
+        Type::Scalar(Prim::F32) => {
+            function.instruction(&Instruction::F32Load(memarg(0, 2)));
+        }
+        Type::Scalar(Prim::F64) => {
+            function.instruction(&Instruction::F64Load(memarg(0, 3)));
+        }
+        Type::Named(name, args) if is_wasm_enum_named_type(name, args) => {
+            function.instruction(&Instruction::I32Load(memarg(0, 2)));
+        }
+        Type::Named(name, args) if is_wasm_string_named_type(name, args) => {
+            function.instruction(&Instruction::I32Load(memarg(0, 2)));
+            emit_enum_row_base_ptr_from_header(
+                function,
+                enum_state.base_local,
+                enum_layout,
+                ctor_layout,
+                enum_state,
+            );
+            function.instruction(&Instruction::LocalGet(enum_state.aux2_local));
+            function.instruction(&Instruction::I32Const(ctor_layout.row_stride as i32));
+            function.instruction(&Instruction::I32Mul);
+            function.instruction(&Instruction::I32Add);
+            function.instruction(&Instruction::I32Load(memarg(
+                u64::from(field_layout.offset) + 4,
+                2,
+            )));
+        }
+        other => {
+            return Err(SimdError::new(format!(
+                "Wasm enum field load does not support field type {:?}",
+                other
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn emit_enum_field_as_condition_value_with_layout(
+    function: &mut Function,
+    value_local: u32,
+    enum_layout: &WasmEnumLayout,
+    ctor_layout: &WasmEnumCtorLayout,
+    field_index: usize,
+    field_ty: &Type,
+    enum_state: EnumWasmState,
+) -> Result<()> {
+    emit_enum_field_load_with_layout(
+        function,
+        value_local,
+        enum_layout,
+        ctor_layout,
+        field_index,
+        field_ty,
+        enum_state,
+    )
+}
+
+fn emit_enum_field_load(
+    function: &mut Function,
+    value_local: u32,
+    enum_layout: &WasmEnumLayout,
+    ctor_layout: &WasmEnumCtorLayout,
+    field_index: usize,
+    field_ty: &Type,
+    enum_state: EnumWasmState,
+) -> Result<()> {
+    emit_enum_field_load_with_layout(
+        function,
+        value_local,
+        enum_layout,
+        ctor_layout,
+        field_index,
+        field_ty,
+        enum_state,
+    )
+}
+
+fn emit_enum_field_as_condition_value(
+    function: &mut Function,
+    value_local: u32,
+    enum_layout: &WasmEnumLayout,
+    ctor_layout: &WasmEnumCtorLayout,
+    field_index: usize,
+    field_ty: &Type,
+    enum_state: EnumWasmState,
+) -> Result<()> {
+    emit_enum_field_as_condition_value_with_layout(
+        function,
+        value_local,
+        enum_layout,
+        ctor_layout,
+        field_index,
+        field_ty,
+        enum_state,
+    )
 }
 
 fn is_wasm_direct_self_recursive_field(field_ty: &Type, ctor: &EnumCtorInfo) -> bool {
@@ -7149,114 +8184,6 @@ fn enum_ctor_non_recursive_field_indices(ctor: &EnumCtorInfo) -> Vec<usize> {
             }
         })
         .collect()
-}
-
-fn emit_enum_alloc(function: &mut Function, enum_state: EnumWasmState, bytes: i32) {
-    function.instruction(&Instruction::I32Const(ENUM_HEAP_PTR_ADDR as i32));
-    function.instruction(&Instruction::I32Load(memarg(0, 2)));
-    function.instruction(&Instruction::LocalSet(enum_state.ptr_local));
-    function.instruction(&Instruction::LocalGet(enum_state.ptr_local));
-    function.instruction(&Instruction::I32Eqz);
-    function.instruction(&Instruction::If(BlockType::Empty));
-    function.instruction(&Instruction::I32Const(ENUM_HEAP_START));
-    function.instruction(&Instruction::LocalSet(enum_state.ptr_local));
-    function.instruction(&Instruction::End);
-    function.instruction(&Instruction::I32Const(ENUM_HEAP_PTR_ADDR as i32));
-    function.instruction(&Instruction::LocalGet(enum_state.ptr_local));
-    function.instruction(&Instruction::I32Const(bytes));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::I32Store(memarg(0, 2)));
-}
-
-fn emit_enum_field_store(
-    function: &mut Function,
-    field_index: usize,
-    field_ty: &Type,
-    enum_state: EnumWasmState,
-) -> Result<()> {
-    let offset = enum_field_slot_offset(field_index)?;
-    match field_ty {
-        Type::Scalar(Prim::I32 | Prim::Char) => {
-            function.instruction(&Instruction::I32Store(memarg(offset, 2)));
-        }
-        Type::Scalar(Prim::I64) => {
-            function.instruction(&Instruction::I64Store(memarg(offset, 3)));
-        }
-        Type::Scalar(Prim::F32) => {
-            function.instruction(&Instruction::F32Store(memarg(offset, 2)));
-        }
-        Type::Scalar(Prim::F64) => {
-            function.instruction(&Instruction::F64Store(memarg(offset, 3)));
-        }
-        Type::Named(name, args) if is_wasm_enum_named_type(name, args) => {
-            function.instruction(&Instruction::I32Store(memarg(offset, 2)));
-        }
-        Type::Named(name, args) if is_wasm_string_named_type(name, args) => {
-            function.instruction(&Instruction::LocalSet(enum_state.ptr_local));
-            function.instruction(&Instruction::LocalSet(enum_state.base_local));
-            function.instruction(&Instruction::LocalTee(enum_state.base_tmp_local));
-            function.instruction(&Instruction::LocalGet(enum_state.base_local));
-            function.instruction(&Instruction::I32Store(memarg(offset, 2)));
-            function.instruction(&Instruction::LocalGet(enum_state.base_tmp_local));
-            function.instruction(&Instruction::LocalGet(enum_state.ptr_local));
-            function.instruction(&Instruction::I32Store(memarg(offset + 4, 2)));
-        }
-        other => {
-            return Err(SimdError::new(format!(
-                "Wasm enum field store does not support field type {:?}",
-                other
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn emit_enum_field_load(
-    function: &mut Function,
-    value_local: u32,
-    field_index: usize,
-    field_ty: &Type,
-) -> Result<()> {
-    let offset = enum_field_slot_offset(field_index)?;
-    function.instruction(&Instruction::LocalGet(value_local));
-    match field_ty {
-        Type::Scalar(Prim::I32 | Prim::Char) => {
-            function.instruction(&Instruction::I32Load(memarg(offset, 2)));
-        }
-        Type::Scalar(Prim::I64) => {
-            function.instruction(&Instruction::I64Load(memarg(offset, 3)));
-        }
-        Type::Scalar(Prim::F32) => {
-            function.instruction(&Instruction::F32Load(memarg(offset, 2)));
-        }
-        Type::Scalar(Prim::F64) => {
-            function.instruction(&Instruction::F64Load(memarg(offset, 3)));
-        }
-        Type::Named(name, args) if is_wasm_enum_named_type(name, args) => {
-            function.instruction(&Instruction::I32Load(memarg(offset, 2)));
-        }
-        Type::Named(name, args) if is_wasm_string_named_type(name, args) => {
-            function.instruction(&Instruction::I32Load(memarg(offset, 2)));
-            function.instruction(&Instruction::LocalGet(value_local));
-            function.instruction(&Instruction::I32Load(memarg(offset + 4, 2)));
-        }
-        other => {
-            return Err(SimdError::new(format!(
-                "Wasm enum field load does not support field type {:?}",
-                other
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn emit_enum_field_as_condition_value(
-    function: &mut Function,
-    value_local: u32,
-    field_index: usize,
-    field_ty: &Type,
-) -> Result<()> {
-    emit_enum_field_load(function, value_local, field_index, field_ty)
 }
 
 fn is_pattern_constructor_name(name: &str, enum_ctors: &BTreeMap<String, EnumCtorInfo>) -> bool {
@@ -7474,9 +8401,10 @@ fn emit_matching_if(
     function: &mut Function,
     patterns: &[TypedPattern],
     enum_ctors: &BTreeMap<String, EnumCtorInfo>,
+    wasm_enum_layouts: &BTreeMap<String, WasmEnumLayout>,
     enum_state: Option<EnumWasmState>,
 ) -> Result<()> {
-    emit_clause_condition(function, patterns, enum_ctors, enum_state)?;
+    emit_clause_condition(function, patterns, enum_ctors, wasm_enum_layouts, enum_state)?;
     function.instruction(&Instruction::If(BlockType::Empty));
     Ok(())
 }
@@ -7485,6 +8413,7 @@ fn emit_clause_condition(
     function: &mut Function,
     patterns: &[TypedPattern],
     enum_ctors: &BTreeMap<String, EnumCtorInfo>,
+    wasm_enum_layouts: &BTreeMap<String, WasmEnumLayout>,
     enum_state: Option<EnumWasmState>,
 ) -> Result<()> {
     let mut terms = 0usize;
@@ -7496,6 +8425,7 @@ fn emit_clause_condition(
             &pattern.ty,
             value_local,
             enum_ctors,
+            wasm_enum_layouts,
             enum_state,
         )? {
             if terms > 0 {
@@ -7656,6 +8586,7 @@ fn emit_single_pattern_condition(
     ty: &Type,
     value_local: u32,
     enum_ctors: &BTreeMap<String, EnumCtorInfo>,
+    wasm_enum_layouts: &BTreeMap<String, WasmEnumLayout>,
     enum_state: Option<EnumWasmState>,
 ) -> Result<bool> {
     match pattern {
@@ -7685,8 +8616,12 @@ fn emit_single_pattern_condition(
                     name, ctor.enum_name, enum_name
                 )));
             }
-            function.instruction(&Instruction::LocalGet(value_local));
-            function.instruction(&Instruction::I32Load(memarg(0, 2)));
+            let Some(enum_state) = enum_state else {
+                return Err(SimdError::new(
+                    "internal error: missing enum scratch local for constructor pattern",
+                ));
+            };
+            emit_enum_tag_load_from_value(function, value_local, enum_state);
             function.instruction(&Instruction::I32Const(i32::from(ctor.tag)));
             function.instruction(&Instruction::I32Eq);
             Ok(true)
@@ -7833,8 +8768,16 @@ fn emit_single_pattern_condition(
                     subpatterns.len()
                 )));
             }
-            function.instruction(&Instruction::LocalGet(value_local));
-            function.instruction(&Instruction::I32Load(memarg(0, 2)));
+            let Some(enum_state) = enum_state else {
+                return Err(SimdError::new(
+                    "internal error: missing enum scratch local for constructor pattern",
+                ));
+            };
+            let wasm_layout =
+                lookup_specialized_wasm_enum_layout(wasm_enum_layouts, enum_name, enum_args)?;
+            let ctor_layout =
+                lookup_specialized_wasm_enum_ctor_layout(wasm_enum_layouts, enum_name, enum_args, name)?;
+            emit_enum_tag_load_from_value(function, value_local, enum_state);
             function.instruction(&Instruction::I32Const(i32::from(ctor.tag)));
             function.instruction(&Instruction::I32Eq);
             let mut terms = 1usize;
@@ -7856,7 +8799,15 @@ fn emit_single_pattern_condition(
                         // Name bindings do not contribute to condition.
                     }
                     Pattern::Int(expected) => {
-                        emit_enum_field_as_condition_value(function, value_local, field_index, &field_ty)?;
+                        emit_enum_field_as_condition_value(
+                            function,
+                            value_local,
+                            &wasm_layout,
+                            &ctor_layout,
+                            field_index,
+                            &field_ty,
+                            enum_state,
+                        )?;
                         let prim = field_ty.prim().ok_or_else(|| {
                             SimdError::new(format!(
                                 "integer subpattern in '{}' requires scalar field, found {:?}",
@@ -7869,7 +8820,15 @@ fn emit_single_pattern_condition(
                         terms += 1;
                     }
                     Pattern::Float(expected) => {
-                        emit_enum_field_as_condition_value(function, value_local, field_index, &field_ty)?;
+                        emit_enum_field_as_condition_value(
+                            function,
+                            value_local,
+                            &wasm_layout,
+                            &ctor_layout,
+                            field_index,
+                            &field_ty,
+                            enum_state,
+                        )?;
                         let prim = field_ty.prim().ok_or_else(|| {
                             SimdError::new(format!(
                                 "float subpattern in '{}' requires scalar field, found {:?}",
@@ -7884,8 +8843,11 @@ fn emit_single_pattern_condition(
                         emit_enum_field_as_condition_value(
                             function,
                             value_local,
+                            &wasm_layout,
+                            &ctor_layout,
                             field_index,
                             &field_ty,
+                            enum_state,
                         )?;
                         let prim = field_ty.prim().ok_or_else(|| {
                             SimdError::new(format!(
@@ -7907,12 +8869,15 @@ fn emit_single_pattern_condition(
                         terms += 1;
                     }
                     Pattern::Name(ctor_name) if is_pattern_constructor_name(ctor_name, enum_ctors) => {
-                        let Some(enum_state) = enum_state else {
-                            return Err(SimdError::new(
-                                "internal error: missing enum scratch local for constructor pattern",
-                            ));
-                        };
-                        emit_enum_field_load(function, value_local, field_index, &field_ty)?;
+                        emit_enum_field_load(
+                            function,
+                            value_local,
+                            &wasm_layout,
+                            &ctor_layout,
+                            field_index,
+                            &field_ty,
+                            enum_state,
+                        )?;
                         function.instruction(&Instruction::LocalSet(enum_state.ptr_local));
                         if emit_single_pattern_condition(
                             function,
@@ -7920,6 +8885,7 @@ fn emit_single_pattern_condition(
                             &field_ty,
                             enum_state.ptr_local,
                             enum_ctors,
+                            wasm_enum_layouts,
                             enum_state.into(),
                         )? {
                             function.instruction(&Instruction::I32And);
@@ -7928,12 +8894,15 @@ fn emit_single_pattern_condition(
                     }
                     Pattern::Name(_) => {}
                     Pattern::Ctor(_, _) => {
-                        let Some(enum_state) = enum_state else {
-                            return Err(SimdError::new(
-                                "internal error: missing enum scratch local for constructor pattern",
-                            ));
-                        };
-                        emit_enum_field_load(function, value_local, field_index, &field_ty)?;
+                        emit_enum_field_load(
+                            function,
+                            value_local,
+                            &wasm_layout,
+                            &ctor_layout,
+                            field_index,
+                            &field_ty,
+                            enum_state,
+                        )?;
                         function.instruction(&Instruction::LocalSet(enum_state.ptr_local));
                         if emit_single_pattern_condition(
                             function,
@@ -7941,6 +8910,7 @@ fn emit_single_pattern_condition(
                             &field_ty,
                             enum_state.ptr_local,
                             enum_ctors,
+                            wasm_enum_layouts,
                             enum_state.into(),
                         )? {
                             function.instruction(&Instruction::I32And);
@@ -7974,6 +8944,7 @@ fn emit_clause_bindings(
     patterns: &[TypedPattern],
     clause_locals: &BTreeMap<String, u32>,
     enum_ctors: &BTreeMap<String, EnumCtorInfo>,
+    wasm_enum_layouts: &BTreeMap<String, WasmEnumLayout>,
     enum_state: Option<EnumWasmState>,
 ) -> Result<()> {
     let mut value_local = 0u32;
@@ -7985,6 +8956,7 @@ fn emit_clause_bindings(
             value_local,
             clause_locals,
             enum_ctors,
+            wasm_enum_layouts,
             enum_state,
         )?;
         value_local += wasm_pattern_value_width(&pattern.ty);
@@ -7999,6 +8971,7 @@ fn emit_pattern_bindings(
     value_local: u32,
     clause_locals: &BTreeMap<String, u32>,
     enum_ctors: &BTreeMap<String, EnumCtorInfo>,
+    wasm_enum_layouts: &BTreeMap<String, WasmEnumLayout>,
     enum_state: Option<EnumWasmState>,
 ) -> Result<()> {
     match pattern {
@@ -8037,6 +9010,10 @@ fn emit_pattern_bindings(
                 .cloned()
                 .zip(enum_args.iter().cloned())
                 .collect::<BTreeMap<_, _>>();
+            let wasm_layout =
+                lookup_specialized_wasm_enum_layout(wasm_enum_layouts, enum_name, enum_args)?;
+            let ctor_layout =
+                lookup_specialized_wasm_enum_ctor_layout(wasm_enum_layouts, enum_name, enum_args, name)?;
             for (field_index, (subpattern, field_ty_template)) in
                 subpatterns.iter().zip(ctor.fields.iter()).enumerate()
             {
@@ -8050,7 +9027,20 @@ fn emit_pattern_bindings(
                     | Pattern::Type(_) => {}
                     Pattern::Name(local_name) if !is_pattern_constructor_name(local_name, enum_ctors) => {
                         if let Some(target_local) = clause_locals.get(local_name).copied() {
-                            emit_enum_field_load(function, value_local, field_index, &field_ty)?;
+                            let Some(enum_state) = enum_state else {
+                                return Err(SimdError::new(
+                                    "internal error: missing enum scratch local for constructor binding",
+                                ));
+                            };
+                            emit_enum_field_load(
+                                function,
+                                value_local,
+                                &wasm_layout,
+                                &ctor_layout,
+                                field_index,
+                                &field_ty,
+                                enum_state,
+                            )?;
                             if is_wasm_bulk_like_type(&field_ty) {
                                 let len_key = bulk_len_local_name(local_name);
                                 let len_local = clause_locals.get(&len_key).copied().ok_or_else(|| {
@@ -8072,7 +9062,15 @@ fn emit_pattern_bindings(
                                 "internal error: missing enum scratch local for nested constructor binding",
                             ));
                         };
-                        emit_enum_field_load(function, value_local, field_index, &field_ty)?;
+                        emit_enum_field_load(
+                            function,
+                            value_local,
+                            &wasm_layout,
+                            &ctor_layout,
+                            field_index,
+                            &field_ty,
+                            enum_state,
+                        )?;
                         function.instruction(&Instruction::LocalSet(enum_state.ptr_local));
                         emit_pattern_bindings(
                             function,
@@ -8081,6 +9079,7 @@ fn emit_pattern_bindings(
                             enum_state.ptr_local,
                             clause_locals,
                             enum_ctors,
+                            wasm_enum_layouts,
                             enum_state.into(),
                         )?;
                     }
@@ -8260,6 +9259,43 @@ fn emit_int_const(function: &mut Function, prim: Prim, value: i64) -> Result<()>
     Ok(())
 }
 
+fn emit_copy_i32_words(function: &mut Function, src_local: u32, dst_local: u32, words_local: u32) {
+    function.instruction(&Instruction::Block(BlockType::Empty));
+    function.instruction(&Instruction::Loop(BlockType::Empty));
+    function.instruction(&Instruction::LocalGet(words_local));
+    function.instruction(&Instruction::I32Eqz);
+    function.instruction(&Instruction::BrIf(1));
+    function.instruction(&Instruction::LocalGet(dst_local));
+    function.instruction(&Instruction::LocalGet(src_local));
+    function.instruction(&Instruction::I32Load(memarg(0, 2)));
+    function.instruction(&Instruction::I32Store(memarg(0, 2)));
+    function.instruction(&Instruction::LocalGet(src_local));
+    function.instruction(&Instruction::I32Const(4));
+    function.instruction(&Instruction::I32Add);
+    function.instruction(&Instruction::LocalSet(src_local));
+    function.instruction(&Instruction::LocalGet(dst_local));
+    function.instruction(&Instruction::I32Const(4));
+    function.instruction(&Instruction::I32Add);
+    function.instruction(&Instruction::LocalSet(dst_local));
+    function.instruction(&Instruction::LocalGet(words_local));
+    function.instruction(&Instruction::I32Const(1));
+    function.instruction(&Instruction::I32Sub);
+    function.instruction(&Instruction::LocalSet(words_local));
+    function.instruction(&Instruction::Br(0));
+    function.instruction(&Instruction::End);
+    function.instruction(&Instruction::End);
+}
+
+fn emit_assert_enum_root_zero(function: &mut Function, handle_local: u32) {
+    function.instruction(&Instruction::LocalGet(handle_local));
+    function.instruction(&Instruction::I32Load(memarg(ENUM_REF_ROOT_OFFSET, 2)));
+    function.instruction(&Instruction::I32Eqz);
+    function.instruction(&Instruction::If(BlockType::Empty));
+    function.instruction(&Instruction::Else);
+    function.instruction(&Instruction::Unreachable);
+    function.instruction(&Instruction::End);
+}
+
 fn emit_int_eq(function: &mut Function, prim: Prim) {
     match prim {
         Prim::I32 | Prim::Char => {
@@ -8299,6 +9335,7 @@ fn compile_scalar_ir_expr(
     scalar_indices: &BTreeMap<String, u32>,
     signatures: &BTreeMap<String, &CheckedFunction>,
     enum_ctors: &BTreeMap<String, EnumCtorInfo>,
+    wasm_enum_layouts: &BTreeMap<String, WasmEnumLayout>,
     enum_state: Option<EnumWasmState>,
 ) -> Result<()> {
     let inline_bindings = BTreeMap::<String, IrExpr>::new();
@@ -8309,6 +9346,7 @@ fn compile_scalar_ir_expr(
         scalar_indices,
         signatures,
         enum_ctors,
+        wasm_enum_layouts,
         enum_state,
         &BTreeMap::new(),
         &inline_bindings,
@@ -8322,6 +9360,7 @@ fn emit_tail_position_scalar_return(
     scalar_indices: &BTreeMap<String, u32>,
     signatures: &BTreeMap<String, &CheckedFunction>,
     enum_ctors: &BTreeMap<String, EnumCtorInfo>,
+    wasm_enum_layouts: &BTreeMap<String, WasmEnumLayout>,
     enum_state: Option<EnumWasmState>,
 ) -> Result<()> {
     let inline_bindings = BTreeMap::<String, IrExpr>::new();
@@ -8332,6 +9371,7 @@ fn emit_tail_position_scalar_return(
         scalar_indices,
         signatures,
         enum_ctors,
+        wasm_enum_layouts,
         enum_state,
         &inline_bindings,
     )
@@ -8344,6 +9384,7 @@ fn emit_tail_position_scalar_return_with_bindings(
     scalar_indices: &BTreeMap<String, u32>,
     signatures: &BTreeMap<String, &CheckedFunction>,
     enum_ctors: &BTreeMap<String, EnumCtorInfo>,
+    wasm_enum_layouts: &BTreeMap<String, WasmEnumLayout>,
     enum_state: Option<EnumWasmState>,
     inline_bindings: &BTreeMap<String, IrExpr>,
 ) -> Result<()> {
@@ -8359,6 +9400,7 @@ fn emit_tail_position_scalar_return_with_bindings(
             scalar_indices,
             signatures,
             enum_ctors,
+            wasm_enum_layouts,
             enum_state,
             &extended,
         );
@@ -8396,6 +9438,7 @@ fn emit_tail_position_scalar_return_with_bindings(
                 scalar_indices,
                 signatures,
                 enum_ctors,
+                wasm_enum_layouts,
                 enum_state,
                 &BTreeMap::new(),
                 inline_bindings,
@@ -8422,6 +9465,7 @@ fn emit_tail_position_scalar_return_with_bindings(
         scalar_indices,
         signatures,
         enum_ctors,
+        wasm_enum_layouts,
         enum_state,
         &BTreeMap::new(),
         inline_bindings,
@@ -8437,6 +9481,7 @@ fn compile_scalar_ir_expr_with_hoists(
     scalar_indices: &BTreeMap<String, u32>,
     signatures: &BTreeMap<String, &CheckedFunction>,
     enum_ctors: &BTreeMap<String, EnumCtorInfo>,
+    wasm_enum_layouts: &BTreeMap<String, WasmEnumLayout>,
     enum_state: Option<EnumWasmState>,
     hoisted_locals: &BTreeMap<HoistExprKey, u32>,
     inline_bindings: &BTreeMap<String, IrExpr>,
@@ -8474,6 +9519,7 @@ fn compile_scalar_ir_expr_with_hoists(
                     scalar_indices,
                     signatures,
                     enum_ctors,
+                    wasm_enum_layouts,
                     enum_state,
                     hoisted_locals,
                     inline_bindings,
@@ -8512,6 +9558,23 @@ fn compile_scalar_ir_expr_with_hoists(
             let ctor_info = enum_ctors
                 .get(ctor)
                 .ok_or_else(|| SimdError::new(format!("unknown constructor '{}'", ctor)))?;
+            let Type::Named(_, enum_args) = &expr.ty else {
+                return Err(SimdError::new(format!(
+                    "constructor '{}' expected enum result type, found {:?}",
+                    ctor, expr.ty
+                )));
+            };
+            let wasm_layout =
+                lookup_specialized_wasm_enum_layout(wasm_enum_layouts, &ctor_info.enum_name, enum_args)?;
+            let ctor_layout = lookup_specialized_wasm_enum_ctor_layout(
+                wasm_enum_layouts,
+                &ctor_info.enum_name,
+                enum_args,
+                ctor,
+            )?
+            .clone();
+            let mut enum_ctor_layouts = wasm_layout.ctors.values().cloned().collect::<Vec<_>>();
+            enum_ctor_layouts.sort_by_key(|layout| layout.tag);
             if ctor_info.fields.len() != args.len() {
                 return Err(SimdError::new(format!(
                     "constructor '{}' expects {} args, found {}",
@@ -8520,68 +9583,655 @@ fn compile_scalar_ir_expr_with_hoists(
                     args.len()
                 )));
             }
-            let field_count = i32::try_from(args.len()).map_err(|_| {
-                SimdError::new(format!(
-                    "constructor '{}' has too many fields for Wasm layout",
+            let tag_count = usize::from(wasm_layout.max_tag) + 1;
+            let tag_count_i32 =
+                i32::try_from(tag_count).map_err(|_| SimdError::new("enum tag-count does not fit in i32"))?;
+            if ctor_layout.recursive_field_indices.len() > enum_state.child_locals.len() {
+                return Err(SimdError::new(format!(
+                    "constructor '{}' has too many recursive fields for Wasm codegen",
                     ctor
-                ))
-            })?;
-            let bytes = ENUM_NODE_HEADER_BYTES
-                .checked_add(
-                    field_count
-                        .checked_mul(ENUM_FIELD_SLOT_BYTES)
-                        .ok_or_else(|| SimdError::new("enum field slot size overflow"))?,
-                )
-                .ok_or_else(|| SimdError::new("enum allocation size overflow"))?;
-            emit_enum_alloc(function, enum_state, bytes);
-            function.instruction(&Instruction::LocalGet(enum_state.ptr_local));
-            function.instruction(&Instruction::LocalSet(enum_state.base_local));
-            function.instruction(&Instruction::LocalGet(enum_state.save_sp_local));
-            function.instruction(&Instruction::LocalGet(enum_state.base_local));
-            function.instruction(&Instruction::I32Store(memarg(0, 2)));
-            function.instruction(&Instruction::LocalGet(enum_state.save_sp_local));
-            function.instruction(&Instruction::I32Const(4));
-            function.instruction(&Instruction::I32Add);
-            function.instruction(&Instruction::LocalSet(enum_state.save_sp_local));
-            function.instruction(&Instruction::LocalGet(enum_state.base_local));
-            function.instruction(&Instruction::I32Const(i32::from(ctor_info.tag)));
-            function.instruction(&Instruction::I32Store(memarg(0, 2)));
-            function.instruction(&Instruction::LocalGet(enum_state.base_local));
-            function.instruction(&Instruction::I32Const(field_count));
-            function.instruction(&Instruction::I32Store(memarg(4, 2)));
+                )));
+            }
+            let mut arg_offsets = Vec::with_capacity(args.len());
+            let mut arg_scratch_bytes = 0i32;
             for (field_index, arg) in args.iter().enumerate() {
+                if ctor_layout.recursive_field_indices.contains(&field_index) {
+                    arg_offsets.push(None);
+                } else {
+                    arg_offsets.push(Some(arg_scratch_bytes));
+                    arg_scratch_bytes = arg_scratch_bytes
+                        .checked_add(wasm_saved_value_bytes(&arg.ty)?)
+                        .ok_or_else(|| SimdError::new("enum arg scratch size overflow"))?;
+                }
+            }
+            let counts_base_offset = arg_scratch_bytes;
+            let child_offsets_base_offset = counts_base_offset
+                .checked_add(tag_count_i32.checked_mul(4).ok_or_else(|| {
+                    SimdError::new("enum tag-count scratch size overflow")
+                })?)
+                .ok_or_else(|| SimdError::new("enum scratch offset overflow"))?;
+            let child_handles_base_offset = child_offsets_base_offset
+                .checked_add(tag_count_i32.checked_mul(4).ok_or_else(|| {
+                    SimdError::new("enum child-offset scratch size overflow")
+                })?)
+                .ok_or_else(|| SimdError::new("enum scratch offset overflow"))?;
+            let child_handle_count_i32 = i32::try_from(ctor_layout.recursive_field_indices.len())
+                .map_err(|_| SimdError::new("enum recursive child count does not fit in i32"))?;
+            let total_scratch_bytes = child_handles_base_offset
+                .checked_add(child_handle_count_i32.checked_mul(4).ok_or_else(|| {
+                    SimdError::new("enum child-handle scratch size overflow")
+                })?)
+                .ok_or_else(|| SimdError::new("enum scratch size overflow"))?;
+
+            function.instruction(&Instruction::LocalGet(enum_state.scratch_sp_local));
+            function.instruction(&Instruction::LocalSet(enum_state.aux0_local));
+            function.instruction(&Instruction::LocalGet(enum_state.aux0_local));
+            function.instruction(&Instruction::I32Const(total_scratch_bytes));
+            function.instruction(&Instruction::I32Add);
+            function.instruction(&Instruction::LocalSet(enum_state.scratch_sp_local));
+            function.instruction(&Instruction::I32Const(ENUM_SAVE_STACK_PTR_ADDR as i32));
+            function.instruction(&Instruction::LocalGet(enum_state.scratch_sp_local));
+            function.instruction(&Instruction::I32Store(memarg(0, 2)));
+
+            let mut recursive_local_index = 0usize;
+            for (field_index, arg) in args.iter().enumerate() {
+                if ctor_layout.recursive_field_indices.contains(&field_index) {
+                    compile_scalar_ir_expr_with_hoists(
+                        function,
+                        arg,
+                        locals,
+                        scalar_indices,
+                        signatures,
+                        enum_ctors,
+                        wasm_enum_layouts,
+                        enum_state.into(),
+                        hoisted_locals,
+                        inline_bindings,
+                    )?;
+                    function.instruction(&Instruction::LocalGet(enum_state.scratch_sp_local));
+                    function.instruction(&Instruction::I32Const(total_scratch_bytes));
+                    function.instruction(&Instruction::I32Sub);
+                    function.instruction(&Instruction::LocalSet(enum_state.aux0_local));
+                    function.instruction(&Instruction::LocalSet(enum_state.base_tmp_local));
+                    function.instruction(&Instruction::LocalGet(enum_state.aux0_local));
+                    function.instruction(&Instruction::I32Const(
+                        child_handles_base_offset
+                            + i32::try_from(recursive_local_index).map_err(|_| {
+                                SimdError::new("enum recursive child index does not fit in i32")
+                            })? * 4,
+                    ));
+                    function.instruction(&Instruction::I32Add);
+                    function.instruction(&Instruction::LocalGet(enum_state.base_tmp_local));
+                    function.instruction(&Instruction::I32Store(memarg(0, 2)));
+                    recursive_local_index += 1;
+                } else {
+                    let arg_offset = arg_offsets[field_index]
+                        .ok_or_else(|| SimdError::new("missing enum arg scratch offset"))?;
+                    function.instruction(&Instruction::LocalGet(enum_state.aux0_local));
+                    if arg_offset != 0 {
+                        function.instruction(&Instruction::I32Const(arg_offset));
+                        function.instruction(&Instruction::I32Add);
+                    }
+                    compile_scalar_ir_expr_with_hoists(
+                        function,
+                        arg,
+                        locals,
+                        scalar_indices,
+                        signatures,
+                        enum_ctors,
+                        wasm_enum_layouts,
+                        enum_state.into(),
+                        hoisted_locals,
+                        inline_bindings,
+                    )?;
+                    emit_store_type_at_address(function, &arg.ty, enum_state)?;
+                    function.instruction(&Instruction::LocalGet(enum_state.scratch_sp_local));
+                    function.instruction(&Instruction::I32Const(total_scratch_bytes));
+                    function.instruction(&Instruction::I32Sub);
+                    function.instruction(&Instruction::LocalSet(enum_state.aux0_local));
+                }
+            }
+
+            for tag in 0..tag_count {
+                function.instruction(&Instruction::LocalGet(enum_state.aux0_local));
+                function.instruction(&Instruction::I32Const(
+                    counts_base_offset
+                        + i32::try_from(tag).map_err(|_| {
+                            SimdError::new("enum scratch tag index does not fit in i32")
+                        })? * 4,
+                ));
+                function.instruction(&Instruction::I32Add);
+                function.instruction(&Instruction::I32Const(0));
+                function.instruction(&Instruction::I32Store(memarg(0, 2)));
+            }
+
+            function.instruction(&Instruction::I32Const(1));
+            function.instruction(&Instruction::LocalSet(enum_state.aux1_local));
+
+            let mut recursive_local_index = 0usize;
+            for (field_index, field_ty) in ctor_info.fields.iter().enumerate()
+            {
+                if !is_wasm_direct_self_recursive_field(field_ty, ctor_info) {
+                    continue;
+                }
+                function.instruction(&Instruction::LocalGet(enum_state.aux0_local));
+                function.instruction(&Instruction::I32Const(
+                    child_handles_base_offset
+                        + i32::try_from(recursive_local_index).map_err(|_| {
+                            SimdError::new("enum recursive child index does not fit in i32")
+                        })? * 4,
+                ));
+                function.instruction(&Instruction::I32Add);
+                function.instruction(&Instruction::I32Load(memarg(0, 2)));
+                function.instruction(&Instruction::LocalSet(enum_state.ptr_local));
+                recursive_local_index += 1;
+                emit_assert_enum_root_zero(function, enum_state.ptr_local);
+                emit_enum_load_header_root(function, enum_state.ptr_local, enum_state);
+                function.instruction(&Instruction::LocalGet(enum_state.aux1_local));
                 function.instruction(&Instruction::LocalGet(enum_state.base_local));
-                let child_state = EnumWasmState {
-                    ptr_local: enum_state.ptr_local,
-                    base_local: enum_state.ptr_local,
-                    save_sp_local: enum_state.save_sp_local,
-                    base_tmp_local: enum_state.base_tmp_local,
-                };
-                compile_scalar_ir_expr_with_hoists(
-                    function,
-                    arg,
-                    locals,
-                    scalar_indices,
-                    signatures,
-                    enum_ctors,
-                    child_state.into(),
-                    hoisted_locals,
-                    inline_bindings,
-                )?;
-                emit_enum_field_store(function, field_index, &arg.ty, enum_state)?;
-                function.instruction(&Instruction::LocalGet(enum_state.save_sp_local));
-                function.instruction(&Instruction::I32Const(4));
-                function.instruction(&Instruction::I32Sub);
+                function.instruction(&Instruction::I32Load(memarg(ENUM_HEADER_NODE_COUNT_OFFSET, 2)));
+                function.instruction(&Instruction::I32Add);
+                function.instruction(&Instruction::LocalSet(enum_state.aux1_local));
+                for child_ctor_layout in &enum_ctor_layouts {
+                    function.instruction(&Instruction::LocalGet(enum_state.aux0_local));
+                    function.instruction(&Instruction::I32Const(
+                        counts_base_offset + i32::from(child_ctor_layout.tag) * 4,
+                    ));
+                    function.instruction(&Instruction::I32Add);
+                    function.instruction(&Instruction::LocalTee(enum_state.aux2_local));
+                    function.instruction(&Instruction::I32Load(memarg(0, 2)));
+                    function.instruction(&Instruction::LocalGet(enum_state.base_local));
+                    function.instruction(&Instruction::I32Load(memarg(ENUM_HEADER_CTOR_TABLE_PTR_OFFSET, 2)));
+                    function.instruction(&Instruction::I32Const(
+                        i32::from(child_ctor_layout.tag) * ENUM_CTOR_TABLE_ENTRY_BYTES,
+                    ));
+                    function.instruction(&Instruction::I32Add);
+                    function.instruction(&Instruction::I32Load(memarg(
+                        ENUM_CTOR_TABLE_ROW_COUNT_OFFSET,
+                        2,
+                    )));
+                    function.instruction(&Instruction::I32Add);
+                    function.instruction(&Instruction::LocalSet(enum_state.aux3_local));
+                    function.instruction(&Instruction::LocalGet(enum_state.aux2_local));
+                    function.instruction(&Instruction::LocalGet(enum_state.aux3_local));
+                    function.instruction(&Instruction::I32Store(memarg(0, 2)));
+                }
+                let _ = field_index;
+            }
+
+            function.instruction(&Instruction::LocalGet(enum_state.aux0_local));
+            function.instruction(&Instruction::I32Const(counts_base_offset + i32::from(ctor_layout.tag) * 4));
+            function.instruction(&Instruction::I32Add);
+            function.instruction(&Instruction::LocalTee(enum_state.aux2_local));
+            function.instruction(&Instruction::I32Load(memarg(0, 2)));
+            function.instruction(&Instruction::I32Const(1));
+            function.instruction(&Instruction::I32Add);
+            function.instruction(&Instruction::LocalSet(enum_state.aux3_local));
+            function.instruction(&Instruction::LocalGet(enum_state.aux2_local));
+            function.instruction(&Instruction::LocalGet(enum_state.aux3_local));
+            function.instruction(&Instruction::I32Store(memarg(0, 2)));
+
+            let structural_bytes = ENUM_REF_CELL_BYTES
+                .checked_add(ENUM_HEADER_BYTES)
+                .and_then(|v| {
+                    v.checked_add(
+                        tag_count_i32
+                            .checked_mul(ENUM_CTOR_TABLE_ENTRY_BYTES)
+                            .unwrap_or(i32::MAX),
+                    )
+                })
+                .ok_or_else(|| SimdError::new("enum structural size overflow"))?;
+            function.instruction(&Instruction::LocalGet(enum_state.aux1_local));
+            function.instruction(&Instruction::I32Const(ENUM_TAG_BYTES));
+            function.instruction(&Instruction::I32Mul);
+            function.instruction(&Instruction::LocalGet(enum_state.aux1_local));
+            function.instruction(&Instruction::I32Const(ENUM_END_BYTES));
+            function.instruction(&Instruction::I32Mul);
+            function.instruction(&Instruction::I32Add);
+            function.instruction(&Instruction::LocalGet(enum_state.aux1_local));
+            function.instruction(&Instruction::I32Const(ENUM_SLOT_BYTES));
+            function.instruction(&Instruction::I32Mul);
+            function.instruction(&Instruction::I32Add);
+            function.instruction(&Instruction::I32Const(structural_bytes));
+            function.instruction(&Instruction::I32Add);
+            function.instruction(&Instruction::LocalSet(enum_state.aux2_local));
+            for child_ctor_layout in &enum_ctor_layouts {
+                if child_ctor_layout.row_stride == 0 {
+                    continue;
+                }
+                function.instruction(&Instruction::LocalGet(enum_state.aux2_local));
+                function.instruction(&Instruction::LocalGet(enum_state.aux0_local));
+                function.instruction(&Instruction::I32Const(
+                    counts_base_offset + i32::from(child_ctor_layout.tag) * 4,
+                ));
+                function.instruction(&Instruction::I32Add);
+                function.instruction(&Instruction::I32Load(memarg(0, 2)));
+                function.instruction(&Instruction::I32Const(child_ctor_layout.row_stride as i32));
+                function.instruction(&Instruction::I32Mul);
+                function.instruction(&Instruction::I32Add);
+                function.instruction(&Instruction::LocalSet(enum_state.aux2_local));
+            }
+            emit_enum_alloc_dynamic(function, enum_state, enum_state.aux2_local);
+
+            function.instruction(&Instruction::LocalGet(enum_state.ptr_local));
+            function.instruction(&Instruction::I32Const(ENUM_REF_CELL_BYTES));
+            function.instruction(&Instruction::I32Add);
+            function.instruction(&Instruction::LocalSet(enum_state.aux4_local));
+
+            function.instruction(&Instruction::LocalGet(enum_state.ptr_local));
+            function.instruction(&Instruction::LocalGet(enum_state.aux4_local));
+            function.instruction(&Instruction::I32Store(memarg(ENUM_REF_HEADER_OFFSET, 2)));
+            function.instruction(&Instruction::LocalGet(enum_state.ptr_local));
+            function.instruction(&Instruction::I32Const(0));
+            function.instruction(&Instruction::I32Store(memarg(ENUM_REF_ROOT_OFFSET, 2)));
+
+            function.instruction(&Instruction::LocalGet(enum_state.aux4_local));
+            function.instruction(&Instruction::I32Const(wasm_layout.enum_id as i32));
+            function.instruction(&Instruction::I32Store(memarg(ENUM_HEADER_ENUM_ID_OFFSET, 2)));
+            function.instruction(&Instruction::LocalGet(enum_state.aux4_local));
+            function.instruction(&Instruction::LocalGet(enum_state.aux1_local));
+            function.instruction(&Instruction::I32Store(memarg(ENUM_HEADER_NODE_COUNT_OFFSET, 2)));
+
+            function.instruction(&Instruction::LocalGet(enum_state.aux4_local));
+            function.instruction(&Instruction::I32Const(ENUM_HEADER_BYTES));
+            function.instruction(&Instruction::I32Add);
+            function.instruction(&Instruction::LocalSet(enum_state.aux5_local));
+            function.instruction(&Instruction::LocalGet(enum_state.aux4_local));
+            function.instruction(&Instruction::LocalGet(enum_state.aux5_local));
+            function.instruction(&Instruction::I32Store(memarg(ENUM_HEADER_TAGS_PTR_OFFSET, 2)));
+
+            function.instruction(&Instruction::LocalGet(enum_state.aux5_local));
+            function.instruction(&Instruction::LocalGet(enum_state.aux1_local));
+            function.instruction(&Instruction::I32Const(ENUM_TAG_BYTES));
+            function.instruction(&Instruction::I32Mul);
+            function.instruction(&Instruction::I32Add);
+            function.instruction(&Instruction::LocalSet(enum_state.aux6_local));
+            function.instruction(&Instruction::LocalGet(enum_state.aux4_local));
+            function.instruction(&Instruction::LocalGet(enum_state.aux6_local));
+            function.instruction(&Instruction::I32Store(memarg(ENUM_HEADER_ENDS_PTR_OFFSET, 2)));
+
+            function.instruction(&Instruction::LocalGet(enum_state.aux6_local));
+            function.instruction(&Instruction::LocalGet(enum_state.aux1_local));
+            function.instruction(&Instruction::I32Const(ENUM_END_BYTES));
+            function.instruction(&Instruction::I32Mul);
+            function.instruction(&Instruction::I32Add);
+            function.instruction(&Instruction::LocalSet(enum_state.aux7_local));
+            function.instruction(&Instruction::LocalGet(enum_state.aux4_local));
+            function.instruction(&Instruction::LocalGet(enum_state.aux7_local));
+            function.instruction(&Instruction::I32Store(memarg(ENUM_HEADER_SLOTS_PTR_OFFSET, 2)));
+
+            function.instruction(&Instruction::LocalGet(enum_state.aux7_local));
+            function.instruction(&Instruction::LocalGet(enum_state.aux1_local));
+            function.instruction(&Instruction::I32Const(ENUM_SLOT_BYTES));
+            function.instruction(&Instruction::I32Mul);
+            function.instruction(&Instruction::I32Add);
+            function.instruction(&Instruction::LocalSet(enum_state.aux2_local));
+            function.instruction(&Instruction::LocalGet(enum_state.aux4_local));
+            function.instruction(&Instruction::LocalGet(enum_state.aux2_local));
+            function.instruction(&Instruction::I32Store(memarg(ENUM_HEADER_CTOR_TABLE_PTR_OFFSET, 2)));
+
+            for tag in 0..tag_count {
+                function.instruction(&Instruction::LocalGet(enum_state.aux2_local));
+                function.instruction(&Instruction::I32Const(
+                    i32::try_from(tag)
+                        .map_err(|_| SimdError::new("enum tag index does not fit in i32"))?
+                        * ENUM_CTOR_TABLE_ENTRY_BYTES,
+                ));
+                function.instruction(&Instruction::I32Add);
+                function.instruction(&Instruction::LocalTee(enum_state.aux3_local));
+                function.instruction(&Instruction::I32Const(0));
+                function.instruction(&Instruction::I32Store(memarg(ENUM_CTOR_TABLE_ROWS_PTR_OFFSET, 2)));
+                function.instruction(&Instruction::LocalGet(enum_state.aux3_local));
+                function.instruction(&Instruction::I32Const(0));
+                function.instruction(&Instruction::I32Store(memarg(ENUM_CTOR_TABLE_ROW_COUNT_OFFSET, 2)));
+            }
+
+            function.instruction(&Instruction::LocalGet(enum_state.aux2_local));
+            function.instruction(&Instruction::I32Const(tag_count_i32 * ENUM_CTOR_TABLE_ENTRY_BYTES));
+            function.instruction(&Instruction::I32Add);
+            function.instruction(&Instruction::LocalSet(enum_state.aux3_local));
+            for child_ctor_layout in &enum_ctor_layouts {
+                function.instruction(&Instruction::LocalGet(enum_state.aux0_local));
+                function.instruction(&Instruction::I32Const(
+                    counts_base_offset + i32::from(child_ctor_layout.tag) * 4,
+                ));
+                function.instruction(&Instruction::I32Add);
                 function.instruction(&Instruction::I32Load(memarg(0, 2)));
                 function.instruction(&Instruction::LocalSet(enum_state.base_local));
+                function.instruction(&Instruction::LocalGet(enum_state.aux2_local));
+                function.instruction(&Instruction::I32Const(
+                    i32::from(child_ctor_layout.tag) * ENUM_CTOR_TABLE_ENTRY_BYTES,
+                ));
+                function.instruction(&Instruction::I32Add);
+                function.instruction(&Instruction::LocalTee(enum_state.base_tmp_local));
+                if child_ctor_layout.row_stride == 0 {
+                    function.instruction(&Instruction::I32Const(0));
+                } else {
+                    function.instruction(&Instruction::LocalGet(enum_state.aux3_local));
+                }
+                function.instruction(&Instruction::I32Store(memarg(ENUM_CTOR_TABLE_ROWS_PTR_OFFSET, 2)));
+                function.instruction(&Instruction::LocalGet(enum_state.base_tmp_local));
+                function.instruction(&Instruction::LocalGet(enum_state.base_local));
+                function.instruction(&Instruction::I32Store(memarg(ENUM_CTOR_TABLE_ROW_COUNT_OFFSET, 2)));
+                if child_ctor_layout.row_stride != 0 {
+                    function.instruction(&Instruction::LocalGet(enum_state.aux3_local));
+                    function.instruction(&Instruction::LocalGet(enum_state.base_local));
+                    function.instruction(&Instruction::I32Const(child_ctor_layout.row_stride as i32));
+                    function.instruction(&Instruction::I32Mul);
+                    function.instruction(&Instruction::I32Add);
+                    function.instruction(&Instruction::LocalSet(enum_state.aux3_local));
+                }
             }
-            function.instruction(&Instruction::LocalGet(enum_state.base_local));
-            function.instruction(&Instruction::LocalGet(enum_state.save_sp_local));
-            function.instruction(&Instruction::I32Const(4));
+
+            for tag in 0..tag_count {
+                for scratch_offset in [counts_base_offset, child_offsets_base_offset] {
+                    function.instruction(&Instruction::LocalGet(enum_state.aux0_local));
+                    function.instruction(&Instruction::I32Const(
+                        scratch_offset
+                            + i32::try_from(tag).map_err(|_| {
+                                SimdError::new("enum scratch tag index does not fit in i32")
+                            })? * 4,
+                    ));
+                    function.instruction(&Instruction::I32Add);
+                    function.instruction(&Instruction::I32Const(0));
+                    function.instruction(&Instruction::I32Store(memarg(0, 2)));
+                }
+            }
+
+            function.instruction(&Instruction::LocalGet(enum_state.aux2_local));
+            function.instruction(&Instruction::I32Const(tag_count_i32 * ENUM_CTOR_TABLE_ENTRY_BYTES));
+            function.instruction(&Instruction::I32Add);
+            function.instruction(&Instruction::LocalSet(enum_state.aux3_local));
+            for child_ctor_layout in &enum_ctor_layouts {
+                function.instruction(&Instruction::LocalGet(enum_state.aux2_local));
+                function.instruction(&Instruction::I32Const(
+                    i32::from(child_ctor_layout.tag) * ENUM_CTOR_TABLE_ENTRY_BYTES,
+                ));
+                function.instruction(&Instruction::I32Add);
+                function.instruction(&Instruction::LocalSet(enum_state.base_tmp_local));
+                function.instruction(&Instruction::LocalGet(enum_state.base_tmp_local));
+                function.instruction(&Instruction::I32Load(memarg(
+                    ENUM_CTOR_TABLE_ROW_COUNT_OFFSET,
+                    2,
+                )));
+                function.instruction(&Instruction::LocalSet(enum_state.base_local));
+                function.instruction(&Instruction::LocalGet(enum_state.base_tmp_local));
+                if child_ctor_layout.row_stride == 0 {
+                    function.instruction(&Instruction::I32Const(0));
+                } else {
+                    function.instruction(&Instruction::LocalGet(enum_state.aux3_local));
+                }
+                function.instruction(&Instruction::I32Store(memarg(ENUM_CTOR_TABLE_ROWS_PTR_OFFSET, 2)));
+                if child_ctor_layout.row_stride != 0 {
+                    function.instruction(&Instruction::LocalGet(enum_state.aux3_local));
+                    function.instruction(&Instruction::LocalGet(enum_state.base_local));
+                    function.instruction(&Instruction::I32Const(child_ctor_layout.row_stride as i32));
+                    function.instruction(&Instruction::I32Mul);
+                    function.instruction(&Instruction::I32Add);
+                    function.instruction(&Instruction::LocalSet(enum_state.aux3_local));
+                }
+            }
+
+            function.instruction(&Instruction::LocalGet(enum_state.aux5_local));
+            function.instruction(&Instruction::I32Const(i32::from(ctor_layout.tag)));
+            function.instruction(&Instruction::I32Store16(memarg(0, 1)));
+            function.instruction(&Instruction::LocalGet(enum_state.aux6_local));
+            function.instruction(&Instruction::LocalGet(enum_state.aux1_local));
+            function.instruction(&Instruction::I32Store(memarg(0, 2)));
+            function.instruction(&Instruction::LocalGet(enum_state.aux7_local));
+            function.instruction(&Instruction::I32Const(0));
+            function.instruction(&Instruction::I32Store(memarg(0, 2)));
+            function.instruction(&Instruction::LocalGet(enum_state.aux0_local));
+            function.instruction(&Instruction::I32Const(counts_base_offset + i32::from(ctor_layout.tag) * 4));
+            function.instruction(&Instruction::I32Add);
+            function.instruction(&Instruction::I32Const(1));
+            function.instruction(&Instruction::I32Store(memarg(0, 2)));
+
+            if ctor_layout.row_stride != 0 {
+                emit_enum_row_base_ptr_from_header(
+                    function,
+                    enum_state.aux4_local,
+                    &wasm_layout,
+                    &ctor_layout,
+                    enum_state,
+                );
+                function.instruction(&Instruction::LocalSet(enum_state.base_local));
+                for field_layout in &ctor_layout.non_recursive_fields {
+                    let arg_offset = arg_offsets[field_layout.source_index]
+                        .ok_or_else(|| SimdError::new("missing enum row field scratch offset"))?;
+                    function.instruction(&Instruction::LocalGet(enum_state.base_local));
+                    if field_layout.offset != 0 {
+                        function.instruction(&Instruction::I32Const(field_layout.offset as i32));
+                        function.instruction(&Instruction::I32Add);
+                    }
+                    function.instruction(&Instruction::LocalGet(enum_state.aux0_local));
+                    if arg_offset != 0 {
+                        function.instruction(&Instruction::I32Const(arg_offset));
+                        function.instruction(&Instruction::I32Add);
+                    }
+                    emit_load_type_from_address(function, &field_layout.ty, enum_state)?;
+                    emit_tape_enum_field_store(function, field_layout, enum_state)?;
+                }
+            }
+
+            function.instruction(&Instruction::I32Const(1));
+            function.instruction(&Instruction::LocalSet(enum_state.aux1_local));
+            let mut recursive_local_index = 0usize;
+            for field_ty in &ctor_info.fields {
+                if !is_wasm_direct_self_recursive_field(field_ty, ctor_info) {
+                    continue;
+                }
+                function.instruction(&Instruction::LocalGet(enum_state.aux0_local));
+                function.instruction(&Instruction::I32Const(
+                    child_handles_base_offset
+                        + i32::try_from(recursive_local_index).map_err(|_| {
+                            SimdError::new("enum recursive child index does not fit in i32")
+                        })? * 4,
+                ));
+                function.instruction(&Instruction::I32Add);
+                function.instruction(&Instruction::I32Load(memarg(0, 2)));
+                function.instruction(&Instruction::LocalSet(enum_state.ptr_local));
+                recursive_local_index += 1;
+                emit_assert_enum_root_zero(function, enum_state.ptr_local);
+                emit_enum_load_header_root(function, enum_state.ptr_local, enum_state);
+
+                for child_ctor_layout in &enum_ctor_layouts {
+                    function.instruction(&Instruction::LocalGet(enum_state.aux0_local));
+                    function.instruction(&Instruction::I32Const(
+                        counts_base_offset + i32::from(child_ctor_layout.tag) * 4,
+                    ));
+                    function.instruction(&Instruction::I32Add);
+                    function.instruction(&Instruction::I32Load(memarg(0, 2)));
+                    function.instruction(&Instruction::LocalSet(enum_state.save_sp_local));
+                    function.instruction(&Instruction::LocalGet(enum_state.aux0_local));
+                    function.instruction(&Instruction::I32Const(
+                        child_offsets_base_offset + i32::from(child_ctor_layout.tag) * 4,
+                    ));
+                    function.instruction(&Instruction::I32Add);
+                    function.instruction(&Instruction::LocalGet(enum_state.save_sp_local));
+                    function.instruction(&Instruction::I32Store(memarg(0, 2)));
+
+                    function.instruction(&Instruction::LocalGet(enum_state.base_local));
+                    function.instruction(&Instruction::I32Load(memarg(ENUM_HEADER_CTOR_TABLE_PTR_OFFSET, 2)));
+                    function.instruction(&Instruction::I32Const(
+                        i32::from(child_ctor_layout.tag) * ENUM_CTOR_TABLE_ENTRY_BYTES,
+                    ));
+                    function.instruction(&Instruction::I32Add);
+                    function.instruction(&Instruction::LocalTee(enum_state.aux3_local));
+                    function.instruction(&Instruction::I32Load(memarg(
+                        ENUM_CTOR_TABLE_ROW_COUNT_OFFSET,
+                        2,
+                    )));
+                    function.instruction(&Instruction::LocalSet(enum_state.aux8_local));
+
+                    if child_ctor_layout.row_stride != 0 {
+                        emit_enum_row_base_ptr_from_header(
+                            function,
+                            enum_state.base_local,
+                            &wasm_layout,
+                            child_ctor_layout,
+                            enum_state,
+                        );
+                        function.instruction(&Instruction::LocalSet(enum_state.ptr_local));
+                        emit_enum_row_base_ptr_from_header(
+                            function,
+                            enum_state.aux4_local,
+                            &wasm_layout,
+                            child_ctor_layout,
+                            enum_state,
+                        );
+                        function.instruction(&Instruction::LocalGet(enum_state.save_sp_local));
+                        function.instruction(&Instruction::I32Const(child_ctor_layout.row_stride as i32));
+                        function.instruction(&Instruction::I32Mul);
+                        function.instruction(&Instruction::I32Add);
+                        function.instruction(&Instruction::LocalSet(enum_state.aux3_local));
+                        function.instruction(&Instruction::LocalGet(enum_state.aux8_local));
+                        function.instruction(&Instruction::I32Const(
+                            i32::try_from(child_ctor_layout.row_stride / 4)
+                                .map_err(|_| SimdError::new("enum row stride words do not fit in i32"))?,
+                        ));
+                        function.instruction(&Instruction::I32Mul);
+                        function.instruction(&Instruction::LocalSet(enum_state.scratch_sp_local));
+                        emit_copy_i32_words(
+                            function,
+                            enum_state.ptr_local,
+                            enum_state.aux3_local,
+                            enum_state.scratch_sp_local,
+                        );
+                    }
+
+                    function.instruction(&Instruction::LocalGet(enum_state.aux0_local));
+                    function.instruction(&Instruction::I32Const(
+                        counts_base_offset + i32::from(child_ctor_layout.tag) * 4,
+                    ));
+                    function.instruction(&Instruction::I32Add);
+                    function.instruction(&Instruction::LocalGet(enum_state.save_sp_local));
+                    function.instruction(&Instruction::LocalGet(enum_state.aux8_local));
+                    function.instruction(&Instruction::I32Add);
+                    function.instruction(&Instruction::I32Store(memarg(0, 2)));
+                }
+
+                function.instruction(&Instruction::I32Const(0));
+                function.instruction(&Instruction::LocalSet(enum_state.ptr_local));
+                function.instruction(&Instruction::Block(BlockType::Empty));
+                function.instruction(&Instruction::Loop(BlockType::Empty));
+                function.instruction(&Instruction::LocalGet(enum_state.ptr_local));
+                function.instruction(&Instruction::LocalGet(enum_state.base_local));
+                function.instruction(&Instruction::I32Load(memarg(ENUM_HEADER_NODE_COUNT_OFFSET, 2)));
+                function.instruction(&Instruction::I32GeU);
+                function.instruction(&Instruction::BrIf(1));
+
+                function.instruction(&Instruction::LocalGet(enum_state.base_local));
+                function.instruction(&Instruction::I32Load(memarg(ENUM_HEADER_TAGS_PTR_OFFSET, 2)));
+                function.instruction(&Instruction::LocalGet(enum_state.ptr_local));
+                function.instruction(&Instruction::I32Const(ENUM_TAG_BYTES));
+                function.instruction(&Instruction::I32Mul);
+                function.instruction(&Instruction::I32Add);
+                function.instruction(&Instruction::I32Load16U(memarg(0, 1)));
+                function.instruction(&Instruction::LocalSet(enum_state.save_sp_local));
+
+                function.instruction(&Instruction::LocalGet(enum_state.aux5_local));
+                function.instruction(&Instruction::LocalGet(enum_state.aux1_local));
+                function.instruction(&Instruction::LocalGet(enum_state.ptr_local));
+                function.instruction(&Instruction::I32Add);
+                function.instruction(&Instruction::I32Const(ENUM_TAG_BYTES));
+                function.instruction(&Instruction::I32Mul);
+                function.instruction(&Instruction::I32Add);
+                function.instruction(&Instruction::LocalGet(enum_state.save_sp_local));
+                function.instruction(&Instruction::I32Store16(memarg(0, 1)));
+
+                function.instruction(&Instruction::LocalGet(enum_state.aux6_local));
+                function.instruction(&Instruction::LocalGet(enum_state.aux1_local));
+                function.instruction(&Instruction::LocalGet(enum_state.ptr_local));
+                function.instruction(&Instruction::I32Add);
+                function.instruction(&Instruction::I32Const(ENUM_END_BYTES));
+                function.instruction(&Instruction::I32Mul);
+                function.instruction(&Instruction::I32Add);
+                function.instruction(&Instruction::LocalGet(enum_state.base_local));
+                function.instruction(&Instruction::I32Load(memarg(ENUM_HEADER_ENDS_PTR_OFFSET, 2)));
+                function.instruction(&Instruction::LocalGet(enum_state.ptr_local));
+                function.instruction(&Instruction::I32Const(ENUM_END_BYTES));
+                function.instruction(&Instruction::I32Mul);
+                function.instruction(&Instruction::I32Add);
+                function.instruction(&Instruction::I32Load(memarg(0, 2)));
+                function.instruction(&Instruction::LocalGet(enum_state.aux1_local));
+                function.instruction(&Instruction::I32Add);
+                function.instruction(&Instruction::I32Store(memarg(0, 2)));
+
+                function.instruction(&Instruction::LocalGet(enum_state.aux7_local));
+                function.instruction(&Instruction::LocalGet(enum_state.aux1_local));
+                function.instruction(&Instruction::LocalGet(enum_state.ptr_local));
+                function.instruction(&Instruction::I32Add);
+                function.instruction(&Instruction::I32Const(ENUM_SLOT_BYTES));
+                function.instruction(&Instruction::I32Mul);
+                function.instruction(&Instruction::I32Add);
+                function.instruction(&Instruction::LocalGet(enum_state.base_local));
+                function.instruction(&Instruction::I32Load(memarg(ENUM_HEADER_SLOTS_PTR_OFFSET, 2)));
+                function.instruction(&Instruction::LocalGet(enum_state.ptr_local));
+                function.instruction(&Instruction::I32Const(ENUM_SLOT_BYTES));
+                function.instruction(&Instruction::I32Mul);
+                function.instruction(&Instruction::I32Add);
+                function.instruction(&Instruction::I32Load(memarg(0, 2)));
+                function.instruction(&Instruction::LocalGet(enum_state.aux0_local));
+                function.instruction(&Instruction::I32Const(child_offsets_base_offset));
+                function.instruction(&Instruction::I32Add);
+                function.instruction(&Instruction::LocalGet(enum_state.save_sp_local));
+                function.instruction(&Instruction::I32Const(4));
+                function.instruction(&Instruction::I32Mul);
+                function.instruction(&Instruction::I32Add);
+                function.instruction(&Instruction::I32Load(memarg(0, 2)));
+                function.instruction(&Instruction::I32Add);
+                function.instruction(&Instruction::I32Store(memarg(0, 2)));
+
+                function.instruction(&Instruction::LocalGet(enum_state.ptr_local));
+                function.instruction(&Instruction::I32Const(1));
+                function.instruction(&Instruction::I32Add);
+                function.instruction(&Instruction::LocalSet(enum_state.ptr_local));
+                function.instruction(&Instruction::Br(0));
+                function.instruction(&Instruction::End);
+                function.instruction(&Instruction::End);
+
+                function.instruction(&Instruction::LocalGet(enum_state.aux1_local));
+                function.instruction(&Instruction::LocalGet(enum_state.base_local));
+                function.instruction(&Instruction::I32Load(memarg(ENUM_HEADER_NODE_COUNT_OFFSET, 2)));
+                function.instruction(&Instruction::I32Add);
+                function.instruction(&Instruction::LocalSet(enum_state.aux1_local));
+            }
+
+            function.instruction(&Instruction::LocalGet(enum_state.aux6_local));
+            function.instruction(&Instruction::LocalGet(enum_state.aux1_local));
+            function.instruction(&Instruction::I32Store(memarg(0, 2)));
+            for child_ctor_layout in &enum_ctor_layouts {
+                function.instruction(&Instruction::LocalGet(enum_state.aux2_local));
+                function.instruction(&Instruction::I32Const(
+                    i32::from(child_ctor_layout.tag) * ENUM_CTOR_TABLE_ENTRY_BYTES,
+                ));
+                function.instruction(&Instruction::I32Add);
+                function.instruction(&Instruction::LocalGet(enum_state.aux0_local));
+                function.instruction(&Instruction::I32Const(
+                    counts_base_offset + i32::from(child_ctor_layout.tag) * 4,
+                ));
+                function.instruction(&Instruction::I32Add);
+                function.instruction(&Instruction::I32Load(memarg(0, 2)));
+                function.instruction(&Instruction::I32Store(memarg(
+                    ENUM_CTOR_TABLE_ROW_COUNT_OFFSET,
+                    2,
+                )));
+            }
+
+            function.instruction(&Instruction::LocalGet(enum_state.aux4_local));
+            function.instruction(&Instruction::I32Const(ENUM_REF_CELL_BYTES));
             function.instruction(&Instruction::I32Sub);
-            function.instruction(&Instruction::LocalSet(enum_state.save_sp_local));
+            function.instruction(&Instruction::LocalGet(enum_state.aux0_local));
+            function.instruction(&Instruction::LocalSet(enum_state.scratch_sp_local));
+            function.instruction(&Instruction::I32Const(ENUM_SAVE_STACK_PTR_ADDR as i32));
+            function.instruction(&Instruction::LocalGet(enum_state.scratch_sp_local));
+            function.instruction(&Instruction::I32Store(memarg(0, 2)));
         }
         IrExprKind::EnumTag { value } => {
+            let enum_state = enum_state.ok_or_else(|| {
+                SimdError::new("internal error: missing enum scratch local for enum tag load")
+            })?;
             compile_scalar_ir_expr_with_hoists(
                 function,
                 value,
@@ -8589,11 +10239,13 @@ fn compile_scalar_ir_expr_with_hoists(
                 scalar_indices,
                 signatures,
                 enum_ctors,
-                enum_state,
+                wasm_enum_layouts,
+                enum_state.into(),
                 hoisted_locals,
                 inline_bindings,
             )?;
-            function.instruction(&Instruction::I32Load(memarg(0, 2)));
+            function.instruction(&Instruction::LocalSet(enum_state.ptr_local));
+            emit_enum_tag_load_from_value(function, enum_state.ptr_local, enum_state);
             if matches!(expr.ty, Type::Scalar(Prim::I64)) {
                 function.instruction(&Instruction::I64ExtendI32U);
             }
@@ -8605,6 +10257,20 @@ fn compile_scalar_ir_expr_with_hoists(
             let ctor_info = enum_ctors
                 .get(ctor)
                 .ok_or_else(|| SimdError::new(format!("unknown constructor '{}'", ctor)))?;
+            let Type::Named(_, enum_args) = &value.ty else {
+                return Err(SimdError::new(format!(
+                    "enum child projection '{}' requires enum value type, found {:?}",
+                    ctor, value.ty
+                )));
+            };
+            let wasm_layout =
+                lookup_specialized_wasm_enum_layout(wasm_enum_layouts, &ctor_info.enum_name, enum_args)?;
+            let ctor_layout = lookup_specialized_wasm_enum_ctor_layout(
+                wasm_enum_layouts,
+                &ctor_info.enum_name,
+                enum_args,
+                ctor,
+            )?;
             let recursive_fields = enum_ctor_recursive_field_indices(ctor_info);
             let source_field = *recursive_fields.get(*slot).ok_or_else(|| {
                 SimdError::new(format!(
@@ -8625,12 +10291,21 @@ fn compile_scalar_ir_expr_with_hoists(
                 scalar_indices,
                 signatures,
                 enum_ctors,
+                wasm_enum_layouts,
                 enum_state.into(),
                 hoisted_locals,
                 inline_bindings,
             )?;
             function.instruction(&Instruction::LocalSet(enum_state.ptr_local));
-            emit_enum_field_load(function, enum_state.ptr_local, source_field, field_ty)?;
+            emit_enum_field_load(
+                function,
+                enum_state.ptr_local,
+                &wasm_layout,
+                &ctor_layout,
+                source_field,
+                field_ty,
+                enum_state,
+            )?;
         }
         IrExprKind::EnumNonRecField { value, ctor, field } => {
             let enum_state = enum_state.ok_or_else(|| {
@@ -8641,6 +10316,20 @@ fn compile_scalar_ir_expr_with_hoists(
             let ctor_info = enum_ctors
                 .get(ctor)
                 .ok_or_else(|| SimdError::new(format!("unknown constructor '{}'", ctor)))?;
+            let Type::Named(_, enum_args) = &value.ty else {
+                return Err(SimdError::new(format!(
+                    "enum field projection '{}' requires enum value type, found {:?}",
+                    ctor, value.ty
+                )));
+            };
+            let wasm_layout =
+                lookup_specialized_wasm_enum_layout(wasm_enum_layouts, &ctor_info.enum_name, enum_args)?;
+            let ctor_layout = lookup_specialized_wasm_enum_ctor_layout(
+                wasm_enum_layouts,
+                &ctor_info.enum_name,
+                enum_args,
+                ctor,
+            )?;
             let non_recursive_fields = enum_ctor_non_recursive_field_indices(ctor_info);
             let source_field = *non_recursive_fields.get(*field).ok_or_else(|| {
                 SimdError::new(format!(
@@ -8655,12 +10344,21 @@ fn compile_scalar_ir_expr_with_hoists(
                 scalar_indices,
                 signatures,
                 enum_ctors,
+                wasm_enum_layouts,
                 enum_state.into(),
                 hoisted_locals,
                 inline_bindings,
             )?;
             function.instruction(&Instruction::LocalSet(enum_state.ptr_local));
-            emit_enum_field_load(function, enum_state.ptr_local, source_field, &expr.ty)?;
+            emit_enum_field_load(
+                function,
+                enum_state.ptr_local,
+                &wasm_layout,
+                &ctor_layout,
+                source_field,
+                &expr.ty,
+                enum_state,
+            )?;
         }
         IrExprKind::Let { bindings, body } => {
             let mut extended = inline_bindings.clone();
@@ -8674,6 +10372,7 @@ fn compile_scalar_ir_expr_with_hoists(
                 scalar_indices,
                 signatures,
                 enum_ctors,
+                wasm_enum_layouts,
                 enum_state,
                 hoisted_locals,
                 &extended,
@@ -8684,24 +10383,26 @@ fn compile_scalar_ir_expr_with_hoists(
                 compile_scalar_ir_expr_with_hoists(
                     function,
                     &args[0],
-                    locals,
-                    scalar_indices,
-                    signatures,
-                    enum_ctors,
-                    enum_state,
-                    hoisted_locals,
-                    inline_bindings,
+                locals,
+                scalar_indices,
+                signatures,
+                enum_ctors,
+                wasm_enum_layouts,
+                enum_state,
+                hoisted_locals,
+                inline_bindings,
                 )?;
                 compile_scalar_ir_expr_with_hoists(
                     function,
                     &args[1],
-                    locals,
-                    scalar_indices,
-                    signatures,
-                    enum_ctors,
-                    enum_state,
-                    hoisted_locals,
-                    inline_bindings,
+                locals,
+                scalar_indices,
+                signatures,
+                enum_ctors,
+                wasm_enum_layouts,
+                enum_state,
+                hoisted_locals,
+                inline_bindings,
                 )?;
                 emit_scalar_primitive(function, *op, expr.ty.prim().unwrap_or(Prim::I64), args)?;
             }
@@ -8714,13 +10415,14 @@ fn compile_scalar_ir_expr_with_hoists(
                     compile_scalar_ir_expr_with_hoists(
                         function,
                         arg,
-                        locals,
-                        scalar_indices,
-                        signatures,
-                        enum_ctors,
-                        enum_state,
-                        hoisted_locals,
-                        inline_bindings,
+                    locals,
+                    scalar_indices,
+                    signatures,
+                    enum_ctors,
+                    wasm_enum_layouts,
+                    enum_state,
+                    hoisted_locals,
+                    inline_bindings,
                     )?;
                     if arg.ty != ty {
                         return Err(SimdError::new(format!(
@@ -9720,6 +11422,255 @@ fn byte_width(prim: Prim) -> u32 {
     }
 }
 
+fn wasm_enum_field_storage_bytes(ty: &Type) -> Result<u32> {
+    match ty {
+        Type::Scalar(prim) => Ok(byte_width(*prim)),
+        Type::Named(name, args) if is_wasm_enum_named_type(name, args) => Ok(4),
+        Type::Named(name, args) if is_wasm_string_named_type(name, args) => Ok(8),
+        other => Err(SimdError::new(format!(
+            "Wasm enum tape rows do not support non-recursive field type {:?}",
+            other
+        ))),
+    }
+}
+
+fn build_specialized_wasm_enum_ctor_layout(
+    ctor_name: &str,
+    ctor: &EnumCtorInfo,
+    enum_args: &[Type],
+) -> Result<WasmEnumCtorLayout> {
+    if ctor.enum_params.len() != enum_args.len() {
+        return Err(SimdError::new(format!(
+            "constructor '{}.{}' expected {} enum args, found {}",
+            ctor.enum_name,
+            ctor_name,
+            ctor.enum_params.len(),
+            enum_args.len()
+        )));
+    }
+    let subst = ctor
+        .enum_params
+        .iter()
+        .cloned()
+        .zip(enum_args.iter().cloned())
+        .collect::<BTreeMap<_, _>>();
+    let mut row_stride = 0u32;
+    let mut recursive_field_indices = Vec::new();
+    let mut non_recursive_fields = Vec::new();
+    for (field_index, field_ty) in ctor.fields.iter().enumerate() {
+        let specialized_ty = apply_type_subst(field_ty, &subst);
+        if is_wasm_direct_self_recursive_field(field_ty, ctor) {
+            recursive_field_indices.push(field_index);
+            continue;
+        }
+        let offset = row_stride;
+        row_stride = row_stride
+            .checked_add(wasm_enum_field_storage_bytes(&specialized_ty)?)
+            .ok_or_else(|| SimdError::new("enum row stride overflow"))?;
+        non_recursive_fields.push(WasmEnumFieldLayout {
+            source_index: field_index,
+            row_index: non_recursive_fields.len(),
+            offset,
+            ty: specialized_ty,
+        });
+    }
+    Ok(WasmEnumCtorLayout {
+        ctor_name: ctor_name.to_string(),
+        tag: ctor.tag,
+        row_stride,
+        recursive_field_indices,
+        non_recursive_fields,
+    })
+}
+
+fn build_specialized_wasm_enum_layout(
+    enum_name: &str,
+    enum_args: &[Type],
+    enum_ctors: &BTreeMap<String, EnumCtorInfo>,
+) -> Result<WasmEnumLayout> {
+    let enum_names = enum_ctors
+        .values()
+        .map(|ctor| ctor.enum_name.clone())
+        .collect::<BTreeSet<_>>();
+    let enum_id = enum_names
+        .iter()
+        .position(|name| name == enum_name)
+        .ok_or_else(|| SimdError::new(format!("unknown enum '{}' in Wasm layout build", enum_name)))?;
+    let mut max_tag = 0u16;
+    let mut ctors = BTreeMap::new();
+    for (ctor_name, ctor) in enum_ctors.iter().filter(|(_, ctor)| ctor.enum_name == enum_name) {
+        max_tag = max_tag.max(ctor.tag);
+        ctors.insert(
+            ctor_name.clone(),
+            build_specialized_wasm_enum_ctor_layout(ctor_name, ctor, enum_args)?,
+        );
+    }
+    Ok(WasmEnumLayout {
+        enum_name: enum_name.to_string(),
+        enum_id: u32::try_from(enum_id).map_err(|_| SimdError::new("enum id does not fit in u32"))?,
+        max_tag,
+        ctors,
+    })
+}
+
+fn specialized_wasm_enum_layout_key(enum_name: &str, enum_args: &[Type]) -> String {
+    format!("{enum_name}::{enum_args:?}")
+}
+
+fn enqueue_precomputed_wasm_enum_layout_types(
+    ty: &Type,
+    seen: &mut BTreeSet<String>,
+    queue: &mut VecDeque<(String, Vec<Type>)>,
+) {
+    match ty {
+        Type::Scalar(_) | Type::Bulk(_, _) | Type::Var(_) | Type::Infer(_) => {}
+        Type::TypeToken(inner) => {
+            enqueue_precomputed_wasm_enum_layout_types(inner, seen, queue);
+        }
+        Type::Record(fields) => {
+            for field_ty in fields.values() {
+                enqueue_precomputed_wasm_enum_layout_types(field_ty, seen, queue);
+            }
+        }
+        Type::Fun(args, ret) => {
+            for arg in args {
+                enqueue_precomputed_wasm_enum_layout_types(arg, seen, queue);
+            }
+            enqueue_precomputed_wasm_enum_layout_types(ret, seen, queue);
+        }
+        Type::Named(name, args) => {
+            for arg in args {
+                enqueue_precomputed_wasm_enum_layout_types(arg, seen, queue);
+            }
+            if is_wasm_enum_named_type(name, args) {
+                let key = specialized_wasm_enum_layout_key(name, args);
+                if seen.insert(key) {
+                    queue.push_back((name.clone(), args.clone()));
+                }
+            }
+        }
+    }
+}
+
+fn enqueue_precomputed_wasm_enum_layout_expr_types(
+    expr: &TypedExpr,
+    seen: &mut BTreeSet<String>,
+    queue: &mut VecDeque<(String, Vec<Type>)>,
+) {
+    enqueue_precomputed_wasm_enum_layout_types(&expr.ty, seen, queue);
+    match &expr.kind {
+        TypedExprKind::Local(_)
+        | TypedExprKind::FunctionRef { .. }
+        | TypedExprKind::ConstructorRef { .. }
+        | TypedExprKind::Int(_, _)
+        | TypedExprKind::Float(_, _)
+        | TypedExprKind::Bool(_)
+        | TypedExprKind::Char(_)
+        | TypedExprKind::String(_)
+        | TypedExprKind::TypeToken(_) => {}
+        TypedExprKind::Lambda { body, .. } => {
+            enqueue_precomputed_wasm_enum_layout_expr_types(body, seen, queue);
+        }
+        TypedExprKind::Let { bindings, body } => {
+            for binding in bindings {
+                enqueue_precomputed_wasm_enum_layout_expr_types(&binding.expr, seen, queue);
+            }
+            enqueue_precomputed_wasm_enum_layout_expr_types(body, seen, queue);
+        }
+        TypedExprKind::Record(fields) => {
+            for field in fields.values() {
+                enqueue_precomputed_wasm_enum_layout_expr_types(field, seen, queue);
+            }
+        }
+        TypedExprKind::Project { base, .. } => {
+            enqueue_precomputed_wasm_enum_layout_expr_types(base, seen, queue);
+        }
+        TypedExprKind::RecordUpdate { base, fields } => {
+            enqueue_precomputed_wasm_enum_layout_expr_types(base, seen, queue);
+            for field in fields.values() {
+                enqueue_precomputed_wasm_enum_layout_expr_types(field, seen, queue);
+            }
+        }
+        TypedExprKind::Call { args, .. } => {
+            for arg in args {
+                enqueue_precomputed_wasm_enum_layout_expr_types(&arg.expr, seen, queue);
+            }
+        }
+        TypedExprKind::Apply { callee, arg } => {
+            enqueue_precomputed_wasm_enum_layout_expr_types(callee, seen, queue);
+            enqueue_precomputed_wasm_enum_layout_expr_types(arg, seen, queue);
+        }
+    }
+}
+
+fn build_precomputed_wasm_enum_layouts(
+    checked_program: &CheckedProgram,
+) -> Result<BTreeMap<String, WasmEnumLayout>> {
+    let mut seen = BTreeSet::<String>::new();
+    let mut queue = VecDeque::<(String, Vec<Type>)>::new();
+    for function in &checked_program.functions {
+        enqueue_precomputed_wasm_enum_layout_types(&function.signature.ty, &mut seen, &mut queue);
+        for clause in &function.clauses {
+            for pattern in &clause.patterns {
+                enqueue_precomputed_wasm_enum_layout_types(&pattern.ty, &mut seen, &mut queue);
+            }
+            enqueue_precomputed_wasm_enum_layout_expr_types(&clause.body, &mut seen, &mut queue);
+        }
+    }
+
+    let mut layouts = BTreeMap::<String, WasmEnumLayout>::new();
+    while let Some((enum_name, enum_args)) = queue.pop_front() {
+        let key = specialized_wasm_enum_layout_key(&enum_name, &enum_args);
+        if layouts.contains_key(&key) {
+            continue;
+        }
+        let layout =
+            build_specialized_wasm_enum_layout(&enum_name, &enum_args, &checked_program.enum_ctors)?;
+        for ctor_layout in layout.ctors.values() {
+            for field_layout in &ctor_layout.non_recursive_fields {
+                enqueue_precomputed_wasm_enum_layout_types(
+                    &field_layout.ty,
+                    &mut seen,
+                    &mut queue,
+                );
+            }
+        }
+        layouts.insert(key, layout);
+    }
+    Ok(layouts)
+}
+
+fn lookup_specialized_wasm_enum_layout<'a>(
+    wasm_enum_layouts: &'a BTreeMap<String, WasmEnumLayout>,
+    enum_name: &str,
+    enum_args: &[Type],
+) -> Result<&'a WasmEnumLayout> {
+    let key = specialized_wasm_enum_layout_key(enum_name, enum_args);
+    wasm_enum_layouts.get(&key).ok_or_else(|| {
+        SimdError::new(format!(
+            "missing precomputed Wasm enum layout for '{}<{:?}>'",
+            enum_name, enum_args
+        ))
+    })
+}
+
+fn lookup_specialized_wasm_enum_ctor_layout<'a>(
+    wasm_enum_layouts: &'a BTreeMap<String, WasmEnumLayout>,
+    enum_name: &str,
+    enum_args: &[Type],
+    ctor_name: &str,
+) -> Result<&'a WasmEnumCtorLayout> {
+    lookup_specialized_wasm_enum_layout(wasm_enum_layouts, enum_name, enum_args)?
+        .ctors
+        .get(ctor_name)
+        .ok_or_else(|| {
+            SimdError::new(format!(
+                "missing precomputed Wasm ctor layout for '{}.{}<{:?}>'",
+                enum_name, ctor_name, enum_args
+            ))
+        })
+}
+
 #[derive(Debug, Clone)]
 struct WasmPlan {
     checked: CheckedProgram,
@@ -10560,11 +12511,53 @@ fn is_wasm_enum_named_type(name: &str, args: &[Type]) -> bool {
     !(args.is_empty() && (name == "string" || name == "bool"))
 }
 
+fn ensure_wasmtime_cache_config() -> Result<String> {
+    let cache_root = if let Some(root) = std::env::var_os("SIMD_WASMTIME_CACHE_ROOT") {
+        std::path::PathBuf::from(root)
+    } else {
+        let cwd = std::env::current_dir().map_err(|error| {
+            SimdError::new(format!("failed to read current directory: {}", error))
+        })?;
+        cwd.join(".tmp/wasmtime-cache")
+    };
+    let cache_dir = cache_root.join("artifacts");
+    fs::create_dir_all(&cache_dir).map_err(|error| {
+        SimdError::new(format!(
+            "failed to create Wasmtime cache directory '{}': {}",
+            cache_dir.display(),
+            error
+        ))
+    })?;
+    let config_path = cache_root.join("config.toml");
+    let config_text = format!("[cache]\ndirectory = '{}'\n", cache_dir.display());
+    let should_write = match fs::read_to_string(&config_path) {
+        Ok(existing) => existing != config_text,
+        Err(_) => true,
+    };
+    if should_write {
+        fs::write(&config_path, config_text).map_err(|error| {
+            SimdError::new(format!(
+                "failed to write Wasmtime cache config '{}': {}",
+                config_path.display(),
+                error
+            ))
+        })?;
+    }
+    Ok(config_path.display().to_string())
+}
+
 fn build_engine() -> Result<Engine> {
     let mut config = Config::new();
     config.wasm_simd(true);
     config.wasm_tail_call(true);
     config.cranelift_opt_level(OptLevel::Speed);
+    let cache_config_path = ensure_wasmtime_cache_config()?;
+    config.cache(Some(
+        Cache::from_file(Some(std::path::Path::new(&cache_config_path)))
+            .map_err(|error| {
+                SimdError::new(format!("failed to load Wasmtime cache config: {error}"))
+            })?,
+    ));
     Engine::new(&config).map_err(|error| SimdError::new(format!("wasmtime engine error: {error}")))
 }
 
@@ -10609,7 +12602,9 @@ fn summarize_function_param_uses(
 
     let mut summary = vec![UsageCount::Zero; arity];
     let clauses = match &function.kind {
-        LoweredKind::Scalar { clauses } | LoweredKind::Kernel { clauses, .. } => clauses,
+        LoweredKind::Scalar { clauses }
+        | LoweredKind::Structural { clauses }
+        | LoweredKind::Kernel { clauses, .. } => clauses,
     };
     for clause in clauses {
         let clause_summary = summarize_clause_param_uses(clause, arity, functions, memo, visiting);
@@ -10946,6 +12941,7 @@ fn execute_wasm_artifact_grouped_in_runtime(
             output_ptr = Some(output_base);
             output_len = Some(bulk.len);
         }
+        runtime.sync_enum_heap_ptr()?;
         func.call(&mut runtime.store, &wasm_args, &mut results)
             .map_err(|error| SimdError::new(format!("Wasm execution failed: {error}")))?;
         let value = match leaf.result {
@@ -11064,6 +13060,7 @@ fn execute_wasm_artifact_grouped_export_in_runtime(
         }
     }
 
+    runtime.sync_enum_heap_ptr()?;
     func.call(&mut runtime.store, &wasm_args, &mut [])
         .map_err(|error| SimdError::new(format!("Wasm grouped execution failed: {error}")))?;
 
@@ -11629,6 +13626,7 @@ fn execute_wasm_artifact_direct_in_runtime(
     } else {
         Vec::new()
     };
+    runtime.sync_enum_heap_ptr()?;
     func.call(&mut runtime.store, &wasm_args, &mut results)
         .map_err(|error| SimdError::new(format!("Wasm execution failed: {error}")))?;
 
@@ -11649,12 +13647,19 @@ fn execute_wasm_artifact_direct_in_runtime(
                             )))
                         }
                     };
+                    let wasm_layout = lookup_specialized_wasm_enum_layout(
+                        &artifact.wasm_enum_layouts,
+                        enum_name,
+                        args,
+                    )?;
                     return decode_wasm_enum_value_from_ptr(
                         &memory,
                         &runtime.store,
                         ptr,
                         enum_name,
                         &artifact.enum_ctors,
+                        &artifact.wasm_enum_layouts,
+                        wasm_layout,
                     );
                 }
             }
@@ -11685,70 +13690,216 @@ fn decode_wasm_enum_value_from_ptr(
     ptr: i32,
     enum_name: &str,
     enum_ctors: &BTreeMap<String, EnumCtorInfo>,
+    wasm_enum_layouts: &BTreeMap<String, WasmEnumLayout>,
+    wasm_layout: &WasmEnumLayout,
 ) -> Result<Value> {
-    let node_ptr = usize::try_from(ptr)
+    let ref_ptr = usize::try_from(ptr)
         .map_err(|_| SimdError::new(format!("invalid negative enum handle '{}'", ptr)))?;
-    if node_ptr == 0 {
+    if ref_ptr == 0 {
         return Err(SimdError::new("enum handle 0 is invalid"));
     }
-    let tag = read_i32_from_memory(memory, store, node_ptr)?;
-    if tag < 0 || tag > i32::from(u16::MAX) {
+    let header_ptr = usize::try_from(read_i32_from_memory(
+        memory,
+        store,
+        ref_ptr + ENUM_REF_HEADER_OFFSET as usize,
+    )?)
+    .map_err(|_| SimdError::new("enum ref header pointer conversion failed"))?;
+    let root = u32::try_from(read_i32_from_memory(
+        memory,
+        store,
+        ref_ptr + ENUM_REF_ROOT_OFFSET as usize,
+    )?)
+    .map_err(|_| SimdError::new("enum ref root conversion failed"))?;
+    let node_count = usize::try_from(read_i32_from_memory(
+        memory,
+        store,
+        header_ptr + ENUM_HEADER_NODE_COUNT_OFFSET as usize,
+    )?)
+    .map_err(|_| SimdError::new("enum header node_count conversion failed"))?;
+    if root as usize >= node_count {
         return Err(SimdError::new(format!(
-            "enum node tag '{}' is out of range",
-            tag
+            "enum root {} is out of bounds for node_count {}",
+            root, node_count
         )));
     }
-    let (ctor_name, ctor_info) = find_enum_ctor_by_tag(enum_name, tag as u16, enum_ctors)?;
-    let field_count = read_i32_from_memory(memory, store, node_ptr + 4)?;
-    if field_count < 0 {
-        return Err(SimdError::new(format!(
-            "enum constructor '{}' has invalid negative field count '{}'",
-            ctor_name, field_count
-        )));
-    }
-    if usize::try_from(field_count).ok() != Some(ctor_info.fields.len()) {
-        return Err(SimdError::new(format!(
-            "enum constructor '{}' expected {} fields, found {}",
-            ctor_name,
-            ctor_info.fields.len(),
-            field_count
-        )));
-    }
-    let mut args = Vec::with_capacity(ctor_info.fields.len());
-    for (index, field_ty) in ctor_info.fields.iter().enumerate() {
-        let slot_ptr = node_ptr + 8 + (index * 8);
-        args.push(decode_wasm_enum_field_value(
+    let tags_ptr = usize::try_from(read_i32_from_memory(
+        memory,
+        store,
+        header_ptr + ENUM_HEADER_TAGS_PTR_OFFSET as usize,
+    )?)
+    .map_err(|_| SimdError::new("enum tags pointer conversion failed"))?;
+    let _ends_ptr = usize::try_from(read_i32_from_memory(
+        memory,
+        store,
+        header_ptr + ENUM_HEADER_ENDS_PTR_OFFSET as usize,
+    )?)
+    .map_err(|_| SimdError::new("enum ends pointer conversion failed"))?;
+    let _slots_ptr = usize::try_from(read_i32_from_memory(
+        memory,
+        store,
+        header_ptr + ENUM_HEADER_SLOTS_PTR_OFFSET as usize,
+    )?)
+    .map_err(|_| SimdError::new("enum slots pointer conversion failed"))?;
+    let ctor_table_ptr = usize::try_from(read_i32_from_memory(
+        memory,
+        store,
+        header_ptr + ENUM_HEADER_CTOR_TABLE_PTR_OFFSET as usize,
+    )?)
+    .map_err(|_| SimdError::new("enum ctor-table pointer conversion failed"))?;
+
+    let mut tags = Vec::with_capacity(node_count);
+    for index in 0..node_count {
+        tags.push(read_u16_from_memory(
             memory,
             store,
-            slot_ptr,
-            field_ty,
-            enum_ctors,
+            tags_ptr + index * ENUM_TAG_BYTES as usize,
         )?);
     }
-    build_enum_value(enum_ctors, ctor_name, args)
+    let tag_names = enum_ctors
+        .iter()
+        .filter(|(_, info)| info.enum_name == enum_name)
+        .map(|(name, info)| (info.tag, name.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let ctor_recursive_mask = enum_ctors
+        .iter()
+        .filter(|(_, info)| info.enum_name == enum_name)
+        .map(|(name, info)| {
+            (
+                name.clone(),
+                info.fields
+                    .iter()
+                    .map(|field| enum_field_is_recursive(field, info))
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    let mut slots = Vec::with_capacity(node_count);
+    let mut next_slot_by_tag = BTreeMap::<u16, u32>::new();
+    for tag in &tags {
+        let slot = next_slot_by_tag.entry(*tag).or_insert(0);
+        slots.push(*slot);
+        *slot += 1;
+    }
+
+    let mut ends = vec![0u32; node_count];
+    for index in (0..node_count).rev() {
+        let tag = tags[index];
+        let ctor_name = tag_names.get(&tag).ok_or_else(|| {
+            SimdError::new(format!("missing constructor name for enum tag {}", tag))
+        })?;
+        let recursive_count = ctor_recursive_mask
+            .get(ctor_name)
+            .map(|mask| mask.iter().filter(|is_recursive| **is_recursive).count())
+            .ok_or_else(|| {
+                SimdError::new(format!(
+                    "missing recursive-field mask for constructor '{}'",
+                    ctor_name
+                ))
+            })?;
+        if recursive_count == 0 {
+            ends[index] = (index + 1) as u32;
+            continue;
+        }
+        let mut child = index + 1;
+        for _ in 0..recursive_count {
+            let next_child = *ends.get(child).ok_or_else(|| {
+                SimdError::new(format!(
+                    "enum child root {} is out of bounds while rebuilding tape ends",
+                    child
+                ))
+            })? as usize;
+            child = next_child;
+        }
+        ends[index] = child as u32;
+    }
+
+    let mut ctor_rows = BTreeMap::<String, Vec<EnumCtorRow>>::new();
+    let mut ctor_layouts = wasm_layout.ctors.values().cloned().collect::<Vec<_>>();
+    ctor_layouts.sort_by_key(|layout| layout.tag);
+    let mut row_cursor = ctor_table_ptr + (usize::from(wasm_layout.max_tag) + 1) * ENUM_CTOR_TABLE_ENTRY_BYTES as usize;
+    for ctor_layout in &ctor_layouts {
+        let row_count = usize::try_from(
+            next_slot_by_tag
+                .get(&ctor_layout.tag)
+                .copied()
+                .unwrap_or(0),
+        )
+        .map_err(|_| SimdError::new("enum reconstructed row-count conversion failed"))?;
+        let rows_ptr = row_cursor;
+        let mut rows = Vec::with_capacity(row_count);
+        for row_index in 0..row_count {
+            let row_base = rows_ptr + row_index * ctor_layout.row_stride as usize;
+            let mut fields = Vec::with_capacity(ctor_layout.non_recursive_fields.len());
+            for field_layout in &ctor_layout.non_recursive_fields {
+                let field_ptr = row_base + field_layout.offset as usize;
+                fields.push(decode_wasm_enum_row_field_value(
+                    memory,
+                    store,
+                    field_ptr,
+                    &field_layout.ty,
+                    enum_ctors,
+                    wasm_enum_layouts,
+                )?);
+            }
+            rows.push(EnumCtorRow { fields });
+        }
+        ctor_rows.insert(ctor_layout.ctor_name.clone(), rows);
+        row_cursor += row_count * ctor_layout.row_stride as usize;
+    }
+
+    Ok(Value::Enum(EnumValue {
+        enum_name: enum_name.to_string(),
+        tape: Rc::new(EnumTape {
+            enum_name: enum_name.to_string(),
+            tags,
+            ends,
+            slots,
+            tag_names,
+            ctor_recursive_mask,
+            ctor_rows,
+        }),
+        root,
+    }))
 }
 
-fn decode_wasm_enum_field_value(
+fn decode_wasm_enum_row_field_value(
     memory: &Memory,
     store: &Store<()>,
-    slot_ptr: usize,
+    field_ptr: usize,
     field_ty: &Type,
     enum_ctors: &BTreeMap<String, EnumCtorInfo>,
+    wasm_enum_layouts: &BTreeMap<String, WasmEnumLayout>,
 ) -> Result<Value> {
     match field_ty {
         Type::Scalar(prim) => Ok(Value::Scalar(read_scalar_from_memory(
-            memory, store, slot_ptr, *prim,
+            memory, store, field_ptr, *prim,
         )?)),
         Type::Named(name, args) if is_wasm_enum_named_type(name, args) => {
-            let child_ptr = read_i32_from_memory(memory, store, slot_ptr)?;
-            decode_wasm_enum_value_from_ptr(memory, store, child_ptr, name, enum_ctors)
+            let value_ptr = read_i32_from_memory(memory, store, field_ptr)?;
+            if value_ptr < 0 {
+                return Err(SimdError::new(format!(
+                    "invalid enum field pointer {} in enum tape row",
+                    value_ptr
+                )));
+            }
+            let wasm_layout = lookup_specialized_wasm_enum_layout(wasm_enum_layouts, name, args)?;
+            decode_wasm_enum_value_from_ptr(
+                memory,
+                store,
+                value_ptr,
+                name,
+                enum_ctors,
+                wasm_enum_layouts,
+                wasm_layout,
+            )
         }
         Type::Named(name, args) if is_wasm_string_named_type(name, args) => {
-            let string_ptr = read_i32_from_memory(memory, store, slot_ptr)?;
-            let string_len = read_i32_from_memory(memory, store, slot_ptr + 4)?;
+            let string_ptr = read_i32_from_memory(memory, store, field_ptr)?;
+            let string_len = read_i32_from_memory(memory, store, field_ptr + 4)?;
             if string_ptr < 0 || string_len < 0 {
                 return Err(SimdError::new(format!(
-                    "invalid string field pointer/len ({}, {}) in enum node",
+                    "invalid string field pointer/len ({}, {}) in enum tape row",
                     string_ptr, string_len
                 )));
             }
@@ -11775,10 +13926,18 @@ fn decode_wasm_enum_field_value(
             Ok(Value::String(text))
         }
         other => Err(SimdError::new(format!(
-            "Wasm enum decode does not support field type {:?}",
+            "Wasm enum tape decode does not support field type {:?}",
             other
         ))),
     }
+}
+
+fn read_u16_from_memory(memory: &Memory, store: &Store<()>, ptr: usize) -> Result<u16> {
+    let data = memory.data(store);
+    let bytes = data
+        .get(ptr..ptr + 2)
+        .ok_or_else(|| SimdError::new(format!("u16 memory read out of bounds at {}", ptr)))?;
+    Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
 }
 
 fn read_i32_from_memory(memory: &Memory, store: &Store<()>, ptr: usize) -> Result<i32> {
@@ -11787,24 +13946,6 @@ fn read_i32_from_memory(memory: &Memory, store: &Store<()>, ptr: usize) -> Resul
         unreachable!("i32 memory read must produce i32 scalar");
     };
     Ok(value)
-}
-
-fn find_enum_ctor_by_tag<'a>(
-    enum_name: &str,
-    tag: u16,
-    enum_ctors: &'a BTreeMap<String, EnumCtorInfo>,
-) -> Result<(&'a str, &'a EnumCtorInfo)> {
-    enum_ctors
-        .iter()
-        .find_map(|(ctor_name, ctor)| {
-            (ctor.enum_name == enum_name && ctor.tag == tag).then_some((ctor_name.as_str(), ctor))
-        })
-        .ok_or_else(|| {
-            SimdError::new(format!(
-                "unknown enum constructor tag '{}' for enum '{}'",
-                tag, enum_name
-            ))
-        })
 }
 
 fn ensure_memory_size(memory: &Memory, store: &mut Store<()>, bytes: usize) -> Result<()> {
@@ -12106,6 +14247,7 @@ mod tests {
             result: WasmResultAbi::Scalar { prim: Prim::I64 },
             result_type: Type::Scalar(Prim::I64),
             enum_ctors: BTreeMap::new(),
+        wasm_enum_layouts: BTreeMap::new(),
             grouped_export: None,
             leaf_exports: vec![WasmLeafExport {
                 leaf_path: LeafPath::root(),
@@ -12433,7 +14575,9 @@ mod tests {
             eprintln!("  {} : {:?}", function.name, function.kind);
             eprintln!("    result={:?}", function.result);
             match &function.kind {
-                LoweredKind::Scalar { clauses } | LoweredKind::Kernel { clauses, .. } => {
+                LoweredKind::Scalar { clauses }
+                | LoweredKind::Structural { clauses }
+                | LoweredKind::Kernel { clauses, .. } => {
                     for (idx, clause) in clauses.iter().enumerate() {
                         eprintln!("    clause {} patterns={:?}", idx, clause.patterns);
                         eprintln!("    body={:?}", clause.body);
@@ -12788,6 +14932,24 @@ mod tests {
         assert_eq!(eval_nested, wasm_nested);
         assert_eq!(wasm_nested, "813");
 
+        let eval_long = run_main(src, "main", "[\"[0,1,2,3,4,5,6,7,8,9,10]\"]")
+            .expect("json parser adt example should handle longer arrays in evaluator")
+            .to_json_string();
+        let wasm_long = run_wasm_main(src, "main", "[\"[0,1,2,3,4,5,6,7,8,9,10]\"]")
+            .expect("json parser adt example should handle longer arrays in wasm")
+            .to_json_string();
+        assert_eq!(eval_long, wasm_long);
+        assert_eq!(wasm_long, "1455");
+
+        let eval_long_spaced = run_main(src, "main", "[\"[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]\"]")
+            .expect("json parser adt example should handle spaced longer arrays in evaluator")
+            .to_json_string();
+        let wasm_long_spaced = run_wasm_main(src, "main", "[\"[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]\"]")
+            .expect("json parser adt example should handle spaced longer arrays in wasm")
+            .to_json_string();
+        assert_eq!(eval_long_spaced, wasm_long_spaced);
+        assert_eq!(wasm_long_spaced, "1400");
+
         let eval_err = run_main(src, "main", "[\"oops\"]")
             .expect("json parser adt example should run in evaluator")
             .to_json_string();
@@ -13031,6 +15193,53 @@ mod tests {
         assert_eq!(eval_whitespace, wasm_whitespace);
         assert_eq!(wasm_whitespace, "906");
 
+        let valid_json_corpus = [
+            "null",
+            "true",
+            "false",
+            "0",
+            "-0.0",
+            "3.14",
+            "\"\"",
+            "\"line1\\nline2\"",
+            "\"tab\\tchar\"",
+            "\"quote:\\\"hi\\\"\"",
+            "\"backspace:\\b and formfeed:\\f\"",
+            "\"slash\\\\path\\\\to\\\\file\"",
+            "\"snowman:\\u2603\"",
+            "[ 1 , 2 , 3 ] ",
+            "{ \"a\" : [ 1 , { \"b\" : true } , 3 ] }",
+            "{\n\t\"a\":1,\n\t\"b\":[\n\t\tnull,\n\t\tfalse\n\t]\n}",
+            "{}",
+            "[]",
+            "{\"a\":[],\"b\":{}}",
+            "[1,\"two\",false,null,{\"x\":3}]",
+            "{\"num\":1,\"str\":\"x\",\"bool\":true,\"nil\":null,\"arr\":[1,2,\"3\"]}",
+            "[{\"a\":1},2,\"3\",true,[false,null],{\"x\":{}}]",
+            "{\"a\":{\"b\":{\"c\":{\"d\":{\"e\":{\"f\":1}}}}}}",
+            "[[[1,[2,[3,[4,[5]]]]]]]",
+            "{\"root\":{\"level1\":[{\"level2\":{\"level3\":[{\"level4\":null}]}}]}}",
+            "[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15]",
+            "[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20]",
+            "[{\"id\":1},{\"id\":2},{\"id\":3},{\"id\":4},{\"id\":5},{\"id\":6},{\"id\":7},{\"id\":8},{\"id\":9},{\"id\":10}]",
+        ];
+        for input in valid_json_corpus {
+            let eval_value = run_compiled_main(&compiled, "main", &[Value::String(input.to_string())])
+                .expect("json parser adt valid corpus should run in evaluator")
+                .to_json_string();
+            let wasm_value = run_wasm_artifact(&artifact, &[Value::String(input.to_string())])
+                .expect("json parser adt valid corpus should run in wasm")
+                .to_json_string();
+            assert_eq!(eval_value, wasm_value, "json corpus parity mismatch for input: {input}");
+            let score = eval_value
+                .parse::<i64>()
+                .expect("json parser adt corpus output should be numeric i64");
+            assert!(
+                score > 0,
+                "json parser adt should accept valid corpus input, got score {score} for input: {input}"
+            );
+        }
+
         let eval_malformed_minus = run_compiled_main(&compiled, "main", &[Value::String("-abc".to_string())])
             .expect("json parser adt example should report malformed minus in evaluator")
             .to_json_string();
@@ -13073,15 +15282,158 @@ mod tests {
     }
 
     #[test]
+    fn wasm_json_parser_adt_string_leaf_chars_harness_runs() {
+        let src = include_str!("../examples/json_parser_adt.simd");
+        let compiled = compile_source(src).expect("json parser adt example should compile");
+        let artifact = compile_wasm_main(src, "main_string_leaf_chars")
+            .expect("json parser adt string leaf harness should compile to wasm");
+
+        let cases = [
+            ("\"car\"", 3_i64),
+            ("[\"car\",\"ed\",\"x\"]", 6_i64),
+            (
+                "{\"a\":\"car\",\"b\":[\"ed\",\"x\",{\"k\":\"milk\"}],\"c\":{\"d\":\"z\"}}",
+                11_i64,
+            ),
+            ("[{\"x\":\"aa\"},{\"y\":[\"bbb\",\"cccc\"]},\"d\"]", 10_i64),
+            ("[\n  \"a\",\n  {\"b\": [\"cd\", \"efg\"]},\n  \"hij\"\n]", 9_i64),
+        ];
+
+        for (input, expected) in cases {
+            let eval_value = run_compiled_main(
+                &compiled,
+                "main_string_leaf_chars",
+                &[Value::String(input.to_string())],
+            )
+            .expect("json parser adt string leaf harness should run in evaluator")
+            .to_json_string();
+            let wasm_value = run_wasm_artifact(&artifact, &[Value::String(input.to_string())])
+                .expect("json parser adt string leaf harness should run in wasm")
+                .to_json_string();
+            assert_eq!(
+                eval_value, wasm_value,
+                "string leaf harness parity mismatch for input: {input}"
+            );
+            let total = eval_value
+                .parse::<i64>()
+                .expect("string leaf harness output should be numeric i64");
+            assert_eq!(
+                total, expected,
+                "string leaf harness total mismatch for input: {input}"
+            );
+        }
+    }
+
+    #[test]
     fn wasm_matches_recursive_enum_list_length() {
         let src = "enum List a =\n  | Nil\n  | Cons a (List a)\n\nlen : List i64 -> i64\nlen Nil = 0\nlen (Cons _ xs) = 1 + len xs\n\nmain : i64\nmain = len (Cons 1 (Cons 2 Nil))\n";
         assert_eq!(wasm_run(src, "main", "[]"), "2");
     }
 
     #[test]
+    fn wasm_returns_recursive_enum_nil_debug() {
+        let src = "enum List a =\n  | Nil\n  | Cons a (List a)\n\nmain : List i64\nmain = Nil\n";
+        assert_eq!(wasm_run(src, "main", "[]"), "{\"$enum\":\"Nil\",\"fields\":[]}");
+    }
+
+    #[test]
+    fn wasm_returns_recursive_enum_cons_debug() {
+        let src = "enum List a =\n  | Nil\n  | Cons a (List a)\n\nmain : List i64\nmain = Cons 1 Nil\n";
+        let value = run_wasm_main(src, "main", "[]").expect("cons debug should run");
+        assert_eq!(
+            value.to_json_string(),
+            "{\"$enum\":\"Cons\",\"fields\":[1,{\"$enum\":\"Nil\",\"fields\":[]}]}"
+        );
+    }
+
+    #[test]
     fn wasm_matches_recursive_enum_tree_sum() {
         let src = "enum Tree a =\n  | Leaf a\n  | Bin (Tree a) (Tree a)\n\nsum : Tree i64 -> i64\nsum (Leaf x) = x\nsum (Bin l r) = sum l + sum r\n\nmain : i64\nmain = sum (Bin (Leaf 2) (Bin (Leaf 3) (Leaf 4)))\n";
         assert_eq!(wasm_run(src, "main", "[]"), "9");
+    }
+
+    #[test]
+    fn wasm_matches_recursive_enum_tree_sum_pair() {
+        let src = "enum Tree a =\n  | Leaf a\n  | Bin (Tree a) (Tree a)\n\nsum : Tree i64 -> i64\nsum (Leaf x) = x\nsum (Bin l r) = sum l + sum r\n\nmain : i64\nmain = sum (Bin (Leaf 2) (Leaf 3))\n";
+        assert_eq!(wasm_run(src, "main", "[]"), "5");
+    }
+
+    #[test]
+    fn wasm_matches_recursive_enum_tree_right_subtree_sum() {
+        let src = "enum Tree a =\n  | Leaf a\n  | Bin (Tree a) (Tree a)\n\nright : Tree i64 -> Tree i64\nright (Bin _ r) = r\nright t = t\n\nsum : Tree i64 -> i64\nsum (Leaf x) = x\nsum (Bin l r) = sum l + sum r\n\nmain : i64\nmain = sum (right (Bin (Leaf 2) (Bin (Leaf 3) (Leaf 4))))\n";
+        assert_eq!(wasm_run(src, "main", "[]"), "7");
+    }
+
+    #[test]
+    fn wasm_matches_recursive_enum_tree_right_subtree_sum_after_left_sum() {
+        let src = "enum Tree a =\n  | Leaf a\n  | Bin (Tree a) (Tree a)\n\nleft : Tree i64 -> Tree i64\nleft (Bin l _) = l\nleft t = t\n\nright : Tree i64 -> Tree i64\nright (Bin _ r) = r\nright t = t\n\nsum : Tree i64 -> i64\nsum (Leaf x) = x\nsum (Bin l r) = sum l + sum r\n\nprobe : Tree i64 -> i64\nprobe t = let x = sum (left t) in sum (right t)\n\nmain : i64\nmain = probe (Bin (Leaf 2) (Bin (Leaf 3) (Leaf 4)))\n";
+        assert_eq!(wasm_run(src, "main", "[]"), "7");
+    }
+
+    #[test]
+    fn wasm_matches_recursive_enum_tree_sum_with_lets() {
+        let src = "enum Tree a =\n  | Leaf a\n  | Bin (Tree a) (Tree a)\n\nsum : Tree i64 -> i64\nsum (Leaf x) = x\nsum (Bin l r) = let a = sum l in let b = sum r in a + b\n\nmain : i64\nmain = sum (Bin (Leaf 2) (Bin (Leaf 3) (Leaf 4)))\n";
+        assert_eq!(wasm_run(src, "main", "[]"), "9");
+    }
+
+    #[test]
+    fn wasm_matches_recursive_enum_clause_bound_right_subtree_sum_after_left_sum() {
+        let src = "enum Tree a =\n  | Leaf a\n  | Bin (Tree a) (Tree a)\n\nsum : Tree i64 -> i64\nsum (Leaf x) = x\nsum (Bin l r) = sum l + sum r\n\nprobe : Tree i64 -> i64\nprobe (Leaf x) = x\nprobe (Bin l r) = let a = sum l in sum r\n\nmain : i64\nmain = probe (Bin (Leaf 2) (Bin (Leaf 3) (Leaf 4)))\n";
+        assert_eq!(wasm_run(src, "main", "[]"), "7");
+    }
+
+    #[test]
+    fn wasm_returns_recursive_enum_bin_debug() {
+        let src = "enum Tree a =\n  | Leaf a\n  | Bin (Tree a) (Tree a)\n\nmain : Tree i64\nmain = Bin (Leaf 2) (Leaf 3)\n";
+        assert_eq!(
+            wasm_run(src, "main", "[]"),
+            "{\"$enum\":\"Bin\",\"fields\":[{\"$enum\":\"Leaf\",\"fields\":[2]},{\"$enum\":\"Leaf\",\"fields\":[3]}]}"
+        );
+    }
+
+    #[test]
+    fn wasm_returns_recursive_enum_nested_bin_debug() {
+        let src = "enum Tree a =\n  | Leaf a\n  | Bin (Tree a) (Tree a)\n\nmain : Tree i64\nmain = Bin (Leaf 2) (Bin (Leaf 3) (Leaf 4))\n";
+        assert_eq!(
+            wasm_run(src, "main", "[]"),
+            "{\"$enum\":\"Bin\",\"fields\":[{\"$enum\":\"Leaf\",\"fields\":[2]},{\"$enum\":\"Bin\",\"fields\":[{\"$enum\":\"Leaf\",\"fields\":[3]},{\"$enum\":\"Leaf\",\"fields\":[4]}]}]}"
+        );
+    }
+
+    #[test]
+    fn wasm_returns_recursive_enum_leaf_debug() {
+        let src = "enum Tree a =\n  | Leaf a\n  | Bin (Tree a) (Tree a)\n\nmain : Tree i64\nmain = Leaf 2\n";
+        assert_eq!(
+            wasm_run(src, "main", "[]"),
+            "{\"$enum\":\"Leaf\",\"fields\":[2]}"
+        );
+    }
+
+    #[test]
+    fn wasm_returns_binary_recursive_enum_without_payloads() {
+        let src = "enum T =\n  | A\n  | B T T\n\nmain : T\nmain = B A A\n";
+        assert_eq!(
+            wasm_run(src, "main", "[]"),
+            "{\"$enum\":\"B\",\"fields\":[{\"$enum\":\"A\",\"fields\":[]},{\"$enum\":\"A\",\"fields\":[]}]}"
+        );
+    }
+
+    #[test]
+    fn wasm_matches_enum_payload_row_with_nested_enum_field() {
+        let src = "enum Json =\n  | JNull\n\nenum ParseResult a =\n  | POk a i64\n  | PErr i64\n\nunwrap : ParseResult Json -> i64\nunwrap (POk JNull _) = 10\nunwrap _ = 0 - 999\n\nmain : i64\nmain = unwrap (POk JNull 0)\n";
+        assert_eq!(wasm_run(src, "main", "[]"), "10");
+    }
+
+    #[test]
+    fn wasm_matches_enum_payload_row_with_nested_enum_and_string_fields() {
+        let src = "enum Json =\n  | JNull\n\nenum ParseResult a =\n  | POk a string\n  | PErr i64\n\nunwrap : ParseResult Json -> i64\nunwrap (POk JNull rest) = 10\nunwrap _ = 0 - 999\n\nmain : string -> i64\nmain s = unwrap (POk JNull s)\n";
+        assert_eq!(wasm_run(src, "main", "[\"car\"]"), "10");
+    }
+
+    #[test]
+    fn wasm_matches_enum_payload_row_string_field_as_empty_slice() {
+        let src = "enum Json =\n  | JNull\n\nenum ParseResult a =\n  | POk a string\n  | PErr i64\n\nrest_score : string -> i64\nrest_score [] = 10\nrest_score _ = 0 - 999\n\nunwrap : ParseResult Json -> i64\nunwrap (POk JNull rest) = rest_score rest\nunwrap _ = 0 - 999\n\nmain : string -> i64\nmain s = unwrap (POk JNull s)\n";
+        assert_eq!(wasm_run(src, "main", "[\"\"]"), "10");
     }
 
     #[test]
@@ -13123,7 +15475,9 @@ mod tests {
             .iter()
             .enumerate()
             .filter_map(|(index, function)| match function.kind {
-                LoweredKind::Scalar { .. } => Some((function.name.clone(), index as u32)),
+                LoweredKind::Scalar { .. } | LoweredKind::Structural { .. } => {
+                    Some((function.name.clone(), index as u32))
+                }
                 LoweredKind::Kernel { .. } => None,
             })
             .collect::<BTreeMap<_, _>>();

@@ -36,3 +36,16 @@ helix-grammar:
 
 helix-register:
 	./scripts/setup_helix.sh
+
+harness mode="quick":
+	sh ./scripts/iterate_structural_harness.sh {{mode}}
+
+harness-diff:
+	@files=($$(ls -1t .tmp/harness/structural_harness_*.ndjson 2>/dev/null)); \
+	if [ $${#files[@]} -lt 2 ]; then \
+	  echo "need at least two harness logs in .tmp/harness"; \
+	  exit 1; \
+	fi; \
+	echo "new: $${files[0]}"; \
+	echo "old: $${files[1]}"; \
+	diff -u "$${files[1]}" "$${files[0]}" || true

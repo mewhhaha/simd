@@ -230,31 +230,20 @@ parse_array_after_open ['\n', ...rest] = parse_array_after_open rest
 parse_array_after_open ['\t', ...rest] = parse_array_after_open rest
 parse_array_after_open ['\r', ...rest] = parse_array_after_open rest
 parse_array_after_open [']', ...rest] = (POk (JArray JArrNil) rest)
-parse_array_after_open s = wrap_array_list (parse_array_list s)
+parse_array_after_open s = parse_array_seed JArrNil (parse_value s)
 
-wrap_array_list : ParseResult Json -> ParseResult Json
-wrap_array_list (PErr c) = (PErr c)
-wrap_array_list (POk values rest) = (POk (JArray values) rest)
+parse_array_seed : Json -> ParseResult Json -> ParseResult Json
+parse_array_seed _ (PErr c) = (PErr c)
+parse_array_seed acc (POk value rest) = parse_array_items (JArrCons value acc) rest
 
-parse_array_list : string -> ParseResult Json
-parse_array_list s = parse_array_list_from_value (parse_value s)
-
-parse_array_list_from_value : ParseResult Json -> ParseResult Json
-parse_array_list_from_value (PErr c) = (PErr c)
-parse_array_list_from_value (POk value rest) = parse_array_list_after_value value rest
-
-parse_array_list_after_value : Json -> string -> ParseResult Json
-parse_array_list_after_value value [' ', ...rest] = parse_array_list_after_value value rest
-parse_array_list_after_value value ['\n', ...rest] = parse_array_list_after_value value rest
-parse_array_list_after_value value ['\t', ...rest] = parse_array_list_after_value value rest
-parse_array_list_after_value value ['\r', ...rest] = parse_array_list_after_value value rest
-parse_array_list_after_value value [',', ...rest] = prepend_array_value value (parse_array_list rest)
-parse_array_list_after_value value [']', ...rest] = (POk (JArrCons value JArrNil) rest)
-parse_array_list_after_value _ _ = (PErr 401)
-
-prepend_array_value : Json -> ParseResult Json -> ParseResult Json
-prepend_array_value _ (PErr c) = (PErr c)
-prepend_array_value value (POk tail rest) = (POk (JArrCons value tail) rest)
+parse_array_items : Json -> string -> ParseResult Json
+parse_array_items acc [' ', ...rest] = parse_array_items acc rest
+parse_array_items acc ['\n', ...rest] = parse_array_items acc rest
+parse_array_items acc ['\t', ...rest] = parse_array_items acc rest
+parse_array_items acc ['\r', ...rest] = parse_array_items acc rest
+parse_array_items acc [',', ...rest] = parse_array_seed acc (parse_value rest)
+parse_array_items acc [']', ...rest] = (POk (JArray acc) rest)
+parse_array_items _ _ = (PErr 401)
 
 parse_object_after_open : string -> ParseResult Json
 parse_object_after_open [' ', ...rest] = parse_object_after_open rest
@@ -262,42 +251,28 @@ parse_object_after_open ['\n', ...rest] = parse_object_after_open rest
 parse_object_after_open ['\t', ...rest] = parse_object_after_open rest
 parse_object_after_open ['\r', ...rest] = parse_object_after_open rest
 parse_object_after_open ['}', ...rest] = (POk (JObject JObjNil) rest)
-parse_object_after_open s = wrap_object_list (parse_object_list s)
+parse_object_after_open s = parse_object_seed JObjNil (parse_member s)
 
-wrap_object_list : ParseResult Json -> ParseResult Json
-wrap_object_list (PErr c) = (PErr c)
-wrap_object_list (POk fields rest) = (POk (JObject fields) rest)
+parse_object_seed : Json -> MemberResult i64 Json -> ParseResult Json
+parse_object_seed _ (MErr c) = (PErr c)
+parse_object_seed acc (MOk key_len value rest) = parse_object_items (JObjCons key_len value acc) rest
 
-parse_object_list : string -> ParseResult Json
-parse_object_list s = parse_object_list_from_member (parse_member s)
-
-parse_object_list_from_member : MemberResult i64 Json -> ParseResult Json
-parse_object_list_from_member (MErr c) = (PErr c)
-parse_object_list_from_member (MOk key_len value rest) = parse_object_list_after_member key_len value rest
-
-parse_object_list_after_member : i64 -> Json -> string -> ParseResult Json
-parse_object_list_after_member key_len value [' ', ...rest] = parse_object_list_after_member key_len value rest
-parse_object_list_after_member key_len value ['\n', ...rest] = parse_object_list_after_member key_len value rest
-parse_object_list_after_member key_len value ['\t', ...rest] = parse_object_list_after_member key_len value rest
-parse_object_list_after_member key_len value ['\r', ...rest] = parse_object_list_after_member key_len value rest
-parse_object_list_after_member key_len value [',', ...rest] = prepend_object_member key_len value (parse_object_list rest)
-parse_object_list_after_member key_len value ['}', ...rest] = (POk (JObjCons key_len value JObjNil) rest)
-parse_object_list_after_member _ _ _ = (PErr 501)
-
-prepend_object_member : i64 -> Json -> ParseResult Json -> ParseResult Json
-prepend_object_member _ _ (PErr c) = (PErr c)
-prepend_object_member key_len value (POk tail rest) = (POk (JObjCons key_len value tail) rest)
+parse_object_items : Json -> string -> ParseResult Json
+parse_object_items acc [' ', ...rest] = parse_object_items acc rest
+parse_object_items acc ['\n', ...rest] = parse_object_items acc rest
+parse_object_items acc ['\t', ...rest] = parse_object_items acc rest
+parse_object_items acc ['\r', ...rest] = parse_object_items acc rest
+parse_object_items acc [',', ...rest] = parse_object_seed acc (parse_member rest)
+parse_object_items acc ['}', ...rest] = (POk (JObject acc) rest)
+parse_object_items _ _ = (PErr 501)
 
 parse_member : string -> MemberResult i64 Json
 parse_member [' ', ...rest] = parse_member rest
 parse_member ['\n', ...rest] = parse_member rest
 parse_member ['\t', ...rest] = parse_member rest
 parse_member ['\r', ...rest] = parse_member rest
-parse_member s = parse_member_from_keylen (parse_member_key s)
-
-parse_member_key : string -> ParseResult i64
-parse_member_key ['"', ...rest] = parse_string_len 0 0 rest
-parse_member_key _ = (PErr 502)
+parse_member ['"', ...rest] = parse_member_from_keylen (parse_string_len 0 0 rest)
+parse_member _ = (MErr 502)
 
 parse_member_from_keylen : ParseResult i64 -> MemberResult i64 Json
 parse_member_from_keylen (PErr c) = (MErr c)
@@ -308,12 +283,12 @@ parse_member_after_key key_len [' ', ...rest] = parse_member_after_key key_len r
 parse_member_after_key key_len ['\n', ...rest] = parse_member_after_key key_len rest
 parse_member_after_key key_len ['\t', ...rest] = parse_member_after_key key_len rest
 parse_member_after_key key_len ['\r', ...rest] = parse_member_after_key key_len rest
-parse_member_after_key key_len [':', ...rest] = parse_member_value key_len (parse_value rest)
+parse_member_after_key key_len [':', ...rest] = parse_member_after_value key_len (parse_value rest)
 parse_member_after_key _ _ = (MErr 502)
 
-parse_member_value : i64 -> ParseResult Json -> MemberResult i64 Json
-parse_member_value _ (PErr c) = (MErr c)
-parse_member_value key_len (POk value rest) = (MOk key_len value rest)
+parse_member_after_value : i64 -> ParseResult Json -> MemberResult i64 Json
+parse_member_after_value _ (PErr c) = (MErr c)
+parse_member_after_value key_len (POk value rest) = (MOk key_len value rest)
 
 json_weight : Json -> i64
 json_weight JNull = 10
@@ -345,6 +320,40 @@ parse_status_rest value ['\t', ...rest] = parse_status_rest value rest
 parse_status_rest value ['\r', ...rest] = parse_status_rest value rest
 parse_status_rest value [] = json_weight value
 parse_status_rest _ _ = (0 - 999)
+
+json_string_leaf_chars : Json -> i64
+json_string_leaf_chars JNull = 0
+json_string_leaf_chars (JBool _) = 0
+json_string_leaf_chars (JNum _) = 0
+json_string_leaf_chars (JStrTok len) = len
+json_string_leaf_chars (JArray items) = array_list_string_leaf_chars items
+json_string_leaf_chars (JObject fields) = object_list_string_leaf_chars fields
+json_string_leaf_chars _ = 0
+
+array_list_string_leaf_chars : Json -> i64
+array_list_string_leaf_chars JArrNil = 0
+array_list_string_leaf_chars (JArrCons value rest) = json_string_leaf_chars value + array_list_string_leaf_chars rest
+array_list_string_leaf_chars _ = 0
+
+object_list_string_leaf_chars : Json -> i64
+object_list_string_leaf_chars JObjNil = 0
+object_list_string_leaf_chars (JObjCons _ value rest) = json_string_leaf_chars value + object_list_string_leaf_chars rest
+object_list_string_leaf_chars _ = 0
+
+parse_string_leaf_chars : ParseResult Json -> i64
+parse_string_leaf_chars (PErr c) = 0 - c
+parse_string_leaf_chars (POk value rest) = parse_string_leaf_chars_rest value rest
+
+parse_string_leaf_chars_rest : Json -> string -> i64
+parse_string_leaf_chars_rest value [' ', ...rest] = parse_string_leaf_chars_rest value rest
+parse_string_leaf_chars_rest value ['\n', ...rest] = parse_string_leaf_chars_rest value rest
+parse_string_leaf_chars_rest value ['\t', ...rest] = parse_string_leaf_chars_rest value rest
+parse_string_leaf_chars_rest value ['\r', ...rest] = parse_string_leaf_chars_rest value rest
+parse_string_leaf_chars_rest value [] = json_string_leaf_chars value
+parse_string_leaf_chars_rest _ _ = (0 - 999)
+
+main_string_leaf_chars : string -> i64
+main_string_leaf_chars s = parse_string_leaf_chars (parse_json s)
 
 parse_json_debug : ParseResult Json -> Json
 parse_json_debug (PErr c) = (JNum (0 - c))
