@@ -13,3 +13,4 @@
 
 # Local tool cache
 .tools/cache/
+.tmp/
