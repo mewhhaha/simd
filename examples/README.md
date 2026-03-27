@@ -31,3 +31,25 @@ Current limitations:
 - this is still a handwritten parser in the language, not a built-in JSON parser
 - enum host JSON input is still unsupported in the generic runtime boundary
 - mutual-recursive enums and dynamically recursive enum multiplicity are still out of scope
+
+## `tuple_basics.simd`
+
+This example is the small tuple feature smoke test for:
+
+- tuple literals
+- tuple patterns
+- tuple projection with `.0`, `.1`, ...
+- JSON-array boundary for tuple params/results
+
+Useful commands:
+
+```sh
+cargo run -- run examples/tuple_basics.simd --main main --args '[[3,4]]'
+cargo run -- run-wasm examples/tuple_basics.simd --main main --args '[[3,4]]'
+cargo run -- run examples/tuple_basics.simd --main main_describe --args '[[7,true]]'
+```
+
+Expected results:
+
+- `main [3,4]` returns `[4,3]`
+- `main_describe [7,true]` returns `[7,true,17]`

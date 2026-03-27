@@ -19,6 +19,7 @@ The current language supports:
 - Primitive numeric scalars: `i32`, `i64`, `f32`, `f64`.
 - `char`.
 - `string`.
+- Native n-ary tuples.
 - Shaped bulk types: `t[n]`, `t[n,m]`, ...
 - Closed records with nested fields.
 - Recursive fixed-arity enums.
@@ -37,7 +38,7 @@ Not supported:
 
 Core type model:
 
-- `Type = Scalar(Prim) | Bulk(Prim, Shape) | Named(...) | Record(...) | Fun(...) | TypeToken(...)`
+- `Type = Scalar(Prim) | Bulk(Prim, Shape) | Named(...) | Tuple(...) | Record(...) | Fun(...) | TypeToken(...)`
 - `Shape = Vec<Dim>` with `Dim = Const | Var`
 
 Core semantic choices:
@@ -70,6 +71,14 @@ Records are source-level values, but lowering is record-free:
 - Record params/results are flattened to leaf primitives (including bulk leaves).
 - Lowering and Wasm codegen consume normalized leaf functions/expressions.
 - Runtime reconstructs source-level records at outer interfaces.
+
+Tuple policy:
+
+- Tuples are native positional product types with surface syntax like `(a, b, c)`.
+- `(x)` remains grouping; v1 does not introduce unit tuples or singleton tuples.
+- Tuple projection uses `.0`, `.1`, ...
+- JSON boundary uses positional JSON arrays for tuple params/results.
+- Normalization/lowering/Wasm flatten tuples like records, but preserve source order instead of field-name order.
 
 Storage policy:
 

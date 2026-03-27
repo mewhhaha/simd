@@ -183,6 +183,7 @@ pub enum Pattern {
     Type(Prim),
     Name(String),
     Wildcard,
+    Tuple(Vec<Pattern>),
     Ctor(String, Vec<Pattern>),
     Slice {
         prefix: Vec<Pattern>,
@@ -205,6 +206,7 @@ pub enum Expr {
     Bool(bool),
     Char(char),
     String(String),
+    Tuple(Vec<Expr>),
     App(Box<Expr>, Box<Expr>),
     Lambda {
         param: String,
@@ -216,6 +218,7 @@ pub enum Expr {
     },
     Record(Vec<(String, Expr)>),
     Project(Box<Expr>, String),
+    TupleProject(Box<Expr>, usize),
     RecordUpdate {
         base: Box<Expr>,
         fields: Vec<(String, Expr)>,
@@ -268,6 +271,7 @@ pub enum Type {
     Scalar(Prim),
     Bulk(Prim, Shape),
     TypeToken(Box<Type>),
+    Tuple(Vec<Type>),
     Record(BTreeMap<String, Type>),
     Named(String, Vec<Type>),
     Var(String),
@@ -423,10 +427,15 @@ pub enum TypedExprKind {
         bindings: Vec<TypedLetBinding>,
         body: Box<TypedExpr>,
     },
+    Tuple(Vec<TypedExpr>),
     Record(BTreeMap<String, TypedExpr>),
     Project {
         base: Box<TypedExpr>,
         field: String,
+    },
+    TupleProject {
+        base: Box<TypedExpr>,
+        index: usize,
     },
     RecordUpdate {
         base: Box<TypedExpr>,
@@ -493,6 +502,20 @@ pub struct GroupedLoweredProgram {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IntentAnalysis {
     pub reports: Vec<KernelIntentReport>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructuralAnalysis {
+    pub clusters: Vec<StructuralClusterReport>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructuralClusterReport {
+    pub id: usize,
+    pub functions: Vec<String>,
+    pub recursive: bool,
+    pub state_count: usize,
+    pub transition_count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -563,12 +586,32 @@ pub struct LoweredFunction {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct StructuralProgram {
+    pub entry_state: u32,
+    pub states: Vec<StructuralState>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct StructuralState {
+    pub patterns: Vec<TypedPattern>,
+    pub on_match: StructuralAction,
+    pub on_miss: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum StructuralAction {
+    Transition { state: u32, args: Vec<IrExpr> },
+    Return { expr: IrExpr },
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum LoweredKind {
     Scalar {
         clauses: Vec<LoweredClause>,
     },
     Structural {
         clauses: Vec<LoweredClause>,
+        program: StructuralProgram,
     },
     Kernel {
         shape: Shape,
@@ -655,6 +698,7 @@ pub struct CompiledProgram {
     pub lowered: LoweredProgram,
     pub grouped: GroupedLoweredProgram,
     pub intents: IntentAnalysis,
+    pub structural: StructuralAnalysis,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -664,6 +708,7 @@ pub enum Value {
     Bool(bool),
     String(String),
     TypeToken(Prim),
+    Tuple(Vec<Value>),
     Record(BTreeMap<String, Value>),
     Enum(EnumValue),
 }
@@ -749,6 +794,7 @@ impl Type {
         match self {
             Self::Scalar(prim) | Self::Bulk(prim, _) => Some(*prim),
             Self::TypeToken(_)
+            | Self::Tuple(_)
             | Self::Record(_)
             | Self::Named(_, _)
             | Self::Var(_)
@@ -854,6 +900,14 @@ impl LeafPath {
     }
 }
 
+fn tuple_leaf_name(index: usize) -> String {
+    index.to_string()
+}
+
+fn parse_tuple_leaf_name(name: &str) -> Option<usize> {
+    name.parse::<usize>().ok()
+}
+
 impl Value {
     pub fn ty(&self) -> Type {
         match self {
@@ -865,6 +919,7 @@ impl Value {
             Self::Bool(_) => builtin_bool_type(),
             Self::String(_) => builtin_string_type(),
             Self::TypeToken(prim) => Type::TypeToken(Box::new(Type::Scalar(*prim))),
+            Self::Tuple(items) => Type::Tuple(items.iter().map(Value::ty).collect()),
             Self::Record(fields) => Type::Record(
                 fields
                     .iter()
@@ -882,10 +937,22 @@ impl Value {
             Self::Bool(value) => value.to_string(),
             Self::String(value) => json_string(value),
             Self::TypeToken(prim) => format!("\"{}\"", format_prim(*prim)),
+            Self::Tuple(items) => render_tuple_json(items),
             Self::Record(fields) => render_record_json(fields),
             Self::Enum(value) => render_enum_json(value),
         }
     }
+}
+
+fn render_tuple_json(items: &[Value]) -> String {
+    format!(
+        "[{}]",
+        items
+            .iter()
+            .map(Value::to_json_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    )
 }
 
 impl ScalarValue {
@@ -1030,6 +1097,20 @@ fn value_lift_shape(value: &Value) -> Option<Vec<usize>> {
     match value {
         Value::Scalar(_) | Value::Bool(_) | Value::String(_) | Value::TypeToken(_) => None,
         Value::Bulk(bulk) => Some(bulk.shape.clone()),
+        Value::Tuple(items) => {
+            let mut shape = None::<Vec<usize>>;
+            for value in items {
+                match value_lift_shape(value) {
+                    Some(field_shape) => match &shape {
+                        None => shape = Some(field_shape),
+                        Some(existing) if existing == &field_shape => {}
+                        Some(_) => return None,
+                    },
+                    None => {}
+                }
+            }
+            shape
+        }
         Value::Record(fields) => {
             let mut shape = None::<Vec<usize>>;
             for value in fields.values() {
@@ -1053,6 +1134,7 @@ fn value_leaf_prim(value: &Value) -> Option<Prim> {
         Value::Scalar(value) => Some(value.prim()),
         Value::Bulk(value) => Some(value.prim),
         Value::Bool(_) | Value::String(_) | Value::TypeToken(_) => None,
+        Value::Tuple(items) => items.iter().find_map(value_leaf_prim),
         Value::Record(fields) => fields.values().find_map(value_leaf_prim),
         Value::Enum(_) => None,
     }
@@ -1061,6 +1143,12 @@ fn value_leaf_prim(value: &Value) -> Option<Prim> {
 fn extract_lifted_lane(value: &Value, index: usize) -> Result<Value> {
     match value {
         Value::Bulk(bulk) => Ok(Value::Scalar(bulk.scalar_at(index))),
+        Value::Tuple(items) => Ok(Value::Tuple(
+            items
+                .iter()
+                .map(|value| extract_lifted_lane(value, index))
+                .collect::<Result<Vec<_>>>()?,
+        )),
         Value::Record(fields) => Ok(Value::Record(
             fields
                 .iter()
@@ -1095,6 +1183,24 @@ fn collect_lifted_value(values: &[Value], scalar_ty: &Type, shape: &[usize]) -> 
                 })
                 .collect::<Result<Vec<_>>>()?,
         })),
+        Type::Tuple(items) => {
+            let mut tuple_items = Vec::with_capacity(items.len());
+            for (index, item_ty) in items.iter().enumerate() {
+                let mut item_values = Vec::with_capacity(values.len());
+                for value in values {
+                    let Value::Tuple(tuple) = value else {
+                        return Err(SimdError::new(
+                            "lifted tuple result expected tuple lane values",
+                        ));
+                    };
+                    item_values.push(tuple.get(index).cloned().ok_or_else(|| {
+                        SimdError::new(format!("lifted tuple lane is missing element {}", index))
+                    })?);
+                }
+                tuple_items.push(collect_lifted_value(&item_values, item_ty, shape)?);
+            }
+            Ok(Value::Tuple(tuple_items))
+        }
         Type::Record(fields) => {
             let mut lifted_fields = BTreeMap::new();
             for (name, field_ty) in fields {
@@ -1146,6 +1252,11 @@ fn collect_type_leaves(ty: &Type, prefix: &LeafPath, leaves: &mut Vec<TypeLeaf>)
             path: prefix.clone(),
             ty: ty.clone(),
         }),
+        Type::Tuple(items) => {
+            for (index, item_ty) in items.iter().enumerate() {
+                collect_type_leaves(item_ty, &prefix.child(&tuple_leaf_name(index)), leaves);
+            }
+        }
         Type::Named(_, _) => leaves.push(TypeLeaf {
             path: prefix.clone(),
             ty: ty.clone(),
@@ -1173,6 +1284,22 @@ pub fn flatten_value_leaves(value: &Value, ty: &Type) -> Result<Vec<(LeafPath, V
         }
         (Value::Enum(_), Type::Named(_, _)) => Ok(vec![(LeafPath::root(), value.clone())]),
         (Value::TypeToken(_), Type::TypeToken(_)) => Ok(Vec::new()),
+        (Value::Tuple(items), Type::Tuple(item_types)) if items.len() == item_types.len() => {
+            let mut leaves = Vec::new();
+            for (index, (item, item_ty)) in items.iter().zip(item_types.iter()).enumerate() {
+                for (path, value) in flatten_value_leaves(item, item_ty)? {
+                    leaves.push((
+                        LeafPath(
+                            std::iter::once(tuple_leaf_name(index))
+                                .chain(path.0)
+                                .collect(),
+                        ),
+                        value,
+                    ));
+                }
+            }
+            Ok(leaves)
+        }
         (Value::Record(fields), Type::Record(field_types)) => {
             let mut leaves = Vec::new();
             for (name, field_ty) in field_types {
@@ -1201,6 +1328,22 @@ pub fn rebuild_value_from_leaves(ty: &Type, leaves: &BTreeMap<LeafPath, Value>) 
             .get(&LeafPath::root())
             .cloned()
             .ok_or_else(|| SimdError::new(format!("missing root leaf for type {:?}", ty))),
+        Type::Tuple(items) => {
+            let mut tuple = Vec::with_capacity(items.len());
+            for (index, item_ty) in items.iter().enumerate() {
+                let item_leaves = leaves
+                    .iter()
+                    .filter_map(|(path, value)| {
+                        path.0.split_first().and_then(|(head, tail)| {
+                            (*head == tuple_leaf_name(index))
+                                .then(|| (LeafPath(tail.to_vec()), value.clone()))
+                        })
+                    })
+                    .collect::<BTreeMap<_, _>>();
+                tuple.push(rebuild_value_from_leaves(item_ty, &item_leaves)?);
+            }
+            Ok(Value::Tuple(tuple))
+        }
         Type::Named(name, args) if name == "string" && args.is_empty() => leaves
             .get(&LeafPath::root())
             .cloned()
@@ -1857,26 +2000,38 @@ impl Parser {
         match token.kind {
             TokenKind::LParen => {
                 self.expect(TokenKind::LParen)?;
-                if self.peek_is(TokenKind::Ident)
+                let first = if self.peek_is(TokenKind::Ident)
                     && self
                         .peek()
                         .is_some_and(|token| is_constructor_name(&token.text))
                 {
                     let ctor_name = self.expect_ident()?;
                     let mut subpatterns = Vec::new();
-                    while !self.peek_is(TokenKind::RParen) {
+                    while !self.peek_is(TokenKind::RParen) && !self.peek_is(TokenKind::Comma) {
                         subpatterns.push(self.parse_pattern()?);
                     }
-                    self.expect(TokenKind::RParen)?;
                     if subpatterns.is_empty() {
-                        Ok(Pattern::Name(ctor_name))
+                        Pattern::Name(ctor_name)
                     } else {
-                        Ok(Pattern::Ctor(ctor_name, subpatterns))
+                        Pattern::Ctor(ctor_name, subpatterns)
                     }
                 } else {
-                    let inner = self.parse_pattern()?;
+                    self.parse_pattern()?
+                };
+                if self.eat(TokenKind::Comma) {
+                    let mut items = vec![first];
+                    loop {
+                        items.push(self.parse_pattern()?);
+                        if self.eat(TokenKind::Comma) {
+                            continue;
+                        }
+                        break;
+                    }
                     self.expect(TokenKind::RParen)?;
-                    Ok(inner)
+                    Ok(Pattern::Tuple(items))
+                } else {
+                    self.expect(TokenKind::RParen)?;
+                    Ok(first)
                 }
             }
             TokenKind::Ident => {
@@ -2039,9 +2194,22 @@ impl Parser {
 
     fn parse_type_atom(&mut self) -> Result<Type> {
         let mut head = if self.eat(TokenKind::LParen) {
-            let ty = self.parse_type()?;
-            self.expect(TokenKind::RParen)?;
-            ty
+            let first = self.parse_type()?;
+            if self.eat(TokenKind::Comma) {
+                let mut items = vec![first];
+                loop {
+                    items.push(self.parse_type()?);
+                    if self.eat(TokenKind::Comma) {
+                        continue;
+                    }
+                    break;
+                }
+                self.expect(TokenKind::RParen)?;
+                Type::Tuple(items)
+            } else {
+                self.expect(TokenKind::RParen)?;
+                first
+            }
         } else if self.eat(TokenKind::LBrace) {
             let mut fields = BTreeMap::new();
             self.skip_newlines();
@@ -2236,9 +2404,22 @@ impl Parser {
             }
             TokenKind::LParen => {
                 self.pos += 1;
-                let expr = self.parse_expr(0)?;
-                self.expect(TokenKind::RParen)?;
-                Ok(expr)
+                let first = self.parse_expr(0)?;
+                if self.eat(TokenKind::Comma) {
+                    let mut items = vec![first];
+                    loop {
+                        items.push(self.parse_expr(0)?);
+                        if self.eat(TokenKind::Comma) {
+                            continue;
+                        }
+                        break;
+                    }
+                    self.expect(TokenKind::RParen)?;
+                    Ok(Expr::Tuple(items))
+                } else {
+                    self.expect(TokenKind::RParen)?;
+                    Ok(first)
+                }
             }
             TokenKind::LBrace => {
                 self.pos += 1;
@@ -2253,6 +2434,14 @@ impl Parser {
 
     fn parse_postfix(&mut self, lhs: Expr) -> Result<Expr> {
         if self.eat(TokenKind::Dot) {
+            if self.peek_is(TokenKind::Int) {
+                let token = self
+                    .peek()
+                    .cloned()
+                    .ok_or_else(|| SimdError::new("expected tuple projection index after '.'"))?;
+                self.pos += 1;
+                return Ok(Expr::TupleProject(Box::new(lhs), parse_nat(&token.text)?));
+            }
             return Ok(Expr::Project(Box::new(lhs), self.expect_ident()?));
         }
         if self.eat(TokenKind::LBrace) {
@@ -2651,9 +2840,9 @@ fn is_direct_self_recursive_field(ty: &Type, enum_decl: &EnumDecl) -> bool {
     if name != &enum_decl.name || args.len() != enum_decl.params.len() {
         return false;
     }
-    args.iter().zip(&enum_decl.params).all(|(arg, param)| {
-        matches!(arg, Type::Var(name) if name == param)
-    })
+    args.iter()
+        .zip(&enum_decl.params)
+        .all(|(arg, param)| matches!(arg, Type::Var(name) if name == param))
 }
 
 fn recursive_slot_paths_in_type(
@@ -2676,6 +2865,14 @@ fn recursive_slot_paths_in_type(
             }
             Ok(())
         }
+        Type::Tuple(items) => {
+            for (index, item_ty) in items.iter().enumerate() {
+                let mut next = prefix.to_vec();
+                next.push(tuple_leaf_name(index));
+                recursive_slot_paths_in_type(item_ty, enum_decl, enum_names, &next, out)?;
+            }
+            Ok(())
+        }
         Type::Named(name, args) => {
             if enum_names.contains(name) {
                 if name != &enum_decl.name {
@@ -2692,7 +2889,10 @@ fn recursive_slot_paths_in_type(
                     enum_decl.params.join(" ")
                 )));
             }
-            if args.iter().any(|arg| type_contains_named_enum(arg, enum_names)) {
+            if args
+                .iter()
+                .any(|arg| type_contains_named_enum(arg, enum_names))
+            {
                 return Err(SimdError::new(format!(
                     "constructor field '{:?}' of enum '{}' nests recursive enum occurrences through '{}'; only direct self recursion or record-contained direct recursion is supported",
                     ty, enum_decl.name, name
@@ -2716,21 +2916,31 @@ fn recursive_slot_paths_in_type(
 fn type_contains_named_enum(ty: &Type, enum_names: &BTreeSet<String>) -> bool {
     match ty {
         Type::Named(name, args) => {
-            enum_names.contains(name) || args.iter().any(|arg| type_contains_named_enum(arg, enum_names))
+            enum_names.contains(name)
+                || args
+                    .iter()
+                    .any(|arg| type_contains_named_enum(arg, enum_names))
         }
         Type::TypeToken(inner) => type_contains_named_enum(inner, enum_names),
+        Type::Tuple(items) => items
+            .iter()
+            .any(|item_ty| type_contains_named_enum(item_ty, enum_names)),
         Type::Record(fields) => fields
             .values()
             .any(|field_ty| type_contains_named_enum(field_ty, enum_names)),
         Type::Fun(args, ret) => {
-            args.iter().any(|arg| type_contains_named_enum(arg, enum_names))
+            args.iter()
+                .any(|arg| type_contains_named_enum(arg, enum_names))
                 || type_contains_named_enum(ret, enum_names)
         }
         Type::Scalar(_) | Type::Bulk(_, _) | Type::Var(_) | Type::Infer(_) => false,
     }
 }
 
-fn validate_enum_recursive_constraints(enums: &[EnumDecl], enum_names: &BTreeSet<String>) -> Result<()> {
+fn validate_enum_recursive_constraints(
+    enums: &[EnumDecl],
+    enum_names: &BTreeSet<String>,
+) -> Result<()> {
     for enum_decl in enums {
         for ctor in &enum_decl.ctors {
             for field in &ctor.fields {
@@ -2866,7 +3076,7 @@ fn parse_char_literal(text: &str) -> Result<char> {
                     return Err(SimdError::new(format!(
                         "unsupported char escape '\\{}'",
                         other
-                    )))
+                    )));
                 }
             }
         }
@@ -2894,9 +3104,10 @@ pub fn read_source_file(path: &str) -> Result<String> {
 pub fn compile_source(source: &str) -> Result<CompiledProgram> {
     let (surface, module, checked) = compile_frontend(source)?;
     let normalized = normalize_records(&checked)?;
-    let lowered = optimize_lowered_program(&lower_program(&normalized)?);
+    let lowered = optimize_lowered_program(&prepare_lowered_program(&normalized)?);
     let grouped = group_lowered_program(&normalized, &lowered)?;
     let intents = analyze_intents(&grouped);
+    let structural = analyze_structural_clusters(&lowered);
     Ok(CompiledProgram {
         surface,
         module,
@@ -2905,6 +3116,7 @@ pub fn compile_source(source: &str) -> Result<CompiledProgram> {
         lowered,
         grouped,
         intents,
+        structural,
     })
 }
 
@@ -3533,6 +3745,7 @@ fn inferred_pattern_type(pattern: &Pattern) -> Result<Option<Type>> {
         Pattern::Type(prim) => Ok(Some(Type::TypeToken(Box::new(Type::Scalar(*prim))))),
         Pattern::Name(_)
         | Pattern::Wildcard
+        | Pattern::Tuple(_)
         | Pattern::Ctor(_, _)
         | Pattern::Slice { .. } => Ok(None),
     }
@@ -3712,6 +3925,14 @@ fn resolve_type_aliases_in_type(
         Type::TypeToken(inner) => Ok(Type::TypeToken(Box::new(resolve_type_aliases_in_type(
             inner, aliases, enum_names, bound_vars, stack,
         )?))),
+        Type::Tuple(items) => Ok(Type::Tuple(
+            items
+                .iter()
+                .map(|item| {
+                    resolve_type_aliases_in_type(item, aliases, enum_names, bound_vars, stack)
+                })
+                .collect::<Result<Vec<_>>>()?,
+        )),
         Type::Record(fields) => Ok(Type::Record(
             fields
                 .iter()
@@ -3719,11 +3940,7 @@ fn resolve_type_aliases_in_type(
                     Ok((
                         name.clone(),
                         resolve_type_aliases_in_type(
-                            field_ty,
-                            aliases,
-                            enum_names,
-                            bound_vars,
-                            stack,
+                            field_ty, aliases, enum_names, bound_vars, stack,
                         )?,
                     ))
                 })
@@ -3774,14 +3991,13 @@ fn resolve_type_aliases_in_type(
                 }
                 stack.push(name.clone());
                 let alias_scope = alias.params.iter().cloned().collect::<BTreeSet<_>>();
-                let alias_body =
-                    resolve_type_aliases_in_type(
-                        &alias.body,
-                        aliases,
-                        enum_names,
-                        &alias_scope,
-                        stack,
-                    )?;
+                let alias_body = resolve_type_aliases_in_type(
+                    &alias.body,
+                    aliases,
+                    enum_names,
+                    &alias_scope,
+                    stack,
+                )?;
                 stack.pop();
                 let subst = alias
                     .params
@@ -3825,6 +4041,7 @@ fn type_contains_type_witness(ty: &Type) -> bool {
         Type::TypeToken(_) => true,
         Type::Scalar(_) | Type::Bulk(_, _) | Type::Var(_) | Type::Infer(_) => false,
         Type::Named(_, args) => args.iter().any(type_contains_type_witness),
+        Type::Tuple(items) => items.iter().any(type_contains_type_witness),
         Type::Record(fields) => fields.values().any(type_contains_type_witness),
         Type::Fun(args, ret) => {
             args.iter().any(type_contains_type_witness) || type_contains_type_witness(ret)
@@ -3861,6 +4078,12 @@ fn validate_pointwise_expr(expr: &Expr, known: &BTreeMap<String, usize>) -> Resu
         | Expr::Char(_)
         | Expr::String(_) => Ok(()),
         Expr::Lambda { body, .. } => validate_pointwise_expr(body, known),
+        Expr::Tuple(items) => {
+            for item in items {
+                validate_pointwise_expr(item, known)?;
+            }
+            Ok(())
+        }
         Expr::Let { bindings, body } => {
             for binding in bindings {
                 validate_pointwise_expr(&binding.expr, known)?;
@@ -3896,7 +4119,9 @@ fn validate_pointwise_expr(expr: &Expr, known: &BTreeMap<String, usize>) -> Resu
             }
             Ok(())
         }
-        Expr::Project(base, _) => validate_pointwise_expr(base, known),
+        Expr::Project(base, _) | Expr::TupleProject(base, _) => {
+            validate_pointwise_expr(base, known)
+        }
         Expr::RecordUpdate { base, fields } => {
             validate_pointwise_expr(base, known)?;
             for (_, value) in fields {
@@ -4143,12 +4368,19 @@ fn apply_infer_bindings_expr(expr: &mut TypedExpr, infer_bindings: &BTreeMap<u32
             }
             apply_infer_bindings_expr(body, infer_bindings);
         }
+        TypedExprKind::Tuple(items) => {
+            for expr in items {
+                apply_infer_bindings_expr(expr, infer_bindings);
+            }
+        }
         TypedExprKind::Record(fields) => {
             for expr in fields.values_mut() {
                 apply_infer_bindings_expr(expr, infer_bindings);
             }
         }
-        TypedExprKind::Project { base, .. } => apply_infer_bindings_expr(base, infer_bindings),
+        TypedExprKind::Project { base, .. } | TypedExprKind::TupleProject { base, .. } => {
+            apply_infer_bindings_expr(base, infer_bindings)
+        }
         TypedExprKind::RecordUpdate { base, fields } => {
             apply_infer_bindings_expr(base, infer_bindings);
             for expr in fields.values_mut() {
@@ -4197,12 +4429,19 @@ fn collect_local_usage_types<'a>(expr: &'a TypedExpr, name: &str, out: &mut Vec<
             }
             collect_local_usage_types(body, name, out);
         }
+        TypedExprKind::Tuple(items) => {
+            for item in items {
+                collect_local_usage_types(item, name, out);
+            }
+        }
         TypedExprKind::Record(fields) => {
             for field in fields.values() {
                 collect_local_usage_types(field, name, out);
             }
         }
-        TypedExprKind::Project { base, .. } => collect_local_usage_types(base, name, out),
+        TypedExprKind::Project { base, .. } | TypedExprKind::TupleProject { base, .. } => {
+            collect_local_usage_types(base, name, out)
+        }
         TypedExprKind::RecordUpdate { base, fields } => {
             collect_local_usage_types(base, name, out);
             for field in fields.values() {
@@ -4249,6 +4488,12 @@ fn apply_infer_bindings(ty: &Type, infer_bindings: &BTreeMap<u32, Type>) -> Type
             .cloned()
             .unwrap_or_else(|| Type::Scalar(Prim::I64)),
         Type::Scalar(_) | Type::Bulk(_, _) | Type::Var(_) => ty.clone(),
+        Type::Tuple(items) => Type::Tuple(
+            items
+                .iter()
+                .map(|item| apply_infer_bindings(item, infer_bindings))
+                .collect(),
+        ),
         Type::Named(name, args) => Type::Named(
             name.clone(),
             args.iter()
@@ -4324,6 +4569,25 @@ fn check_pattern(
             }
             Ok(())
         }
+        Pattern::Tuple(items) => {
+            let Type::Tuple(item_types) = ty else {
+                return Err(SimdError::new(format!(
+                    "tuple pattern expects tuple type, found {:?}",
+                    ty
+                )));
+            };
+            if items.len() != item_types.len() {
+                return Err(SimdError::new(format!(
+                    "tuple pattern expects {} elements, found {}",
+                    item_types.len(),
+                    items.len()
+                )));
+            }
+            for (item, item_ty) in items.iter().zip(item_types) {
+                check_pattern(item, item_ty, locals, enum_ctors)?;
+            }
+            Ok(())
+        }
         Pattern::Ctor(name, subpatterns) => {
             let ctor = enum_ctors
                 .get(name)
@@ -4377,14 +4641,12 @@ fn check_pattern(
                 Type::Named(name, args) if name == "string" && args.is_empty() => {
                     (Type::Scalar(Prim::Char), builtin_string_type())
                 }
-                Type::Bulk(prim, shape) if shape.0.len() == 1 => {
-                    (Type::Scalar(*prim), ty.clone())
-                }
+                Type::Bulk(prim, shape) if shape.0.len() == 1 => (Type::Scalar(*prim), ty.clone()),
                 _ => {
                     return Err(SimdError::new(format!(
                         "slice pattern is only valid against rank-1 bulk or string types, found {:?}",
                         ty
-                    )))
+                    )));
                 }
             };
             for subpattern in prefix {
@@ -4618,8 +4880,10 @@ fn infer_expr(
         }
         Expr::Lambda { param, body } => infer_lambda_expr(param, body, context, expected),
         Expr::Let { bindings, body } => infer_let_expr(bindings, body, context, expected),
+        Expr::Tuple(items) => infer_tuple_expr(items, context, expected),
         Expr::Record(fields) => infer_record_expr(fields, context, expected),
         Expr::Project(base, field) => infer_projection_expr(base, field, context),
+        Expr::TupleProject(base, index) => infer_tuple_projection_expr(base, *index, context),
         Expr::RecordUpdate { base, fields } => infer_record_update_expr(base, fields, context),
         Expr::Infix { op, lhs, rhs } => infer_primitive_call(*op, lhs, rhs, context, expected),
         Expr::App(_, _) => infer_apply_expr(expr, context, expected),
@@ -4850,6 +5114,74 @@ fn infer_let_expr(
     })
 }
 
+fn infer_tuple_expr(
+    items: &[Expr],
+    context: &TypeContext<'_>,
+    expected: Option<&Type>,
+) -> Result<TypedExpr> {
+    let expected_items = match expected {
+        Some(Type::Tuple(items)) => Some(items),
+        Some(Type::Var(_) | Type::Infer(_)) | None => None,
+        Some(other) => {
+            return Err(SimdError::new(format!(
+                "tuple literal used where {:?} was expected",
+                other
+            )));
+        }
+    };
+    if let Some(expected_items) = expected_items
+        && expected_items.len() != items.len()
+    {
+        return Err(SimdError::new(format!(
+            "tuple literal has {} elements, expected {}",
+            items.len(),
+            expected_items.len()
+        )));
+    }
+    let typed_items = items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            infer_expr(
+                item,
+                context,
+                expected_items.and_then(|items| items.get(index)),
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(TypedExpr {
+        ty: Type::Tuple(typed_items.iter().map(|item| item.ty.clone()).collect()),
+        kind: TypedExprKind::Tuple(typed_items),
+    })
+}
+
+fn infer_tuple_projection_expr(
+    base: &Expr,
+    index: usize,
+    context: &TypeContext<'_>,
+) -> Result<TypedExpr> {
+    let base = infer_expr(base, context, None)?;
+    let Type::Tuple(items) = &base.ty else {
+        return Err(SimdError::new(format!(
+            "tuple projection '.{}' requires a tuple value, found {:?}",
+            index, base.ty
+        )));
+    };
+    let item_ty = items.get(index).cloned().ok_or_else(|| {
+        SimdError::new(format!(
+            "tuple index {} does not exist for tuple type {:?}",
+            index, base.ty
+        ))
+    })?;
+    Ok(TypedExpr {
+        ty: item_ty,
+        kind: TypedExprKind::TupleProject {
+            base: Box::new(base),
+            index,
+        },
+    })
+}
+
 fn topo_sort_let_bindings(bindings: &[LetBinding]) -> Result<Vec<usize>> {
     let mut binding_names = BTreeMap::<String, usize>::new();
     for (index, binding) in bindings.iter().enumerate() {
@@ -4942,6 +5274,11 @@ fn collect_expr_local_names_into(expr: &Expr, names: &mut BTreeSet<String>) {
             }
         }
         Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::Char(_) | Expr::String(_) => {}
+        Expr::Tuple(items) => {
+            for item in items {
+                collect_expr_local_names_into(item, names);
+            }
+        }
         Expr::Lambda { body, .. } => {
             collect_expr_local_names_into(body, names);
         }
@@ -4960,7 +5297,9 @@ fn collect_expr_local_names_into(expr: &Expr, names: &mut BTreeSet<String>) {
                 collect_expr_local_names_into(expr, names);
             }
         }
-        Expr::Project(base, _) => collect_expr_local_names_into(base, names),
+        Expr::Project(base, _) | Expr::TupleProject(base, _) => {
+            collect_expr_local_names_into(base, names)
+        }
         Expr::RecordUpdate { base, fields } => {
             collect_expr_local_names_into(base, names);
             for (_, expr) in fields {
@@ -4990,6 +5329,7 @@ fn type_contains_var(ty: &Type) -> bool {
         Type::Var(_) | Type::Infer(_) => true,
         Type::Scalar(_) | Type::Bulk(_, _) => false,
         Type::Named(_, args) => args.iter().any(type_contains_var),
+        Type::Tuple(items) => items.iter().any(type_contains_var),
         Type::TypeToken(inner) => type_contains_var(inner),
         Type::Record(fields) => fields.values().any(type_contains_var),
         Type::Fun(args, ret) => args.iter().any(type_contains_var) || type_contains_var(ret),
@@ -5001,6 +5341,7 @@ fn type_contains_infer(ty: &Type) -> bool {
         Type::Infer(_) => true,
         Type::Scalar(_) | Type::Bulk(_, _) | Type::Var(_) => false,
         Type::Named(_, args) => args.iter().any(type_contains_infer),
+        Type::Tuple(items) => items.iter().any(type_contains_infer),
         Type::TypeToken(inner) => type_contains_infer(inner),
         Type::Record(fields) => fields.values().any(type_contains_infer),
         Type::Fun(args, ret) => args.iter().any(type_contains_infer) || type_contains_infer(ret),
@@ -5025,6 +5366,11 @@ fn collect_type_vars_in_order_into(ty: &Type, seen: &mut BTreeSet<String>, vars:
         Type::Named(_, args) => {
             for arg in args {
                 collect_type_vars_in_order_into(arg, seen, vars);
+            }
+        }
+        Type::Tuple(items) => {
+            for item in items {
+                collect_type_vars_in_order_into(item, seen, vars);
             }
         }
         Type::TypeToken(inner) => collect_type_vars_in_order_into(inner, seen, vars),
@@ -5078,6 +5424,11 @@ fn collect_legacy_family_params_into(
                 collect_legacy_family_params_into(arg, seen, vars);
             }
         }
+        Type::Tuple(items) => {
+            for item in items {
+                collect_legacy_family_params_into(item, seen, vars);
+            }
+        }
         Type::Record(fields) => {
             for field_ty in fields.values() {
                 collect_legacy_family_params_into(field_ty, seen, vars);
@@ -5100,6 +5451,12 @@ fn apply_type_subst(ty: &Type, subst: &BTreeMap<String, Type>) -> Type {
             name.clone(),
             args.iter()
                 .map(|arg| apply_type_subst(arg, subst))
+                .collect(),
+        ),
+        Type::Tuple(items) => Type::Tuple(
+            items
+                .iter()
+                .map(|item| apply_type_subst(item, subst))
                 .collect(),
         ),
         Type::TypeToken(inner) => Type::TypeToken(Box::new(apply_type_subst(inner, subst))),
@@ -5183,6 +5540,18 @@ fn unify_type_template(
             }
             _ => Err(SimdError::new(format!(
                 "expected type constructor {:?}, found {:?}",
+                template, actual
+            ))),
+        },
+        Type::Tuple(left_items) => match actual {
+            Type::Tuple(right_items) if left_items.len() == right_items.len() => {
+                for (left_item, right_item) in left_items.iter().zip(right_items) {
+                    unify_type_template(left_item, right_item, subst)?;
+                }
+                Ok(())
+            }
+            _ => Err(SimdError::new(format!(
+                "expected tuple {:?}, found {:?}",
                 template, actual
             ))),
         },
@@ -5355,7 +5724,8 @@ fn infer_apply_expr(
         return Ok(direct_call);
     }
     if let Expr::Ref(reference) = head
-        && let Some(typed) = infer_direct_constructor_apply(reference, &args_exprs, context, expected)?
+        && let Some(typed) =
+            infer_direct_constructor_apply(reference, &args_exprs, context, expected)?
     {
         return Ok(typed);
     }
@@ -6305,7 +6675,10 @@ fn infer_primitive_signature(
 
 fn ensure_valid_primitive_prim(op: PrimOp, prim: Prim) -> Result<()> {
     if prim == Prim::Char
-        && !matches!(op, PrimOp::Eq | PrimOp::Lt | PrimOp::Gt | PrimOp::Le | PrimOp::Ge)
+        && !matches!(
+            op,
+            PrimOp::Eq | PrimOp::Lt | PrimOp::Gt | PrimOp::Le | PrimOp::Ge
+        )
     {
         return Err(SimdError::new(
             "char operands currently support only comparison operators",
@@ -6392,6 +6765,12 @@ fn lift_type_over_shape(ty: &Type, shape: &Shape) -> Result<Type> {
         Type::Named(_, _) => Err(SimdError::new(
             "bulk postfix cannot be applied to unresolved type constructors",
         )),
+        Type::Tuple(items) => Ok(Type::Tuple(
+            items
+                .iter()
+                .map(|item_ty| lift_type_over_shape(item_ty, shape))
+                .collect::<Result<Vec<_>>>()?,
+        )),
         Type::TypeToken(_) => Err(SimdError::new(
             "bulk postfix cannot be applied to type witness parameters",
         )),
@@ -6418,6 +6797,12 @@ fn unify_lifted_type(slot: &mut Option<Shape>, param: &Type, actual: &Type) -> R
         )),
         (Type::Scalar(left), Type::Bulk(right, shape)) if left == right => {
             unify_lifted_shape(slot, shape)
+        }
+        (Type::Tuple(left), Type::Tuple(right)) if left.len() == right.len() => {
+            for (left_ty, right_ty) in left.iter().zip(right) {
+                unify_lifted_type(slot, left_ty, right_ty)?;
+            }
+            Ok(())
         }
         (Type::Record(left), Type::Record(right)) if left.len() == right.len() => {
             for (name, left_ty) in left {
@@ -6452,6 +6837,12 @@ fn unify_param_type(
         {
             for (left_arg, right_arg) in left_args.iter().zip(right_args) {
                 unify_param_type(left_arg, right_arg, dim_subst)?;
+            }
+            Ok(())
+        }
+        (Type::Tuple(left), Type::Tuple(right)) if left.len() == right.len() => {
+            for (left_ty, right_ty) in left.iter().zip(right) {
+                unify_param_type(left_ty, right_ty, dim_subst)?;
             }
             Ok(())
         }
@@ -6515,6 +6906,12 @@ fn apply_dim_subst(ty: &Type, subst: &BTreeMap<String, Dim>) -> Type {
         Type::Named(name, args) => Type::Named(
             name.clone(),
             args.iter().map(|arg| apply_dim_subst(arg, subst)).collect(),
+        ),
+        Type::Tuple(items) => Type::Tuple(
+            items
+                .iter()
+                .map(|item| apply_dim_subst(item, subst))
+                .collect(),
         ),
         Type::TypeToken(inner) => Type::TypeToken(Box::new(apply_dim_subst(inner, subst))),
         Type::Bulk(prim, shape) => Type::Bulk(
@@ -6595,12 +6992,17 @@ fn visit_tail_calls(
             }
             visit_tail_calls(body, self_name, in_tail, recursive, valid);
         }
+        TypedExprKind::Tuple(items) => {
+            for item in items {
+                visit_tail_calls(item, self_name, false, recursive, valid);
+            }
+        }
         TypedExprKind::Record(fields) => {
             for field in fields.values() {
                 visit_tail_calls(field, self_name, false, recursive, valid);
             }
         }
-        TypedExprKind::Project { base, .. } => {
+        TypedExprKind::Project { base, .. } | TypedExprKind::TupleProject { base, .. } => {
             visit_tail_calls(base, self_name, false, recursive, valid);
         }
         TypedExprKind::RecordUpdate { base, fields } => {
@@ -6722,8 +7124,11 @@ fn typed_expr_uses_type_witness(expr: &TypedExpr) -> bool {
                 .any(|binding| typed_expr_uses_type_witness(&binding.expr))
                 || typed_expr_uses_type_witness(body)
         }
+        TypedExprKind::Tuple(items) => items.iter().any(typed_expr_uses_type_witness),
         TypedExprKind::Record(fields) => fields.values().any(typed_expr_uses_type_witness),
-        TypedExprKind::Project { base, .. } => typed_expr_uses_type_witness(base),
+        TypedExprKind::Project { base, .. } | TypedExprKind::TupleProject { base, .. } => {
+            typed_expr_uses_type_witness(base)
+        }
         TypedExprKind::RecordUpdate { base, fields } => {
             typed_expr_uses_type_witness(base) || fields.values().any(typed_expr_uses_type_witness)
         }
@@ -6733,6 +7138,46 @@ fn typed_expr_uses_type_witness(expr: &TypedExpr) -> bool {
         TypedExprKind::Apply { callee, arg } => {
             typed_expr_uses_type_witness(callee) || typed_expr_uses_type_witness(arg)
         }
+    }
+}
+
+fn normalized_pattern_at_leaf(pattern: &Pattern, ty: &Type, path: &LeafPath) -> Result<Pattern> {
+    if path.is_root() {
+        return Ok(pattern.clone());
+    }
+    let Some((head, tail)) = path.split_first() else {
+        unreachable!("non-root normalized leaf path must have a head");
+    };
+    match pattern {
+        Pattern::Name(name) => Ok(Pattern::Name(normalized_local_name(name, path))),
+        Pattern::Wildcard => Ok(Pattern::Wildcard),
+        Pattern::Tuple(items) => {
+            let Type::Tuple(item_types) = ty else {
+                return Err(SimdError::new(format!(
+                    "tuple pattern expects tuple type, found {:?}",
+                    ty
+                )));
+            };
+            let index = parse_tuple_leaf_name(head).ok_or_else(|| {
+                SimdError::new(format!("tuple leaf '{}' is not a valid tuple index", head))
+            })?;
+            let item = items.get(index).ok_or_else(|| {
+                SimdError::new(format!("tuple pattern is missing element {}", index))
+            })?;
+            let item_ty = item_types.get(index).ok_or_else(|| {
+                SimdError::new(format!("tuple type is missing element {}", index))
+            })?;
+            normalized_pattern_at_leaf(item, item_ty, &tail)
+        }
+        Pattern::Int(_)
+        | Pattern::Float(_)
+        | Pattern::Bool(_)
+        | Pattern::Char(_)
+        | Pattern::Type(_)
+        | Pattern::Ctor(_, _)
+        | Pattern::Slice { .. } => Err(SimdError::new(
+            "tuple/record parameters cannot use nested literal patterns",
+        )),
     }
 }
 
@@ -6872,6 +7317,24 @@ fn normalize_function_leaf(
                         &mut locals,
                     )?;
                 }
+                Pattern::Tuple(_) => {
+                    for leaf in leaves {
+                        patterns.push(TypedPattern {
+                            pattern: normalized_pattern_at_leaf(
+                                &typed_pattern.pattern,
+                                &typed_pattern.ty,
+                                &leaf.path,
+                            )?,
+                            ty: leaf.ty.clone(),
+                        });
+                    }
+                    collect_pattern_local_leaf_bindings(
+                        &typed_pattern.pattern,
+                        &typed_pattern.ty,
+                        enum_ctors,
+                        &mut locals,
+                    )?;
+                }
             }
         }
 
@@ -6930,6 +7393,25 @@ fn collect_pattern_local_leaf_bindings(
             }
             Ok(())
         }
+        Pattern::Tuple(items) => {
+            let Type::Tuple(item_types) = ty else {
+                return Err(SimdError::new(format!(
+                    "tuple pattern expects tuple type, found {:?}",
+                    ty
+                )));
+            };
+            if items.len() != item_types.len() {
+                return Err(SimdError::new(format!(
+                    "tuple pattern expects {} elements, found {}",
+                    item_types.len(),
+                    items.len()
+                )));
+            }
+            for (item, item_ty) in items.iter().zip(item_types) {
+                collect_pattern_local_leaf_bindings(item, item_ty, enum_ctors, locals)?;
+            }
+            Ok(())
+        }
         Pattern::Ctor(name, subpatterns) => {
             let ctor = enum_ctors
                 .get(name)
@@ -6972,7 +7454,7 @@ fn collect_pattern_local_leaf_bindings(
                     return Err(SimdError::new(format!(
                         "slice pattern expects rank-1 bulk/string type, found {:?}",
                         other
-                    )))
+                    )));
                 }
             };
             for subpattern in prefix {
@@ -7110,7 +7592,7 @@ fn normalize_expr_to_leaf(
                 ty: leaf_ty,
                 kind: TypedExprKind::ConstructorRef { name: name.clone() },
             })
-        },
+        }
         TypedExprKind::Apply { callee, arg } => {
             if !requested.is_root() {
                 return Err(SimdError::new(format!(
@@ -7177,6 +7659,31 @@ fn normalize_expr_to_leaf(
                 })
             }
         }
+        TypedExprKind::Tuple(items) => {
+            if requested.is_root() {
+                let normalized_items = items
+                    .iter()
+                    .map(|item| normalize_expr_to_leaf(item, &LeafPath::root(), locals, entries))
+                    .collect::<Result<Vec<_>>>()?;
+                return Ok(TypedExpr {
+                    ty: leaf_ty,
+                    kind: TypedExprKind::Tuple(normalized_items),
+                });
+            }
+            let (field, rest) = requested.split_first().ok_or_else(|| {
+                SimdError::new("tuple expression must normalize to a concrete leaf path")
+            })?;
+            let index = parse_tuple_leaf_name(field).ok_or_else(|| {
+                SimdError::new(format!("tuple leaf '{}' is not a valid tuple index", field))
+            })?;
+            let item_expr = items.get(index).ok_or_else(|| {
+                SimdError::new(format!(
+                    "tuple index {} is missing during normalization",
+                    index
+                ))
+            })?;
+            normalize_expr_to_leaf(item_expr, &rest, locals, entries)
+        }
         TypedExprKind::Record(fields) => {
             if requested.is_root() {
                 let normalized_fields = fields
@@ -7184,12 +7691,7 @@ fn normalize_expr_to_leaf(
                     .map(|(name, field_expr)| {
                         Ok((
                             name.clone(),
-                            normalize_expr_to_leaf(
-                                field_expr,
-                                &LeafPath::root(),
-                                locals,
-                                entries,
-                            )?,
+                            normalize_expr_to_leaf(field_expr, &LeafPath::root(), locals, entries)?,
                         ))
                     })
                     .collect::<Result<BTreeMap<_, _>>>()?;
@@ -7212,6 +7714,12 @@ fn normalize_expr_to_leaf(
         TypedExprKind::Project { base, field } => {
             normalize_expr_to_leaf(base, &requested.prepend(field), locals, entries)
         }
+        TypedExprKind::TupleProject { base, index } => normalize_expr_to_leaf(
+            base,
+            &requested.prepend(&tuple_leaf_name(*index)),
+            locals,
+            entries,
+        ),
         TypedExprKind::RecordUpdate { base, fields } => {
             let (field, rest) = requested.split_first().ok_or_else(|| {
                 SimdError::new("record update must normalize to a concrete leaf path")
@@ -7341,6 +7849,7 @@ fn lookup_leaf_type(ty: &Type, path: &LeafPath) -> Result<Type> {
             Type::TypeToken(_) => Err(SimdError::new(
                 "type witness values cannot appear as normalized leaf results",
             )),
+            Type::Tuple(_) => Ok(ty.clone()),
             Type::Record(_) => Ok(ty.clone()),
             Type::Named(_, _) => Ok(ty.clone()),
             Type::Var(_) | Type::Infer(_) => Err(SimdError::new(
@@ -7353,6 +7862,15 @@ fn lookup_leaf_type(ty: &Type, path: &LeafPath) -> Result<Type> {
         .split_first()
         .ok_or_else(|| SimdError::new("invalid empty leaf path"))?;
     match ty {
+        Type::Tuple(items) => {
+            let index = parse_tuple_leaf_name(field).ok_or_else(|| {
+                SimdError::new(format!("tuple leaf '{}' is not a valid tuple index", field))
+            })?;
+            let item_ty = items.get(index).ok_or_else(|| {
+                SimdError::new(format!("tuple index {} does not exist in {:?}", index, ty))
+            })?;
+            lookup_leaf_type(item_ty, &rest)
+        }
         Type::Record(fields) => {
             let field_ty = fields.get(field).ok_or_else(|| {
                 SimdError::new(format!(
@@ -7363,7 +7881,7 @@ fn lookup_leaf_type(ty: &Type, path: &LeafPath) -> Result<Type> {
             lookup_leaf_type(field_ty, &rest)
         }
         _ => Err(SimdError::new(format!(
-            "cannot select record leaf {:?} from non-record type {:?}",
+            "cannot select tuple/record leaf {:?} from non-product type {:?}",
             path, ty
         ))),
     }
@@ -7395,12 +7913,19 @@ fn collect_typed_local_names(expr: &TypedExpr, names: &mut BTreeSet<String>) {
             }
             collect_typed_local_names(body, names);
         }
+        TypedExprKind::Tuple(items) => {
+            for expr in items {
+                collect_typed_local_names(expr, names);
+            }
+        }
         TypedExprKind::Record(fields) => {
             for expr in fields.values() {
                 collect_typed_local_names(expr, names);
             }
         }
-        TypedExprKind::Project { base, .. } => collect_typed_local_names(base, names),
+        TypedExprKind::Project { base, .. } | TypedExprKind::TupleProject { base, .. } => {
+            collect_typed_local_names(base, names)
+        }
         TypedExprKind::RecordUpdate { base, fields } => {
             collect_typed_local_names(base, names);
             for expr in fields.values() {
@@ -7456,6 +7981,81 @@ pub(crate) fn lower_program(checked: &NormalizedProgram) -> Result<LoweredProgra
         functions.push(lower_function(function)?);
     }
     Ok(LoweredProgram { functions })
+}
+
+pub(crate) fn prepare_lowered_program(checked: &NormalizedProgram) -> Result<LoweredProgram> {
+    let lowered = lower_program(checked)?;
+    Ok(materialize_structural_programs(&lowered))
+}
+
+fn materialize_structural_programs(program: &LoweredProgram) -> LoweredProgram {
+    LoweredProgram {
+        functions: program
+            .functions
+            .iter()
+            .map(materialize_structural_function)
+            .collect(),
+    }
+}
+
+fn materialize_structural_function(function: &LoweredFunction) -> LoweredFunction {
+    let kind = match &function.kind {
+        LoweredKind::Structural { clauses, .. } => LoweredKind::Structural {
+            clauses: clauses.clone(),
+            program: build_structural_program(clauses, function.tail_loop.as_ref()),
+        },
+        other => other.clone(),
+    };
+    LoweredFunction {
+        name: function.name.clone(),
+        param_access: function.param_access.clone(),
+        result: function.result.clone(),
+        kind,
+        tail_loop: function.tail_loop.clone(),
+    }
+}
+
+fn build_structural_program(
+    clauses: &[LoweredClause],
+    tail_loop: Option<&TailLoop>,
+) -> StructuralProgram {
+    if let Some(tail_loop) = tail_loop {
+        return StructuralProgram {
+            entry_state: 0,
+            states: tail_loop
+                .clauses
+                .iter()
+                .enumerate()
+                .map(|(index, clause)| StructuralState {
+                    patterns: clause.patterns.clone(),
+                    on_match: match &clause.action {
+                        TailAction::Continue { args } => StructuralAction::Transition {
+                            state: 0,
+                            args: args.clone(),
+                        },
+                        TailAction::Return { expr } => StructuralAction::Return {
+                            expr: expr.clone(),
+                        },
+                    },
+                    on_miss: (index + 1 < tail_loop.clauses.len()).then_some((index + 1) as u32),
+                })
+                .collect(),
+        };
+    }
+    StructuralProgram {
+        entry_state: 0,
+        states: clauses
+            .iter()
+            .enumerate()
+            .map(|(index, clause)| StructuralState {
+                patterns: clause.patterns.clone(),
+                on_match: StructuralAction::Return {
+                    expr: clause.body.clone(),
+                },
+                on_miss: (index + 1 < clauses.len()).then_some((index + 1) as u32),
+            })
+            .collect(),
+    }
 }
 
 fn group_lowered_program(
@@ -7528,12 +8128,12 @@ fn group_lowered_program(
         };
         let clause_count = match &lowered_function.kind {
             LoweredKind::Scalar { clauses }
-            | LoweredKind::Structural { clauses }
+            | LoweredKind::Structural { clauses, .. }
             | LoweredKind::Kernel { clauses, .. } => clauses.len(),
         };
         let clause_patterns = match &lowered_function.kind {
             LoweredKind::Scalar { clauses }
-            | LoweredKind::Structural { clauses }
+            | LoweredKind::Structural { clauses, .. }
             | LoweredKind::Kernel { clauses, .. } => clauses
                 .iter()
                 .map(|clause| format!("{:?}", clause.patterns))
@@ -7589,7 +8189,7 @@ fn group_lowered_program(
                 LoweredKind::Scalar { clauses } => GroupedLoweredKind::Scalar {
                     clauses: clauses.clone(),
                 },
-                LoweredKind::Structural { clauses } => GroupedLoweredKind::Structural {
+                LoweredKind::Structural { clauses, .. } => GroupedLoweredKind::Structural {
                     clauses: clauses.clone(),
                 },
                 LoweredKind::Kernel {
@@ -7662,7 +8262,7 @@ fn collect_trivial_wrapper_calls(program: &LoweredProgram) -> BTreeMap<String, T
                 return None;
             }
             let clauses = match &function.kind {
-                LoweredKind::Scalar { clauses } | LoweredKind::Structural { clauses } => clauses,
+                LoweredKind::Scalar { clauses } | LoweredKind::Structural { clauses, .. } => clauses,
                 LoweredKind::Kernel { .. } => return None,
             };
             let [clause] = clauses.as_slice() else {
@@ -7714,11 +8314,12 @@ fn optimize_lowered_function(
                 .map(|clause| optimize_lowered_clause(clause, trivial_wrappers))
                 .collect(),
         },
-        LoweredKind::Structural { clauses } => LoweredKind::Structural {
+        LoweredKind::Structural { clauses, program } => LoweredKind::Structural {
             clauses: clauses
                 .iter()
                 .map(|clause| optimize_lowered_clause(clause, trivial_wrappers))
                 .collect(),
+            program: program.clone(),
         },
         LoweredKind::Kernel {
             shape,
@@ -8093,6 +8694,251 @@ fn analyze_intents(grouped: &GroupedLoweredProgram) -> IntentAnalysis {
     }
 }
 
+fn analyze_structural_clusters(lowered: &LoweredProgram) -> StructuralAnalysis {
+    let candidates = lowered
+        .functions
+        .iter()
+        .filter(|function| {
+            matches!(function.kind, LoweredKind::Structural { .. }) || function.tail_loop.is_some()
+        })
+        .map(|function| function.name.clone())
+        .collect::<Vec<_>>();
+    let candidate_set = candidates.iter().cloned().collect::<BTreeSet<_>>();
+    let mut edges = BTreeMap::<String, BTreeSet<String>>::new();
+    let mut state_counts = BTreeMap::<String, usize>::new();
+    let mut transition_counts = BTreeMap::<String, usize>::new();
+
+    for function in &lowered.functions {
+        if !candidate_set.contains(&function.name) {
+            continue;
+        }
+        let mut calls = BTreeSet::<String>::new();
+        let mut transitions = 0usize;
+        match &function.kind {
+            LoweredKind::Scalar { clauses } | LoweredKind::Structural { clauses, .. } => {
+                state_counts.insert(function.name.clone(), clauses.len());
+                for clause in clauses {
+                    collect_ir_called_functions(&clause.body, &mut calls, &candidate_set);
+                    transitions += count_ir_function_calls(&clause.body, &candidate_set);
+                }
+            }
+            LoweredKind::Kernel { .. } => {}
+        }
+        if let Some(tail_loop) = &function.tail_loop {
+            state_counts.insert(function.name.clone(), tail_loop.clauses.len());
+            transitions += tail_loop.clauses.len();
+            calls.insert(function.name.clone());
+            for clause in &tail_loop.clauses {
+                match &clause.action {
+                    TailAction::Continue { args } => {
+                        for arg in args {
+                            collect_ir_called_functions(arg, &mut calls, &candidate_set);
+                            transitions += count_ir_function_calls(arg, &candidate_set);
+                        }
+                    }
+                    TailAction::Return { expr } => {
+                        collect_ir_called_functions(expr, &mut calls, &candidate_set);
+                        transitions += count_ir_function_calls(expr, &candidate_set);
+                    }
+                }
+            }
+        }
+        edges.insert(function.name.clone(), calls);
+        transition_counts.insert(function.name.clone(), transitions);
+    }
+
+    let components = tarjan_scc(&candidates, &edges);
+    let clusters = components
+        .into_iter()
+        .enumerate()
+        .filter_map(|(id, mut component)| {
+            component.sort();
+            let recursive = component.len() > 1
+                || component.iter().any(|name| {
+                    edges
+                        .get(name)
+                        .map(|targets| targets.contains(name))
+                        .unwrap_or(false)
+                });
+            if !recursive {
+                return None;
+            }
+            let state_count = component
+                .iter()
+                .map(|name| state_counts.get(name).copied().unwrap_or(0))
+                .sum();
+            let transition_count = component
+                .iter()
+                .map(|name| transition_counts.get(name).copied().unwrap_or(0))
+                .sum();
+            Some(StructuralClusterReport {
+                id,
+                functions: component,
+                recursive,
+                state_count,
+                transition_count,
+            })
+        })
+        .collect();
+    StructuralAnalysis { clusters }
+}
+
+fn collect_ir_called_functions(
+    expr: &IrExpr,
+    names: &mut BTreeSet<String>,
+    candidate_set: &BTreeSet<String>,
+) {
+    match &expr.kind {
+        IrExprKind::Call {
+            callee: Callee::Function(name),
+            args,
+        } => {
+            if candidate_set.contains(name) {
+                names.insert(name.clone());
+            }
+            for arg in args {
+                collect_ir_called_functions(arg, names, candidate_set);
+            }
+        }
+        IrExprKind::Call { args, .. } => {
+            for arg in args {
+                collect_ir_called_functions(arg, names, candidate_set);
+            }
+        }
+        IrExprKind::Record(fields) => {
+            for field in fields.values() {
+                collect_ir_called_functions(field, names, candidate_set);
+            }
+        }
+        IrExprKind::EnumCtor { args, .. } => {
+            for arg in args {
+                collect_ir_called_functions(arg, names, candidate_set);
+            }
+        }
+        IrExprKind::EnumTag { value }
+        | IrExprKind::EnumChildBySlot { value, .. }
+        | IrExprKind::EnumNonRecField { value, .. } => {
+            collect_ir_called_functions(value, names, candidate_set);
+        }
+        IrExprKind::Let { bindings, body } => {
+            for binding in bindings {
+                collect_ir_called_functions(&binding.expr, names, candidate_set);
+            }
+            collect_ir_called_functions(body, names, candidate_set);
+        }
+        IrExprKind::Local(_) | IrExprKind::Int(_, _) | IrExprKind::Float(_, _) => {}
+    }
+}
+
+fn count_ir_function_calls(expr: &IrExpr, candidate_set: &BTreeSet<String>) -> usize {
+    match &expr.kind {
+        IrExprKind::Call {
+            callee: Callee::Function(name),
+            args,
+        } => {
+            usize::from(candidate_set.contains(name))
+                + args
+                    .iter()
+                    .map(|arg| count_ir_function_calls(arg, candidate_set))
+                    .sum::<usize>()
+        }
+        IrExprKind::Call { args, .. } => args
+            .iter()
+            .map(|arg| count_ir_function_calls(arg, candidate_set))
+            .sum(),
+        IrExprKind::Record(fields) => fields
+            .values()
+            .map(|field| count_ir_function_calls(field, candidate_set))
+            .sum(),
+        IrExprKind::EnumCtor { args, .. } => args
+            .iter()
+            .map(|arg| count_ir_function_calls(arg, candidate_set))
+            .sum(),
+        IrExprKind::EnumTag { value }
+        | IrExprKind::EnumChildBySlot { value, .. }
+        | IrExprKind::EnumNonRecField { value, .. } => {
+            count_ir_function_calls(value, candidate_set)
+        }
+        IrExprKind::Let { bindings, body } => {
+            bindings
+                .iter()
+                .map(|binding| count_ir_function_calls(&binding.expr, candidate_set))
+                .sum::<usize>()
+                + count_ir_function_calls(body, candidate_set)
+        }
+        IrExprKind::Local(_) | IrExprKind::Int(_, _) | IrExprKind::Float(_, _) => 0,
+    }
+}
+
+fn tarjan_scc(nodes: &[String], edges: &BTreeMap<String, BTreeSet<String>>) -> Vec<Vec<String>> {
+    struct Tarjan<'a> {
+        edges: &'a BTreeMap<String, BTreeSet<String>>,
+        index: usize,
+        indices: BTreeMap<String, usize>,
+        lowlinks: BTreeMap<String, usize>,
+        stack: Vec<String>,
+        on_stack: BTreeSet<String>,
+        components: Vec<Vec<String>>,
+    }
+
+    impl<'a> Tarjan<'a> {
+        fn strong_connect(&mut self, node: &str) {
+            self.indices.insert(node.to_string(), self.index);
+            self.lowlinks.insert(node.to_string(), self.index);
+            self.index += 1;
+            self.stack.push(node.to_string());
+            self.on_stack.insert(node.to_string());
+
+            if let Some(targets) = self.edges.get(node) {
+                for target in targets {
+                    if !self.indices.contains_key(target) {
+                        self.strong_connect(target);
+                        let target_low = self.lowlinks.get(target).copied().unwrap_or(usize::MAX);
+                        if let Some(node_low) = self.lowlinks.get_mut(node) {
+                            *node_low = (*node_low).min(target_low);
+                        }
+                    } else if self.on_stack.contains(target) {
+                        let target_index =
+                            self.indices.get(target).copied().unwrap_or(usize::MAX);
+                        if let Some(node_low) = self.lowlinks.get_mut(node) {
+                            *node_low = (*node_low).min(target_index);
+                        }
+                    }
+                }
+            }
+
+            if self.indices.get(node) == self.lowlinks.get(node) {
+                let mut component = Vec::new();
+                while let Some(entry) = self.stack.pop() {
+                    self.on_stack.remove(&entry);
+                    component.push(entry.clone());
+                    if entry == node {
+                        break;
+                    }
+                }
+                self.components.push(component);
+            }
+        }
+    }
+
+    let mut tarjan = Tarjan {
+        edges,
+        index: 0,
+        indices: BTreeMap::new(),
+        lowlinks: BTreeMap::new(),
+        stack: Vec::new(),
+        on_stack: BTreeSet::new(),
+        components: Vec::new(),
+    };
+
+    for node in nodes {
+        if !tarjan.indices.contains_key(node) {
+            tarjan.strong_connect(node);
+        }
+    }
+    tarjan.components
+}
+
 fn analyze_grouped_function_intent(function: &GroupedLoweredFunction) -> KernelIntentReport {
     let lane_inputs = function
         .param_access
@@ -8142,7 +8988,7 @@ fn analyze_grouped_function_intent(function: &GroupedLoweredFunction) -> KernelI
         .iter()
         .flat_map(|leaf| match &leaf.kind {
             LoweredKind::Scalar { clauses }
-            | LoweredKind::Structural { clauses }
+            | LoweredKind::Structural { clauses, .. }
             | LoweredKind::Kernel { clauses, .. } => clauses,
         })
         .map(|clause| count_primitive_ops(&clause.body))
@@ -8217,13 +9063,13 @@ fn lower_function(function: &NormalizedFunction) -> Result<LoweredFunction> {
             Type::Bulk(_, _) if slice_pattern_params.contains(&index) => AccessKind::Same,
             Type::Bulk(_, _) => AccessKind::Lane,
             Type::TypeToken(_) => AccessKind::Same,
-            Type::Record(_) => AccessKind::Same,
+            Type::Record(_) | Type::Tuple(_) => AccessKind::Same,
             Type::Named(_, _) | Type::Var(_) | Type::Infer(_) => AccessKind::Same,
             Type::Fun(_, _) => AccessKind::Same,
         })
         .collect();
 
-    let tail_loop = if function.tailrec.loop_lowerable {
+    let tail_loop = if function.tailrec.loop_lowerable && function_supports_tail_loop_lowering(function) {
         Some(lower_tail_loop(function)?)
     } else {
         None
@@ -8250,14 +9096,18 @@ fn lower_function(function: &NormalizedFunction) -> Result<LoweredFunction> {
                 .map(|clause| lower_clause(clause, &param_access, None))
                 .collect::<Result<Vec<_>>>()?;
             if uses_structural_lowering(function, &clauses) {
-                LoweredKind::Structural { clauses }
+                let program = build_structural_program(&clauses, tail_loop.as_ref());
+                LoweredKind::Structural {
+                    clauses,
+                    program,
+                }
             } else {
                 LoweredKind::Scalar { clauses }
             }
         }
-        Type::Record(_) => {
+        Type::Record(_) | Type::Tuple(_) => {
             return Err(SimdError::new(
-                "normalized lowering encountered an unexpected record result",
+                "normalized lowering encountered an unexpected tuple/record result",
             ));
         }
         Type::TypeToken(_) => {
@@ -8288,6 +9138,51 @@ fn lower_function(function: &NormalizedFunction) -> Result<LoweredFunction> {
     })
 }
 
+fn function_supports_tail_loop_lowering(function: &NormalizedFunction) -> bool {
+    function
+        .clauses
+        .iter()
+        .all(|clause| typed_expr_supports_loop_lowering(&clause.body))
+}
+
+fn typed_expr_supports_loop_lowering(expr: &TypedExpr) -> bool {
+    match &expr.kind {
+        TypedExprKind::Local(_)
+        | TypedExprKind::FunctionRef { .. }
+        | TypedExprKind::ConstructorRef { .. }
+        | TypedExprKind::Int(_, _)
+        | TypedExprKind::Float(_, _)
+        | TypedExprKind::Char(_) => true,
+        TypedExprKind::Bool(_)
+        | TypedExprKind::String(_)
+        | TypedExprKind::TypeToken(_)
+        | TypedExprKind::Tuple(_)
+        | TypedExprKind::TupleProject { .. }
+        | TypedExprKind::Lambda { .. } => false,
+        TypedExprKind::Let { bindings, body } => {
+            bindings
+                .iter()
+                .all(|binding| typed_expr_supports_loop_lowering(&binding.expr))
+                && typed_expr_supports_loop_lowering(body)
+        }
+        TypedExprKind::Record(fields) => fields
+            .values()
+            .all(typed_expr_supports_loop_lowering),
+        TypedExprKind::Project { base, .. } => typed_expr_supports_loop_lowering(base),
+        TypedExprKind::RecordUpdate { base, fields } => {
+            typed_expr_supports_loop_lowering(base)
+                && fields.values().all(typed_expr_supports_loop_lowering)
+        }
+        TypedExprKind::Call { args, .. } => args
+            .iter()
+            .all(|arg| typed_expr_supports_loop_lowering(&arg.expr)),
+        TypedExprKind::Apply { callee, arg } => {
+            typed_expr_supports_loop_lowering(callee)
+                && typed_expr_supports_loop_lowering(arg)
+        }
+    }
+}
+
 fn uses_structural_lowering(function: &NormalizedFunction, clauses: &[LoweredClause]) -> bool {
     let (params, ret) = function.signature.ty.fun_parts();
     params.iter().any(type_is_structural)
@@ -8313,6 +9208,7 @@ fn pattern_is_structural(pattern: &Pattern) -> bool {
     match pattern {
         Pattern::Name(name) => is_constructor_name(name),
         Pattern::Ctor(_, _) | Pattern::Slice { .. } => true,
+        Pattern::Tuple(_) => false,
         Pattern::Int(_)
         | Pattern::Float(_)
         | Pattern::Bool(_)
@@ -8337,7 +9233,9 @@ fn ir_expr_is_structural(expr: &IrExpr) -> bool {
         | IrExprKind::EnumChildBySlot { .. }
         | IrExprKind::EnumNonRecField { .. } => true,
         IrExprKind::Let { bindings, body } => {
-            bindings.iter().any(|binding| ir_expr_is_structural(&binding.expr))
+            bindings
+                .iter()
+                .any(|binding| ir_expr_is_structural(&binding.expr))
                 || ir_expr_is_structural(body)
         }
         IrExprKind::Call { args, .. } => args.iter().any(ir_expr_is_structural),
@@ -8463,11 +9361,17 @@ fn lower_expr_to_ir(
                 fields
                     .iter()
                     .map(|(name, field)| {
-                        Ok((name.clone(), lower_expr_to_ir(field, kernel_shape, _locals)?))
+                        Ok((
+                            name.clone(),
+                            lower_expr_to_ir(field, kernel_shape, _locals)?,
+                        ))
                     })
                     .collect::<Result<BTreeMap<_, _>>>()?,
             ),
         }),
+        TypedExprKind::Tuple(_) | TypedExprKind::TupleProject { .. } => Err(SimdError::new(
+            "tuple expressions should have been eliminated by normalization before loop lowering",
+        )),
         TypedExprKind::Bool(_) => Err(SimdError::new(
             "bool expressions are currently evaluator-only and are not supported by loop lowering",
         )),
@@ -8491,8 +9395,10 @@ fn lower_expr_to_ir(
                     args: Vec::new(),
                 },
             })
-        },
-        TypedExprKind::FunctionRef { .. } | TypedExprKind::Lambda { .. } | TypedExprKind::Apply { .. } => Err(SimdError::new(
+        }
+        TypedExprKind::FunctionRef { .. }
+        | TypedExprKind::Lambda { .. }
+        | TypedExprKind::Apply { .. } => Err(SimdError::new(
             "higher-order expressions are not supported by loop lowering",
         )),
         TypedExprKind::Let { bindings, body } => {
@@ -8515,8 +9421,7 @@ fn lower_expr_to_ir(
                 },
             })
         }
-        TypedExprKind::Project { .. }
-        | TypedExprKind::RecordUpdate { .. } => Err(SimdError::new(
+        TypedExprKind::Project { .. } | TypedExprKind::RecordUpdate { .. } => Err(SimdError::new(
             "record expressions are not yet supported by loop lowering",
         )),
         TypedExprKind::Call {
@@ -8825,9 +9730,10 @@ impl<'a> Evaluator<'a> {
             Pattern::Wildcard => Ok(true),
             Pattern::Name(name) => {
                 if is_constructor_name(name) && self.enum_ctors.contains_key(name) {
-                    let ctor = self.enum_ctors.get(name).ok_or_else(|| {
-                        SimdError::new(format!("unknown constructor '{}'", name))
-                    })?;
+                    let ctor = self
+                        .enum_ctors
+                        .get(name)
+                        .ok_or_else(|| SimdError::new(format!("unknown constructor '{}'", name)))?;
                     if !ctor.fields.is_empty() {
                         return Err(SimdError::new(format!(
                             "constructor pattern '{}' with arguments must use parenthesized form",
@@ -8843,6 +9749,38 @@ impl<'a> Evaluator<'a> {
             Pattern::Ctor(name, subpatterns) => {
                 let value = self.expect_host_value(self.force_binding(binding)?)?;
                 self.match_enum_ctor_pattern(name, subpatterns, value, env)
+            }
+            Pattern::Tuple(subpatterns) => {
+                let Value::Tuple(items) = self.expect_host_value(self.force_binding(binding)?)?
+                else {
+                    return Err(SimdError::new(
+                        "tuple pattern can only match tuple runtime values",
+                    ));
+                };
+                let Type::Tuple(item_types) = &pattern.ty else {
+                    return Err(SimdError::new(format!(
+                        "tuple pattern expects tuple type, found {:?}",
+                        pattern.ty
+                    )));
+                };
+                if items.len() != subpatterns.len() || item_types.len() != subpatterns.len() {
+                    return Ok(false);
+                }
+                for ((subpattern, item_ty), item) in
+                    subpatterns.iter().zip(item_types.iter()).zip(items.iter())
+                {
+                    if !self.match_pattern(
+                        &TypedPattern {
+                            pattern: subpattern.clone(),
+                            ty: item_ty.clone(),
+                        },
+                        &Binding::Ready(EvalValue::Host(item.clone())),
+                        env,
+                    )? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
             }
             Pattern::Type(expected) => {
                 let Value::TypeToken(actual) =
@@ -8865,7 +9803,9 @@ impl<'a> Evaluator<'a> {
                 let Value::Scalar(ScalarValue::Char(actual)) =
                     self.expect_host_value(self.force_binding(binding)?)?
                 else {
-                    return Err(SimdError::new("char pattern can only match char scalar inputs"));
+                    return Err(SimdError::new(
+                        "char pattern can only match char scalar inputs",
+                    ));
                 };
                 Ok(*expected == actual)
             }
@@ -8904,13 +9844,15 @@ impl<'a> Evaluator<'a> {
         env: &mut Env<'a>,
     ) -> Result<bool> {
         let elem_ty = match scrutinee_ty {
-            Type::Named(name, args) if name == "string" && args.is_empty() => Type::Scalar(Prim::Char),
+            Type::Named(name, args) if name == "string" && args.is_empty() => {
+                Type::Scalar(Prim::Char)
+            }
             Type::Bulk(prim, shape) if shape.0.len() == 1 => Type::Scalar(*prim),
             other => {
                 return Err(SimdError::new(format!(
                     "slice pattern expects rank-1 bulk/string type, found {:?}",
                     other
-                )))
+                )));
             }
         };
         match value {
@@ -8931,8 +9873,11 @@ impl<'a> Evaluator<'a> {
                             ty: elem_ty.clone(),
                         };
                         let value = Value::Scalar(ScalarValue::Char(bytes[index] as char));
-                        if !self.match_pattern(&typed, &Binding::Ready(EvalValue::Host(value)), env)?
-                        {
+                        if !self.match_pattern(
+                            &typed,
+                            &Binding::Ready(EvalValue::Host(value)),
+                            env,
+                        )? {
                             return Ok(false);
                         }
                     }
@@ -8943,8 +9888,11 @@ impl<'a> Evaluator<'a> {
                             ty: elem_ty.clone(),
                         };
                         let value = Value::Scalar(ScalarValue::Char(bytes[idx] as char));
-                        if !self.match_pattern(&typed, &Binding::Ready(EvalValue::Host(value)), env)?
-                        {
+                        if !self.match_pattern(
+                            &typed,
+                            &Binding::Ready(EvalValue::Host(value)),
+                            env,
+                        )? {
                             return Ok(false);
                         }
                     }
@@ -9126,12 +10074,16 @@ impl<'a> Evaluator<'a> {
                     root,
                 })
             } else {
-                let value = row.fields.get(non_recursive_index).cloned().ok_or_else(|| {
-                    SimdError::new(format!(
-                        "constructor '{}' payload row is missing non-recursive field {}",
-                        ctor_name, non_recursive_index
-                    ))
-                })?;
+                let value = row
+                    .fields
+                    .get(non_recursive_index)
+                    .cloned()
+                    .ok_or_else(|| {
+                        SimdError::new(format!(
+                            "constructor '{}' payload row is missing non-recursive field {}",
+                            ctor_name, non_recursive_index
+                        ))
+                    })?;
                 non_recursive_index += 1;
                 value
             };
@@ -9198,7 +10150,7 @@ impl<'a> Evaluator<'a> {
                         bound_args: Vec::new(),
                     }))
                 }
-            },
+            }
             TypedExprKind::Int(value, prim) => Ok(EvalValue::Host(Value::Scalar(make_int_value(
                 *value, *prim,
             )?))),
@@ -9206,9 +10158,9 @@ impl<'a> Evaluator<'a> {
                 make_float_value(*value, *prim),
             ))),
             TypedExprKind::Bool(value) => Ok(EvalValue::Host(Value::Bool(*value))),
-            TypedExprKind::Char(value) => Ok(EvalValue::Host(Value::Scalar(ScalarValue::Char(
-                *value,
-            )))),
+            TypedExprKind::Char(value) => {
+                Ok(EvalValue::Host(Value::Scalar(ScalarValue::Char(*value))))
+            }
             TypedExprKind::String(value) => Ok(EvalValue::Host(Value::String(value.clone()))),
             TypedExprKind::TypeToken(prim) => Ok(EvalValue::Host(Value::TypeToken(*prim))),
             TypedExprKind::Lambda { param, body } => Ok(EvalValue::Closure(Closure::Lambda {
@@ -9233,6 +10185,13 @@ impl<'a> Evaluator<'a> {
                     );
                 }
                 self.eval_expr(body, &Rc::new(scope))
+            }
+            TypedExprKind::Tuple(items) => {
+                let mut values = Vec::with_capacity(items.len());
+                for item in items {
+                    values.push(self.expect_host_value(self.eval_expr(item, env)?)?);
+                }
+                Ok(EvalValue::Host(Value::Tuple(values)))
             }
             TypedExprKind::Record(fields) => Ok(EvalValue::Host(Value::Record(
                 fields
@@ -9259,6 +10218,19 @@ impl<'a> Evaluator<'a> {
                     .ok_or_else(|| {
                         SimdError::new(format!("record field '{}' does not exist", field))
                     })
+            }
+            TypedExprKind::TupleProject { base, index } => {
+                let Value::Tuple(items) = self.expect_host_value(self.eval_expr(base, env)?)?
+                else {
+                    return Err(SimdError::new(
+                        "tuple projection evaluated a non-tuple base",
+                    ));
+                };
+                items
+                    .get(*index)
+                    .cloned()
+                    .map(EvalValue::Host)
+                    .ok_or_else(|| SimdError::new(format!("tuple index {} does not exist", index)))
             }
             TypedExprKind::RecordUpdate { base, fields } => {
                 let Value::Record(mut base_fields) =
@@ -9342,7 +10314,10 @@ impl<'a> Evaluator<'a> {
                         values,
                     )?))
                 } else {
-                    Ok(EvalValue::Closure(Closure::Constructor { name, bound_args }))
+                    Ok(EvalValue::Closure(Closure::Constructor {
+                        name,
+                        bound_args,
+                    }))
                 }
             }
             Closure::Lambda { param, body, env } => {
@@ -9529,9 +10504,9 @@ fn enum_field_is_recursive(field_ty: &Type, ctor: &EnumCtorInfo) -> bool {
     if name != &ctor.enum_name || args.len() != ctor.enum_params.len() {
         return false;
     }
-    args.iter().zip(&ctor.enum_params).all(|(arg, param)| {
-        matches!(arg, Type::Var(name) if name == param)
-    })
+    args.iter()
+        .zip(&ctor.enum_params)
+        .all(|(arg, param)| matches!(arg, Type::Var(name) if name == param))
 }
 
 fn enum_child_roots(value: &EnumValue, ctor: &EnumCtorInfo) -> Result<Vec<u32>> {
@@ -9557,11 +10532,9 @@ fn enum_ctor_row<'a>(value: &'a EnumValue, ctor_name: &str) -> Result<&'a EnumCt
         .slots
         .get(value.root as usize)
         .ok_or_else(|| SimdError::new("enum tape root slot out of bounds"))?;
-    let rows = value
-        .tape
-        .ctor_rows
-        .get(ctor_name)
-        .ok_or_else(|| SimdError::new(format!("enum tape missing ctor row slab '{}'", ctor_name)))?;
+    let rows = value.tape.ctor_rows.get(ctor_name).ok_or_else(|| {
+        SimdError::new(format!("enum tape missing ctor row slab '{}'", ctor_name))
+    })?;
     rows.get(slot as usize).ok_or_else(|| {
         SimdError::new(format!(
             "enum tape row slot {} out of bounds for constructor '{}'",
@@ -9697,13 +10670,18 @@ impl<'a> EnumTapeBuilder<'a> {
             .ok_or_else(|| SimdError::new("enum tape child root out of bounds"))?
             as usize;
         if end <= start || end > child.tape.tags.len() {
-            return Err(SimdError::new("enum tape child subtree interval is invalid"));
+            return Err(SimdError::new(
+                "enum tape child subtree interval is invalid",
+            ));
         }
         let base = self.tags.len() as u32;
         for index in start..end {
             let tag = child.tape.tags[index];
             let ctor_name = child.tape.tag_names.get(&tag).ok_or_else(|| {
-                SimdError::new(format!("enum tape missing constructor name for tag {}", tag))
+                SimdError::new(format!(
+                    "enum tape missing constructor name for tag {}",
+                    tag
+                ))
             })?;
             let old_slot = child.tape.slots[index] as usize;
             let old_row = child
@@ -9724,9 +10702,9 @@ impl<'a> EnumTapeBuilder<'a> {
             self.tags.push(tag);
             self.slots.push(new_slot);
             let old_end = child.tape.ends[index];
-            let rel_end = old_end.checked_sub(start as u32).ok_or_else(|| {
-                SimdError::new("enum tape child subtree end underflow")
-            })?;
+            let rel_end = old_end
+                .checked_sub(start as u32)
+                .ok_or_else(|| SimdError::new("enum tape child subtree end underflow"))?;
             self.ends.push(base + rel_end);
         }
         Ok(base)
@@ -9771,7 +10749,9 @@ fn make_int_value(value: i64, prim: Prim) -> Result<ScalarValue> {
             let scalar = u32::try_from(value)
                 .ok()
                 .and_then(char::from_u32)
-                .ok_or_else(|| SimdError::new(format!("'{}' is not a valid char codepoint", value)))?;
+                .ok_or_else(|| {
+                    SimdError::new(format!("'{}' is not a valid char codepoint", value))
+                })?;
             Ok(ScalarValue::Char(scalar))
         }
         Prim::F32 | Prim::F64 => Err(SimdError::new("integer literal cannot inhabit float type")),
@@ -9996,10 +10976,12 @@ fn apply_primitive(op: PrimOp, left: &ScalarValue, right: &ScalarValue) -> Resul
                 }
             })
         }
-        (ScalarValue::Char(left), ScalarValue::Char(right)) => {
-            apply_int_primitive_i64(op, i64::from(u32::from(*left)), i64::from(u32::from(*right)))
-                .and_then(|value| make_int_value(value, primitive_result_prim(op, Prim::Char)))
-        }
+        (ScalarValue::Char(left), ScalarValue::Char(right)) => apply_int_primitive_i64(
+            op,
+            i64::from(u32::from(*left)),
+            i64::from(u32::from(*right)),
+        )
+        .and_then(|value| make_int_value(value, primitive_result_prim(op, Prim::Char))),
         _ => Err(SimdError::new(format!(
             "primitive {:?} received mismatched scalar operands {:?} and {:?}",
             op, left, right
@@ -10137,7 +11119,7 @@ impl<'a> LoweredEvaluator<'a> {
             .ok_or_else(|| SimdError::new(format!("unknown lowered function '{}'", name)))?;
         match &function.kind {
             LoweredKind::Scalar { clauses } => self.run_scalar(function, clauses, args),
-            LoweredKind::Structural { clauses } => self.run_structural(function, clauses, args),
+            LoweredKind::Structural { clauses, .. } => self.run_structural(function, clauses, args),
             LoweredKind::Kernel {
                 shape: _,
                 vector_width: _,
@@ -10170,10 +11152,47 @@ impl<'a> LoweredEvaluator<'a> {
     fn run_structural(
         &self,
         function: &LoweredFunction,
-        clauses: &[LoweredClause],
+        _clauses: &[LoweredClause],
         args: Vec<Value>,
     ) -> Result<Value> {
-        self.run_scalar(function, clauses, args)
+        let LoweredKind::Structural { program, .. } = &function.kind else {
+            return Err(SimdError::new(format!(
+                "structural evaluator received non-structural function '{}'",
+                function.name
+            )));
+        };
+        let mut state_index = program.entry_state as usize;
+        let mut state = args;
+        loop {
+            let structural_state = program.states.get(state_index).ok_or_else(|| {
+                SimdError::new(format!(
+                    "structural function '{}' jumped to missing state {}",
+                    function.name, state_index
+                ))
+            })?;
+            if let Some(env) = self.match_lowered_clause(&structural_state.patterns, &state)? {
+                match &structural_state.on_match {
+                    StructuralAction::Transition { state: next, args } => {
+                        state = args
+                            .iter()
+                            .map(|arg| self.eval_ir_expr(arg, &env))
+                            .collect::<Result<Vec<_>>>()?;
+                        state_index = *next as usize;
+                    }
+                    StructuralAction::Return { expr } => {
+                        return self.eval_ir_expr(expr, &env);
+                    }
+                }
+                continue;
+            }
+            let Some(next_state) = structural_state.on_miss else {
+                return Err(SimdError::new(format!(
+                    "no structural state of '{}' matched the provided arguments",
+                    function.name
+                )));
+            };
+            state_index = next_state as usize;
+        }
     }
 
     fn run_tail_loop(&self, tail_loop: &TailLoop, mut state: Vec<Value>) -> Result<Value> {
@@ -10260,6 +11279,11 @@ impl<'a> LoweredEvaluator<'a> {
                             "kernel lowering does not yet support record runtime values",
                         ));
                     }
+                    (Value::Tuple(_), _) => {
+                        return Err(SimdError::new(
+                            "kernel lowering does not yet support tuple runtime values",
+                        ));
+                    }
                     (Value::Enum(_), _) => {
                         return Err(SimdError::new(
                             "kernel lowering does not yet support enum runtime values",
@@ -10267,7 +11291,9 @@ impl<'a> LoweredEvaluator<'a> {
                     }
                 }
             }
-            let value = self.run_scalar(function, clauses, lane_args)?.expect_scalar()?;
+            let value = self
+                .run_scalar(function, clauses, lane_args)?
+                .expect_scalar()?;
             elements.push(value);
         }
         Ok(Value::Bulk(BulkValue {
@@ -10365,6 +11391,21 @@ impl<'a> LoweredEvaluator<'a> {
                         return Ok(None);
                     }
                 }
+                Pattern::Tuple(subpatterns) => {
+                    let Value::Tuple(items) = value else {
+                        return Err(SimdError::new(
+                            "tuple pattern can only match tuple runtime values",
+                        ));
+                    };
+                    if items.len() != subpatterns.len() {
+                        return Ok(None);
+                    }
+                    for (subpattern, item) in subpatterns.iter().zip(items.iter()) {
+                        if !self.match_lowered_pattern(subpattern, item, &mut env)? {
+                            return Ok(None);
+                        }
+                    }
+                }
             }
         }
         Ok(Some(env))
@@ -10420,12 +11461,16 @@ impl<'a> LoweredEvaluator<'a> {
                     root,
                 })
             } else {
-                let value = row.fields.get(non_recursive_index).cloned().ok_or_else(|| {
-                    SimdError::new(format!(
-                        "constructor '{}' payload row is missing non-recursive field {}",
-                        ctor_name, non_recursive_index
-                    ))
-                })?;
+                let value = row
+                    .fields
+                    .get(non_recursive_index)
+                    .cloned()
+                    .ok_or_else(|| {
+                        SimdError::new(format!(
+                            "constructor '{}' payload row is missing non-recursive field {}",
+                            ctor_name, non_recursive_index
+                        ))
+                    })?;
                 non_recursive_index += 1;
                 value
             };
@@ -10453,6 +11498,22 @@ impl<'a> LoweredEvaluator<'a> {
             }
             Pattern::Ctor(name, subpatterns) => {
                 self.match_lowered_ctor_pattern(name, subpatterns, value, env)
+            }
+            Pattern::Tuple(subpatterns) => {
+                let Value::Tuple(items) = value else {
+                    return Err(SimdError::new(
+                        "tuple pattern can only match tuple runtime values",
+                    ));
+                };
+                if items.len() != subpatterns.len() {
+                    return Ok(false);
+                }
+                for (subpattern, item) in subpatterns.iter().zip(items.iter()) {
+                    if !self.match_lowered_pattern(subpattern, item, env)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
             }
             Pattern::Int(expected) => {
                 let Value::Scalar(actual) = value else {
@@ -10638,11 +11699,7 @@ impl<'a> LoweredEvaluator<'a> {
         }
     }
 
-    fn eval_ir_expr(
-        &self,
-        expr: &IrExpr,
-        env: &BTreeMap<String, Value>,
-    ) -> Result<Value> {
+    fn eval_ir_expr(&self, expr: &IrExpr, env: &BTreeMap<String, Value>) -> Result<Value> {
         match &expr.kind {
             IrExprKind::Local(name) => env
                 .get(name)
@@ -10680,9 +11737,10 @@ impl<'a> LoweredEvaluator<'a> {
                 let Value::Enum(value) = self.eval_ir_expr(value, env)? else {
                     return Err(SimdError::new("enum child operator requires enum input"));
                 };
-                let ctor_info = self.enum_ctors.get(ctor).ok_or_else(|| {
-                    SimdError::new(format!("unknown constructor '{}'", ctor))
-                })?;
+                let ctor_info = self
+                    .enum_ctors
+                    .get(ctor)
+                    .ok_or_else(|| SimdError::new(format!("unknown constructor '{}'", ctor)))?;
                 let roots = enum_child_roots(&value, ctor_info)?;
                 let root = *roots.get(*slot).ok_or_else(|| {
                     SimdError::new(format!(
@@ -10743,8 +11801,7 @@ impl<'a> LoweredEvaluator<'a> {
                             })?;
                         Ok(Value::Scalar(apply_primitive(*op, lhs, rhs)?))
                     }
-                    Callee::Function(name) => self
-                        .run_function(name, values),
+                    Callee::Function(name) => self.run_function(name, values),
                     Callee::Builtin(_) => Err(SimdError::new(
                         "lowered evaluator does not support builtin family calls",
                     )),
@@ -10765,6 +11822,7 @@ impl ValueExt for Value {
             Value::Bulk(_) => Err(SimdError::new("expected scalar value, found bulk")),
             Value::TypeToken(_) => Err(SimdError::new("expected scalar value, found type witness")),
             Value::Record(_) => Err(SimdError::new("expected scalar value, found record")),
+            Value::Tuple(_) => Err(SimdError::new("expected scalar value, found tuple")),
             Value::Bool(_) => Err(SimdError::new("expected scalar value, found bool")),
             Value::String(_) => Err(SimdError::new("expected scalar value, found string")),
             Value::Enum(_) => Err(SimdError::new("expected scalar value, found enum")),
@@ -11083,7 +12141,10 @@ fn value_from_json(
                         name
                     ))
                 })?;
-                record.insert(name.clone(), value_from_json(value, ty, shape_env, enum_names)?);
+                record.insert(
+                    name.clone(),
+                    value_from_json(value, ty, shape_env, enum_names)?,
+                );
             }
             if values.len() != fields.len() || values.keys().any(|name| !fields.contains_key(name))
             {
@@ -11092,6 +12153,27 @@ fn value_from_json(
                 ));
             }
             Ok(Value::Record(record))
+        }
+        Type::Tuple(items) => {
+            let JsonValue::Array(values) = json else {
+                return Err(SimdError::new(
+                    "tuple runtime argument must be a JSON array",
+                ));
+            };
+            if values.len() != items.len() {
+                return Err(SimdError::new(format!(
+                    "tuple runtime argument has {} elements, expected {}",
+                    values.len(),
+                    items.len()
+                )));
+            }
+            Ok(Value::Tuple(
+                values
+                    .iter()
+                    .zip(items.iter())
+                    .map(|(value, item_ty)| value_from_json(value, item_ty, shape_env, enum_names))
+                    .collect::<Result<Vec<_>>>()?,
+            ))
         }
         Type::Named(name, args) if name == "string" && args.is_empty() => match json {
             JsonValue::String(value) => Ok(Value::String(value.clone())),
@@ -11337,6 +12419,13 @@ fn bundled_examples_inspector_html() -> Result<String> {
             "examples/string_family_demo.simd",
             "main",
             include_str!("../examples/string_family_demo.simd"),
+        ),
+        (
+            "tuple-basics",
+            "tuple-basics",
+            "examples/tuple_basics.simd",
+            "main",
+            include_str!("../examples/tuple_basics.simd"),
         ),
     ];
 
@@ -11653,10 +12742,7 @@ mod tests {
 
     #[test]
     fn parses_recursive_enum_declaration() {
-        let program = parse_source(
-            "enum List a =\n  | Nil\n  | Cons a (List a)\n",
-        )
-        .unwrap();
+        let program = parse_source("enum List a =\n  | Nil\n  | Cons a (List a)\n").unwrap();
         assert_eq!(program.decls.len(), 1);
         match &program.decls[0] {
             Decl::Enum(enum_decl) => {
@@ -11668,6 +12754,53 @@ mod tests {
             }
             _ => panic!("expected enum declaration"),
         }
+    }
+
+    #[test]
+    fn parses_tuple_type_pattern_and_projection() {
+        let program = parse_source("fst : (i64, bool) -> i64\nfst (x, y) = (x, y).0\n").unwrap();
+        assert_eq!(program.decls.len(), 2);
+        match &program.decls[0] {
+            Decl::Signature(signature) => {
+                let (params, ret) = signature.ty.fun_parts();
+                assert_eq!(params.len(), 1);
+                assert!(matches!(
+                    &params[0],
+                    Type::Tuple(items)
+                        if matches!(&items[0], Type::Scalar(Prim::I64))
+                        && matches!(&items[1], Type::Named(name, args) if name == "bool" && args.is_empty())
+                ));
+                assert!(matches!(ret, Type::Scalar(Prim::I64)));
+            }
+            _ => panic!("expected tuple signature"),
+        }
+        match &program.decls[1] {
+            Decl::Clause(clause) => {
+                assert!(matches!(&clause.patterns[0], Pattern::Tuple(items) if items.len() == 2));
+                assert!(matches!(
+                    &clause.body,
+                    Expr::TupleProject(base, 0)
+                        if matches!(base.as_ref(), Expr::Tuple(items) if items.len() == 2)
+                ));
+            }
+            _ => panic!("expected tuple clause"),
+        }
+    }
+
+    #[test]
+    fn rejects_unit_and_singleton_tuple_syntax() {
+        assert!(parse_source("main : i64\nmain = ()\n").is_err());
+        assert!(parse_source("main : i64\nmain = (1,)\n").is_err());
+    }
+
+    #[test]
+    fn grouping_parentheses_remain_grouping_not_singleton_tuple() {
+        assert_eq!(
+            run_main("main : i64\nmain = (1)\n", "main", "[]")
+                .unwrap()
+                .to_json_string(),
+            "1"
+        );
     }
 
     #[test]
@@ -12159,7 +13292,8 @@ mod tests {
 
     #[test]
     fn renders_enum_output_with_enum_and_fields_markers() {
-        let src = "enum List a =\n  | Nil\n  | Cons a (List a)\n\nmain : List i64\nmain = Cons 7 Nil\n";
+        let src =
+            "enum List a =\n  | Nil\n  | Cons a (List a)\n\nmain : List i64\nmain = Cons 7 Nil\n";
         let out = run(src, "main", "[]");
         assert!(out.contains("\"$enum\""));
         assert!(out.contains("\"fields\""));
@@ -12177,7 +13311,9 @@ mod tests {
     fn lowered_execution_matches_recursive_list_length() {
         let src = "enum List a =\n  | Nil\n  | Cons a (List a)\n\nlen : List i64 -> i64\nlen Nil = 0\nlen (Cons _ xs) = 1 + len xs\n\nmain : i64\nmain = len (Cons 1 (Cons 2 Nil))\n";
         let checked = run_main(src, "main", "[]").unwrap().to_json_string();
-        let lowered = run_lowered_main(src, "main", "[]").unwrap().to_json_string();
+        let lowered = run_lowered_main(src, "main", "[]")
+            .unwrap()
+            .to_json_string();
         assert_eq!(checked, lowered);
     }
 
@@ -12185,7 +13321,9 @@ mod tests {
     fn lowered_execution_matches_recursive_tree_sum() {
         let src = "enum Tree a =\n  | Leaf a\n  | Bin (Tree a) (Tree a)\n\nsum : Tree i64 -> i64\nsum (Leaf x) = x\nsum (Bin l r) = sum l + sum r\n\nmain : i64\nmain = sum (Bin (Leaf 2) (Bin (Leaf 3) (Leaf 4)))\n";
         let checked = run_main(src, "main", "[]").unwrap().to_json_string();
-        let lowered = run_lowered_main(src, "main", "[]").unwrap().to_json_string();
+        let lowered = run_lowered_main(src, "main", "[]")
+            .unwrap()
+            .to_json_string();
         assert_eq!(checked, lowered);
     }
 
@@ -12193,7 +13331,9 @@ mod tests {
     fn evaluator_and_lowering_support_record_nested_recursive_enum_field() {
         let src = "enum BoxedList a =\n  | End\n  | Node { head: a, tail: BoxedList a }\n\nscore : BoxedList i64 -> i64\nscore End = 0\nscore (Node _) = 1\n\nmain : i64\nmain = score (Node { head = 1, tail = End })\n";
         let checked = run_main(src, "main", "[]").unwrap().to_json_string();
-        let lowered = run_lowered_main(src, "main", "[]").unwrap().to_json_string();
+        let lowered = run_lowered_main(src, "main", "[]")
+            .unwrap()
+            .to_json_string();
         assert_eq!(checked, lowered);
     }
 
@@ -12372,9 +13512,8 @@ mod tests {
 
     #[test]
     fn slice_pattern_function_lowers_to_structural() {
-        let compiled = compile(
-            "starts : string -> i64\nstarts ['c', 'a', 'r', ...] = 1\nstarts _ = 0\n",
-        );
+        let compiled =
+            compile("starts : string -> i64\nstarts ['c', 'a', 'r', ...] = 1\nstarts _ = 0\n");
         let function = compiled
             .lowered
             .functions
@@ -12388,7 +13527,9 @@ mod tests {
     fn lowered_recursive_enum_execution_matches_checked_execution() {
         let src = "enum Tree a =\n  | Leaf a\n  | Bin (Tree a) (Tree a)\n\nsum : Tree i64 -> i64\nsum (Leaf x) = x\nsum (Bin l r) = sum l + sum r\n\nmain : i64\nmain = sum (Bin (Leaf 2) (Bin (Leaf 3) (Leaf 4)))\n";
         let checked = run_main(src, "main", "[]").unwrap().to_json_string();
-        let lowered = run_lowered_main(src, "main", "[]").unwrap().to_json_string();
+        let lowered = run_lowered_main(src, "main", "[]")
+            .unwrap()
+            .to_json_string();
         assert_eq!(checked, lowered);
     }
 
@@ -12412,6 +13553,52 @@ mod tests {
             .unwrap()
             .to_json_string();
         assert_eq!(checked, lowered);
+    }
+
+    #[test]
+    fn evaluator_supports_tuple_pattern_and_projection() {
+        let src = "fst : (i64, i64) -> i64\nfst (x, y) = (x, y).0\nmain : i64\nmain = fst (4, 9)\n";
+        assert_eq!(run_main(src, "main", "[]").unwrap().to_json_string(), "4");
+    }
+
+    #[test]
+    fn tuple_results_render_as_json_arrays() {
+        let src = "main : (i64, bool)\nmain = (1, true)\n";
+        assert_eq!(
+            run_main(src, "main", "[]").unwrap().to_json_string(),
+            "[1,true]"
+        );
+    }
+
+    #[test]
+    fn tuple_lowered_execution_matches_checked_execution() {
+        let src = "swap : (i64, i64) -> (i64, i64)\nswap (x, y) = (y, x)\nmain : (i64, i64)\nmain = swap (3, 7)\n";
+        let checked = run_main(src, "main", "[]").unwrap().to_json_string();
+        let lowered = run_lowered_main(src, "main", "[]")
+            .unwrap()
+            .to_json_string();
+        assert_eq!(checked, lowered);
+    }
+
+    #[test]
+    fn tuple_json_boundary_uses_arrays() {
+        let src = "swap : (i64, i64) -> (i64, i64)\nswap (x, y) = (y, x)\nmain : (i64, i64) -> (i64, i64)\nmain p = swap p\n";
+        assert_eq!(
+            run_main(src, "main", "[[3,4]]").unwrap().to_json_string(),
+            "[4,3]"
+        );
+        let error = run_main(src, "main", "[[3]]").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("tuple runtime argument has 1 elements, expected 2")
+        );
+    }
+
+    #[test]
+    fn tuple_projection_out_of_bounds_is_rejected() {
+        let error = compile_source("main : i64\nmain = (1, true).2\n").unwrap_err();
+        assert!(error.to_string().contains("tuple index 2 does not exist"));
     }
 
     #[test]
@@ -12442,6 +13629,37 @@ mod tests {
     }
 
     #[test]
+    fn json_parser_helpers_do_not_fallback_and_form_structural_cluster() {
+        let compiled = compile(include_str!("../examples/json_parser_adt.simd"));
+        let fallback_reports = compiled
+            .intents
+            .reports
+            .iter()
+            .filter(|report| {
+                report.source_name.starts_with("parse_") && report.intent == IntentClass::Fallback
+            })
+            .map(|report| report.source_name.clone())
+            .collect::<Vec<_>>();
+        assert!(
+            fallback_reports.is_empty(),
+            "unexpected parser fallback intents: {:?}",
+            fallback_reports
+        );
+
+        let parse_cluster = compiled
+            .structural
+            .clusters
+            .iter()
+            .find(|cluster| cluster.functions.iter().any(|name| name == "parse_value"))
+            .expect("expected structural cluster containing parse_value");
+        assert!(parse_cluster.functions.iter().any(|name| name == "parse_array_after_open"));
+        assert!(parse_cluster.functions.iter().any(|name| name == "parse_object_after_open"));
+        assert!(parse_cluster.recursive);
+        assert!(parse_cluster.state_count >= parse_cluster.functions.len());
+        assert!(parse_cluster.transition_count >= parse_cluster.functions.len());
+    }
+
+    #[test]
     fn inspector_html_embeds_examples_and_wat() {
         let html = bundled_examples_inspector_html().unwrap();
         assert!(html.contains("simd wat inspector"));
@@ -12452,6 +13670,7 @@ mod tests {
         assert!(html.contains("lambda-capture-i64"));
         assert!(html.contains("custom-record-types"));
         assert!(html.contains("string-family-demo"));
+        assert!(html.contains("tuple-basics"));
         assert!(html.contains("(module"));
         assert!(html.contains("color-scheme: dark"));
         assert!(html.contains("--bg: #0b1020"));
@@ -12578,13 +13797,10 @@ mod tests {
             .to_json_string();
         assert_eq!(neg_num, "88");
 
-        let escaped = run_compiled_main(
-            &compiled,
-            "main",
-            &[Value::String("\"\\\\\"".to_string())],
-        )
-        .expect("json parser adt example should handle escaped string chars")
-        .to_json_string();
+        let escaped =
+            run_compiled_main(&compiled, "main", &[Value::String("\"\\\\\"".to_string())])
+                .expect("json parser adt example should handle escaped string chars")
+                .to_json_string();
         assert_eq!(escaped, "201");
 
         let unicode_escape = run_compiled_main(
@@ -12641,40 +13857,25 @@ mod tests {
         .to_json_string();
         assert_eq!(unpaired_low, "-202");
 
-        let invalid_escape = run_compiled_main(
-            &compiled,
-            "main",
-            &[Value::String("\"\\x\"".to_string())],
-        )
-        .expect("json parser adt example should return an escape error")
-        .to_json_string();
+        let invalid_escape =
+            run_compiled_main(&compiled, "main", &[Value::String("\"\\x\"".to_string())])
+                .expect("json parser adt example should return an escape error")
+                .to_json_string();
         assert_eq!(invalid_escape, "-202");
 
-        let trailing = run_compiled_main(
-            &compiled,
-            "main",
-            &[Value::String("nullx".to_string())],
-        )
-        .expect("json parser adt example should report trailing garbage")
-        .to_json_string();
+        let trailing = run_compiled_main(&compiled, "main", &[Value::String("nullx".to_string())])
+            .expect("json parser adt example should report trailing garbage")
+            .to_json_string();
         assert_eq!(trailing, "-999");
 
-        let empty_array = run_compiled_main(
-            &compiled,
-            "main",
-            &[Value::String("[]".to_string())],
-        )
-        .expect("json parser adt example should parse empty array")
-        .to_json_string();
+        let empty_array = run_compiled_main(&compiled, "main", &[Value::String("[]".to_string())])
+            .expect("json parser adt example should parse empty array")
+            .to_json_string();
         assert_eq!(empty_array, "300");
 
-        let empty_object = run_compiled_main(
-            &compiled,
-            "main",
-            &[Value::String("{}".to_string())],
-        )
-        .expect("json parser adt example should parse empty object")
-        .to_json_string();
+        let empty_object = run_compiled_main(&compiled, "main", &[Value::String("{}".to_string())])
+            .expect("json parser adt example should parse empty object")
+            .to_json_string();
         assert_eq!(empty_object, "400");
 
         let whitespace_nested = run_compiled_main(
@@ -12686,13 +13887,10 @@ mod tests {
         .to_json_string();
         assert_eq!(whitespace_nested, "906");
 
-        let malformed_minus = run_compiled_main(
-            &compiled,
-            "main",
-            &[Value::String("-abc".to_string())],
-        )
-        .expect("json parser adt example should report malformed minus")
-        .to_json_string();
+        let malformed_minus =
+            run_compiled_main(&compiled, "main", &[Value::String("-abc".to_string())])
+                .expect("json parser adt example should report malformed minus")
+                .to_json_string();
         assert_eq!(malformed_minus, "-301");
 
         let object_key_lengths = run_compiled_main(
@@ -12743,13 +13941,10 @@ mod tests {
         assert!(debug_ok.contains("JArray"));
         assert!(debug_ok.contains("JArrCons"));
 
-        let debug_err = run_compiled_main(
-            &compiled,
-            "main_json",
-            &[Value::String("1.".to_string())],
-        )
-        .expect("json parser adt example debug entry should return error payload")
-        .to_json_string();
+        let debug_err =
+            run_compiled_main(&compiled, "main_json", &[Value::String("1.".to_string())])
+                .expect("json parser adt example debug entry should return error payload")
+                .to_json_string();
         assert!(debug_err.contains("JNum"));
         assert!(debug_err.contains("-302"));
     }

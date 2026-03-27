@@ -1,0 +1,11 @@
+swap : (i64, i64) -> (i64, i64)
+swap (x, y) = (y, x)
+
+describe : (i64, bool) -> (i64, bool, i64)
+describe pair = (pair.0, pair.1, pair.0 + 10)
+
+main : (i64, i64) -> (i64, i64)
+main pair = swap pair
+
+main_describe : (i64, bool) -> (i64, bool, i64)
+main_describe pair = describe pair

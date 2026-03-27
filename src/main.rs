@@ -117,8 +117,10 @@ fn run() -> simd::Result<()> {
                     }
                 }
             }
-            let main = main.ok_or_else(|| simd::SimdError::new("run-profile requires --main <fn>"))?;
-            let json = json.ok_or_else(|| simd::SimdError::new("run-profile requires --args <json>"))?;
+            let main =
+                main.ok_or_else(|| simd::SimdError::new("run-profile requires --main <fn>"))?;
+            let json =
+                json.ok_or_else(|| simd::SimdError::new("run-profile requires --args <json>"))?;
             println!("{}", simd::run_profile_command(&path, &main, &json)?);
         }
         "wasm" => {
@@ -268,11 +270,10 @@ fn run() -> simd::Result<()> {
                     }
                 }
             }
-            let main = main
-                .ok_or_else(|| simd::SimdError::new("run-wasm-prepared requires --main <fn>"))?;
-            let json = json.ok_or_else(|| {
-                simd::SimdError::new("run-wasm-prepared requires --args <json>")
-            })?;
+            let main =
+                main.ok_or_else(|| simd::SimdError::new("run-wasm-prepared requires --main <fn>"))?;
+            let json = json
+                .ok_or_else(|| simd::SimdError::new("run-wasm-prepared requires --args <json>"))?;
             println!(
                 "{}",
                 simd::run_wasm_prepared_command(&path, &main, &json, iters)?
@@ -314,9 +315,8 @@ fn run() -> simd::Result<()> {
             }
             let main =
                 main.ok_or_else(|| simd::SimdError::new("run-wasm-profile requires --main <fn>"))?;
-            let json = json.ok_or_else(|| {
-                simd::SimdError::new("run-wasm-profile requires --args <json>")
-            })?;
+            let json = json
+                .ok_or_else(|| simd::SimdError::new("run-wasm-profile requires --args <json>"))?;
             println!("{}", simd::run_wasm_profile_command(&path, &main, &json)?);
         }
         "bench" => {

@@ -10,53 +10,56 @@ enum Json =
   | JObjNil
   | JObjCons i64 Json Json
 
-enum ParseResult a =
-  | POk a string
-  | PErr i64
+enum Either a b =
+  | Left a
+  | Right b
 
-enum MemberResult a b =
-  | MOk a b string
-  | MErr i64
+enum Parsed a =
+  | Parsed a string
 
+enum ParsedMember a b =
+  | ParsedMember a b string
 
-parse_json : string -> ParseResult Json
+parse_json : string -> Either i64 (Parsed Json)
 parse_json s = parse_value s
 
-parse_value : string -> ParseResult Json
+parse_value : string -> Either i64 (Parsed Json)
 parse_value [' ', ...rest] = parse_value rest
 parse_value ['\n', ...rest] = parse_value rest
 parse_value ['\t', ...rest] = parse_value rest
 parse_value ['\r', ...rest] = parse_value rest
-parse_value ['n', 'u', 'l', 'l', ...rest] = (POk JNull rest)
-parse_value ['t', 'r', 'u', 'e', ...rest] = (POk (JBool 1) rest)
-parse_value ['f', 'a', 'l', 's', 'e', ...rest] = (POk (JBool 0) rest)
-parse_value ['"', ...rest] = to_json_from_strlen (parse_string_len 0 0 rest)
+parse_value ['n', 'u', 'l', 'l', ...rest] = Right (Parsed JNull rest)
+parse_value ['t', 'r', 'u', 'e', ...rest] = Right (Parsed (JBool 1) rest)
+parse_value ['f', 'a', 'l', 's', 'e', ...rest] = Right (Parsed (JBool 0) rest)
+parse_value ['"', ...rest] = as_string_token (parse_string_len 0 0 rest)
 parse_value ['[', ...rest] = parse_array_after_open rest
 parse_value ['{', ...rest] = parse_object_after_open rest
-parse_value ['-', ...rest] = to_json_from_i64 (parse_negative_number rest)
-parse_value ['0', ...rest] = to_json_from_i64 (parse_number_from_int 0 rest 0)
-parse_value ['1', ...rest] = to_json_from_i64 (parse_number_from_int 1 rest 0)
-parse_value ['2', ...rest] = to_json_from_i64 (parse_number_from_int 2 rest 0)
-parse_value ['3', ...rest] = to_json_from_i64 (parse_number_from_int 3 rest 0)
-parse_value ['4', ...rest] = to_json_from_i64 (parse_number_from_int 4 rest 0)
-parse_value ['5', ...rest] = to_json_from_i64 (parse_number_from_int 5 rest 0)
-parse_value ['6', ...rest] = to_json_from_i64 (parse_number_from_int 6 rest 0)
-parse_value ['7', ...rest] = to_json_from_i64 (parse_number_from_int 7 rest 0)
-parse_value ['8', ...rest] = to_json_from_i64 (parse_number_from_int 8 rest 0)
-parse_value ['9', ...rest] = to_json_from_i64 (parse_number_from_int 9 rest 0)
-parse_value _ = (PErr 100)
+parse_value ['-', ...rest] = as_number_token (parse_negative_number rest)
+parse_value ['0', ...rest] = as_number_token (parse_number_from_int 0 rest 0)
+parse_value ['1', ...rest] = as_number_token (parse_number_from_int 1 rest 0)
+parse_value ['2', ...rest] = as_number_token (parse_number_from_int 2 rest 0)
+parse_value ['3', ...rest] = as_number_token (parse_number_from_int 3 rest 0)
+parse_value ['4', ...rest] = as_number_token (parse_number_from_int 4 rest 0)
+parse_value ['5', ...rest] = as_number_token (parse_number_from_int 5 rest 0)
+parse_value ['6', ...rest] = as_number_token (parse_number_from_int 6 rest 0)
+parse_value ['7', ...rest] = as_number_token (parse_number_from_int 7 rest 0)
+parse_value ['8', ...rest] = as_number_token (parse_number_from_int 8 rest 0)
+parse_value ['9', ...rest] = as_number_token (parse_number_from_int 9 rest 0)
+parse_value _ = Left 100
 
-to_json_from_strlen : ParseResult i64 -> ParseResult Json
-to_json_from_strlen (PErr c) = (PErr c)
-to_json_from_strlen (POk value rest) = (POk (JStrTok value) rest)
+as_string_token : Either i64 (Parsed i64) -> Either i64 (Parsed Json)
+as_string_token (Left c) = Left c
+as_string_token (Right (Parsed value rest)) = Right (Parsed (JStrTok value) rest)
 
-to_json_from_i64 : ParseResult i64 -> ParseResult Json
-to_json_from_i64 (PErr c) = (PErr c)
-to_json_from_i64 (POk value rest) = (POk (JNum value) rest)
+as_number_token : Either i64 (Parsed i64) -> Either i64 (Parsed Json)
+as_number_token (Left c) = Left c
+as_number_token (Right (Parsed value rest)) = Right (Parsed (JNum value) rest)
 
-parse_string_len : i64 -> i64 -> string -> ParseResult i64
-parse_string_len 0 len ['"', ...rest] = (POk len rest)
+parse_string_len : i64 -> i64 -> string -> Either i64 (Parsed i64)
+parse_string_len 0 len ['"', ...rest] = Right (Parsed len rest)
 parse_string_len 0 len ['\\', ...rest] = parse_string_len 1 len rest
+parse_string_len 0 _ ['\n', ..._] = Left 202
+parse_string_len 0 _ ['\r', ..._] = Left 202
 parse_string_len 0 len [_, ...rest] = parse_string_len 0 (len + 1) rest
 parse_string_len 1 len ['"', ...rest] = parse_string_len 0 (len + 1) rest
 parse_string_len 1 len ['\\', ...rest] = parse_string_len 0 (len + 1) rest
@@ -67,72 +70,46 @@ parse_string_len 1 len ['n', ...rest] = parse_string_len 0 (len + 1) rest
 parse_string_len 1 len ['r', ...rest] = parse_string_len 0 (len + 1) rest
 parse_string_len 1 len ['t', ...rest] = parse_string_len 0 (len + 1) rest
 parse_string_len 1 len ['u', ...rest] = parse_unicode_escape len rest
-parse_string_len 1 _ _ = (PErr 202)
-parse_string_len _ _ _ = (PErr 201)
+parse_string_len 1 _ _ = Left 202
+parse_string_len _ _ _ = Left 201
 
-parse_unicode_escape : i64 -> string -> ParseResult i64
-parse_unicode_escape len ['d', '8', ...rest] = (PErr 202)
-parse_unicode_escape len ['d', '9', ...rest] = (PErr 202)
-parse_unicode_escape len ['d', 'a', ...rest] = (PErr 202)
-parse_unicode_escape len ['d', 'b', ...rest] = (PErr 202)
-parse_unicode_escape len ['d', 'A', ...rest] = (PErr 202)
-parse_unicode_escape len ['d', 'B', ...rest] = (PErr 202)
-parse_unicode_escape len ['D', '8', ...rest] = (PErr 202)
-parse_unicode_escape len ['D', '9', ...rest] = (PErr 202)
-parse_unicode_escape len ['D', 'a', ...rest] = (PErr 202)
-parse_unicode_escape len ['D', 'b', ...rest] = (PErr 202)
-parse_unicode_escape len ['D', 'A', ...rest] = (PErr 202)
-parse_unicode_escape len ['D', 'B', ...rest] = (PErr 202)
-parse_unicode_escape _ ['d', 'c', ...rest] = (PErr 202)
-parse_unicode_escape _ ['d', 'd', ...rest] = (PErr 202)
-parse_unicode_escape _ ['d', 'e', ...rest] = (PErr 202)
-parse_unicode_escape _ ['d', 'f', ...rest] = (PErr 202)
-parse_unicode_escape _ ['d', 'C', ...rest] = (PErr 202)
-parse_unicode_escape _ ['d', 'D', ...rest] = (PErr 202)
-parse_unicode_escape _ ['d', 'E', ...rest] = (PErr 202)
-parse_unicode_escape _ ['d', 'F', ...rest] = (PErr 202)
-parse_unicode_escape _ ['D', 'c', ...rest] = (PErr 202)
-parse_unicode_escape _ ['D', 'd', ...rest] = (PErr 202)
-parse_unicode_escape _ ['D', 'e', ...rest] = (PErr 202)
-parse_unicode_escape _ ['D', 'f', ...rest] = (PErr 202)
-parse_unicode_escape _ ['D', 'C', ...rest] = (PErr 202)
-parse_unicode_escape _ ['D', 'D', ...rest] = (PErr 202)
-parse_unicode_escape _ ['D', 'E', ...rest] = (PErr 202)
-parse_unicode_escape _ ['D', 'F', ...rest] = (PErr 202)
+parse_unicode_escape : i64 -> string -> Either i64 (Parsed i64)
+parse_unicode_escape len ['d', '8', ...rest] = Left 202
+parse_unicode_escape len ['d', '9', ...rest] = Left 202
+parse_unicode_escape len ['d', 'a', ...rest] = Left 202
+parse_unicode_escape len ['d', 'b', ...rest] = Left 202
+parse_unicode_escape len ['d', 'A', ...rest] = Left 202
+parse_unicode_escape len ['d', 'B', ...rest] = Left 202
+parse_unicode_escape len ['D', '8', ...rest] = Left 202
+parse_unicode_escape len ['D', '9', ...rest] = Left 202
+parse_unicode_escape len ['D', 'a', ...rest] = Left 202
+parse_unicode_escape len ['D', 'b', ...rest] = Left 202
+parse_unicode_escape len ['D', 'A', ...rest] = Left 202
+parse_unicode_escape len ['D', 'B', ...rest] = Left 202
+parse_unicode_escape _ ['d', 'c', ...rest] = Left 202
+parse_unicode_escape _ ['d', 'd', ...rest] = Left 202
+parse_unicode_escape _ ['d', 'e', ...rest] = Left 202
+parse_unicode_escape _ ['d', 'f', ...rest] = Left 202
+parse_unicode_escape _ ['d', 'C', ...rest] = Left 202
+parse_unicode_escape _ ['d', 'D', ...rest] = Left 202
+parse_unicode_escape _ ['d', 'E', ...rest] = Left 202
+parse_unicode_escape _ ['d', 'F', ...rest] = Left 202
+parse_unicode_escape _ ['D', 'c', ...rest] = Left 202
+parse_unicode_escape _ ['D', 'd', ...rest] = Left 202
+parse_unicode_escape _ ['D', 'e', ...rest] = Left 202
+parse_unicode_escape _ ['D', 'f', ...rest] = Left 202
+parse_unicode_escape _ ['D', 'C', ...rest] = Left 202
+parse_unicode_escape _ ['D', 'D', ...rest] = Left 202
+parse_unicode_escape _ ['D', 'E', ...rest] = Left 202
+parse_unicode_escape _ ['D', 'F', ...rest] = Left 202
 parse_unicode_escape len rest = parse_unicode_regular_escape len (parse_hex_n 4 rest)
 
-parse_unicode_high_after_prefix : i64 -> string -> ParseResult i64
-parse_unicode_high_after_prefix len rest = parse_unicode_high_continue len (parse_hex_n 2 rest)
+parse_unicode_regular_escape : i64 -> Either i64 (Parsed i64) -> Either i64 (Parsed i64)
+parse_unicode_regular_escape _ (Left c) = Left c
+parse_unicode_regular_escape len (Right (Parsed _ rest)) = parse_string_len 0 (len + 1) rest
 
-parse_unicode_high_continue : i64 -> ParseResult i64 -> ParseResult i64
-parse_unicode_high_continue _ (PErr c) = (PErr c)
-parse_unicode_high_continue len (POk _ rest) = parse_unicode_expect_low_prefix len rest
-
-parse_unicode_expect_low_prefix : i64 -> string -> ParseResult i64
-parse_unicode_expect_low_prefix len ['\\', 'u', 'd', 'c', ...rest] = parse_unicode_regular_escape len (parse_hex_n 2 rest)
-parse_unicode_expect_low_prefix len ['\\', 'u', 'd', 'd', ...rest] = parse_unicode_regular_escape len (parse_hex_n 2 rest)
-parse_unicode_expect_low_prefix len ['\\', 'u', 'd', 'e', ...rest] = parse_unicode_regular_escape len (parse_hex_n 2 rest)
-parse_unicode_expect_low_prefix len ['\\', 'u', 'd', 'f', ...rest] = parse_unicode_regular_escape len (parse_hex_n 2 rest)
-parse_unicode_expect_low_prefix len ['\\', 'u', 'd', 'C', ...rest] = parse_unicode_regular_escape len (parse_hex_n 2 rest)
-parse_unicode_expect_low_prefix len ['\\', 'u', 'd', 'D', ...rest] = parse_unicode_regular_escape len (parse_hex_n 2 rest)
-parse_unicode_expect_low_prefix len ['\\', 'u', 'd', 'E', ...rest] = parse_unicode_regular_escape len (parse_hex_n 2 rest)
-parse_unicode_expect_low_prefix len ['\\', 'u', 'd', 'F', ...rest] = parse_unicode_regular_escape len (parse_hex_n 2 rest)
-parse_unicode_expect_low_prefix len ['\\', 'u', 'D', 'c', ...rest] = parse_unicode_regular_escape len (parse_hex_n 2 rest)
-parse_unicode_expect_low_prefix len ['\\', 'u', 'D', 'd', ...rest] = parse_unicode_regular_escape len (parse_hex_n 2 rest)
-parse_unicode_expect_low_prefix len ['\\', 'u', 'D', 'e', ...rest] = parse_unicode_regular_escape len (parse_hex_n 2 rest)
-parse_unicode_expect_low_prefix len ['\\', 'u', 'D', 'f', ...rest] = parse_unicode_regular_escape len (parse_hex_n 2 rest)
-parse_unicode_expect_low_prefix len ['\\', 'u', 'D', 'C', ...rest] = parse_unicode_regular_escape len (parse_hex_n 2 rest)
-parse_unicode_expect_low_prefix len ['\\', 'u', 'D', 'D', ...rest] = parse_unicode_regular_escape len (parse_hex_n 2 rest)
-parse_unicode_expect_low_prefix len ['\\', 'u', 'D', 'E', ...rest] = parse_unicode_regular_escape len (parse_hex_n 2 rest)
-parse_unicode_expect_low_prefix len ['\\', 'u', 'D', 'F', ...rest] = parse_unicode_regular_escape len (parse_hex_n 2 rest)
-parse_unicode_expect_low_prefix _ _ = (PErr 202)
-
-parse_unicode_regular_escape : i64 -> ParseResult i64 -> ParseResult i64
-parse_unicode_regular_escape _ (PErr c) = (PErr c)
-parse_unicode_regular_escape len (POk _ rest) = parse_string_len 0 (len + 1) rest
-
-parse_hex_n : i64 -> string -> ParseResult i64
-parse_hex_n 0 rest = (POk 0 rest)
+parse_hex_n : i64 -> string -> Either i64 (Parsed i64)
+parse_hex_n 0 rest = Right (Parsed 0 rest)
 parse_hex_n n ['0', ...rest] = parse_hex_n (n - 1) rest
 parse_hex_n n ['1', ...rest] = parse_hex_n (n - 1) rest
 parse_hex_n n ['2', ...rest] = parse_hex_n (n - 1) rest
@@ -155,9 +132,9 @@ parse_hex_n n ['C', ...rest] = parse_hex_n (n - 1) rest
 parse_hex_n n ['D', ...rest] = parse_hex_n (n - 1) rest
 parse_hex_n n ['E', ...rest] = parse_hex_n (n - 1) rest
 parse_hex_n n ['F', ...rest] = parse_hex_n (n - 1) rest
-parse_hex_n _ _ = (PErr 202)
+parse_hex_n _ _ = Left 202
 
-parse_negative_number : string -> ParseResult i64
+parse_negative_number : string -> Either i64 (Parsed i64)
 parse_negative_number ['0', ...rest] = parse_number_from_int 0 rest 1
 parse_negative_number ['1', ...rest] = parse_number_from_int 1 rest 1
 parse_negative_number ['2', ...rest] = parse_number_from_int 2 rest 1
@@ -168,9 +145,9 @@ parse_negative_number ['6', ...rest] = parse_number_from_int 6 rest 1
 parse_negative_number ['7', ...rest] = parse_number_from_int 7 rest 1
 parse_negative_number ['8', ...rest] = parse_number_from_int 8 rest 1
 parse_negative_number ['9', ...rest] = parse_number_from_int 9 rest 1
-parse_negative_number _ = (PErr 301)
+parse_negative_number _ = Left 301
 
-parse_number_from_int : i64 -> string -> i64 -> ParseResult i64
+parse_number_from_int : i64 -> string -> i64 -> Either i64 (Parsed i64)
 parse_number_from_int acc ['0', ...rest] neg = parse_number_from_int ((acc * 10) + 0) rest neg
 parse_number_from_int acc ['1', ...rest] neg = parse_number_from_int ((acc * 10) + 1) rest neg
 parse_number_from_int acc ['2', ...rest] neg = parse_number_from_int ((acc * 10) + 2) rest neg
@@ -184,10 +161,10 @@ parse_number_from_int acc ['9', ...rest] neg = parse_number_from_int ((acc * 10)
 parse_number_from_int acc ['.', ...rest] neg = parse_number_fraction acc rest neg 0
 parse_number_from_int acc ['e', ...rest] neg = parse_number_exponent acc rest neg
 parse_number_from_int acc ['E', ...rest] neg = parse_number_exponent acc rest neg
-parse_number_from_int acc rest 0 = (POk acc rest)
-parse_number_from_int acc rest _ = (POk (0 - acc) rest)
+parse_number_from_int acc rest 0 = Right (Parsed acc rest)
+parse_number_from_int acc rest _ = Right (Parsed (0 - acc) rest)
 
-parse_number_fraction : i64 -> string -> i64 -> i64 -> ParseResult i64
+parse_number_fraction : i64 -> string -> i64 -> i64 -> Either i64 (Parsed i64)
 parse_number_fraction acc ['0', ...rest] neg _ = parse_number_fraction acc rest neg 1
 parse_number_fraction acc ['1', ...rest] neg _ = parse_number_fraction acc rest neg 1
 parse_number_fraction acc ['2', ...rest] neg _ = parse_number_fraction acc rest neg 1
@@ -200,16 +177,16 @@ parse_number_fraction acc ['8', ...rest] neg _ = parse_number_fraction acc rest 
 parse_number_fraction acc ['9', ...rest] neg _ = parse_number_fraction acc rest neg 1
 parse_number_fraction acc ['e', ...rest] neg 1 = parse_number_exponent acc rest neg
 parse_number_fraction acc ['E', ...rest] neg 1 = parse_number_exponent acc rest neg
-parse_number_fraction acc rest 0 1 = (POk acc rest)
-parse_number_fraction acc rest _ 1 = (POk (0 - acc) rest)
-parse_number_fraction _ _ _ _ = (PErr 302)
+parse_number_fraction acc rest 0 1 = Right (Parsed acc rest)
+parse_number_fraction acc rest _ 1 = Right (Parsed (0 - acc) rest)
+parse_number_fraction _ _ _ _ = Left 302
 
-parse_number_exponent : i64 -> string -> i64 -> ParseResult i64
+parse_number_exponent : i64 -> string -> i64 -> Either i64 (Parsed i64)
 parse_number_exponent acc ['+', ...rest] neg = parse_number_exponent_digits acc rest neg 0
 parse_number_exponent acc ['-', ...rest] neg = parse_number_exponent_digits acc rest neg 0
 parse_number_exponent acc rest neg = parse_number_exponent_digits acc rest neg 0
 
-parse_number_exponent_digits : i64 -> string -> i64 -> i64 -> ParseResult i64
+parse_number_exponent_digits : i64 -> string -> i64 -> i64 -> Either i64 (Parsed i64)
 parse_number_exponent_digits acc ['0', ...rest] neg _ = parse_number_exponent_digits acc rest neg 1
 parse_number_exponent_digits acc ['1', ...rest] neg _ = parse_number_exponent_digits acc rest neg 1
 parse_number_exponent_digits acc ['2', ...rest] neg _ = parse_number_exponent_digits acc rest neg 1
@@ -220,75 +197,75 @@ parse_number_exponent_digits acc ['6', ...rest] neg _ = parse_number_exponent_di
 parse_number_exponent_digits acc ['7', ...rest] neg _ = parse_number_exponent_digits acc rest neg 1
 parse_number_exponent_digits acc ['8', ...rest] neg _ = parse_number_exponent_digits acc rest neg 1
 parse_number_exponent_digits acc ['9', ...rest] neg _ = parse_number_exponent_digits acc rest neg 1
-parse_number_exponent_digits acc rest 0 1 = (POk acc rest)
-parse_number_exponent_digits acc rest _ 1 = (POk (0 - acc) rest)
-parse_number_exponent_digits _ _ _ _ = (PErr 303)
+parse_number_exponent_digits acc rest 0 1 = Right (Parsed acc rest)
+parse_number_exponent_digits acc rest _ 1 = Right (Parsed (0 - acc) rest)
+parse_number_exponent_digits _ _ _ _ = Left 303
 
-parse_array_after_open : string -> ParseResult Json
+parse_array_after_open : string -> Either i64 (Parsed Json)
 parse_array_after_open [' ', ...rest] = parse_array_after_open rest
 parse_array_after_open ['\n', ...rest] = parse_array_after_open rest
 parse_array_after_open ['\t', ...rest] = parse_array_after_open rest
 parse_array_after_open ['\r', ...rest] = parse_array_after_open rest
-parse_array_after_open [']', ...rest] = (POk (JArray JArrNil) rest)
+parse_array_after_open [']', ...rest] = Right (Parsed (JArray JArrNil) rest)
 parse_array_after_open s = parse_array_seed JArrNil (parse_value s)
 
-parse_array_seed : Json -> ParseResult Json -> ParseResult Json
-parse_array_seed _ (PErr c) = (PErr c)
-parse_array_seed acc (POk value rest) = parse_array_items (JArrCons value acc) rest
+parse_array_seed : Json -> Either i64 (Parsed Json) -> Either i64 (Parsed Json)
+parse_array_seed _ (Left c) = Left c
+parse_array_seed acc (Right (Parsed value rest)) = parse_array_items (JArrCons value acc) rest
 
-parse_array_items : Json -> string -> ParseResult Json
+parse_array_items : Json -> string -> Either i64 (Parsed Json)
 parse_array_items acc [' ', ...rest] = parse_array_items acc rest
 parse_array_items acc ['\n', ...rest] = parse_array_items acc rest
 parse_array_items acc ['\t', ...rest] = parse_array_items acc rest
 parse_array_items acc ['\r', ...rest] = parse_array_items acc rest
 parse_array_items acc [',', ...rest] = parse_array_seed acc (parse_value rest)
-parse_array_items acc [']', ...rest] = (POk (JArray acc) rest)
-parse_array_items _ _ = (PErr 401)
+parse_array_items acc [']', ...rest] = Right (Parsed (JArray acc) rest)
+parse_array_items _ _ = Left 401
 
-parse_object_after_open : string -> ParseResult Json
+parse_object_after_open : string -> Either i64 (Parsed Json)
 parse_object_after_open [' ', ...rest] = parse_object_after_open rest
 parse_object_after_open ['\n', ...rest] = parse_object_after_open rest
 parse_object_after_open ['\t', ...rest] = parse_object_after_open rest
 parse_object_after_open ['\r', ...rest] = parse_object_after_open rest
-parse_object_after_open ['}', ...rest] = (POk (JObject JObjNil) rest)
+parse_object_after_open ['}', ...rest] = Right (Parsed (JObject JObjNil) rest)
 parse_object_after_open s = parse_object_seed JObjNil (parse_member s)
 
-parse_object_seed : Json -> MemberResult i64 Json -> ParseResult Json
-parse_object_seed _ (MErr c) = (PErr c)
-parse_object_seed acc (MOk key_len value rest) = parse_object_items (JObjCons key_len value acc) rest
+parse_object_seed : Json -> Either i64 (ParsedMember i64 Json) -> Either i64 (Parsed Json)
+parse_object_seed _ (Left c) = Left c
+parse_object_seed acc (Right (ParsedMember key_len value rest)) = parse_object_items (JObjCons key_len value acc) rest
 
-parse_object_items : Json -> string -> ParseResult Json
+parse_object_items : Json -> string -> Either i64 (Parsed Json)
 parse_object_items acc [' ', ...rest] = parse_object_items acc rest
 parse_object_items acc ['\n', ...rest] = parse_object_items acc rest
 parse_object_items acc ['\t', ...rest] = parse_object_items acc rest
 parse_object_items acc ['\r', ...rest] = parse_object_items acc rest
 parse_object_items acc [',', ...rest] = parse_object_seed acc (parse_member rest)
-parse_object_items acc ['}', ...rest] = (POk (JObject acc) rest)
-parse_object_items _ _ = (PErr 501)
+parse_object_items acc ['}', ...rest] = Right (Parsed (JObject acc) rest)
+parse_object_items _ _ = Left 501
 
-parse_member : string -> MemberResult i64 Json
+parse_member : string -> Either i64 (ParsedMember i64 Json)
 parse_member [' ', ...rest] = parse_member rest
 parse_member ['\n', ...rest] = parse_member rest
 parse_member ['\t', ...rest] = parse_member rest
 parse_member ['\r', ...rest] = parse_member rest
 parse_member ['"', ...rest] = parse_member_from_keylen (parse_string_len 0 0 rest)
-parse_member _ = (MErr 502)
+parse_member _ = Left 502
 
-parse_member_from_keylen : ParseResult i64 -> MemberResult i64 Json
-parse_member_from_keylen (PErr c) = (MErr c)
-parse_member_from_keylen (POk key_len rest) = parse_member_after_key key_len rest
+parse_member_from_keylen : Either i64 (Parsed i64) -> Either i64 (ParsedMember i64 Json)
+parse_member_from_keylen (Left c) = Left c
+parse_member_from_keylen (Right (Parsed key_len rest)) = parse_member_after_key key_len rest
 
-parse_member_after_key : i64 -> string -> MemberResult i64 Json
+parse_member_after_key : i64 -> string -> Either i64 (ParsedMember i64 Json)
 parse_member_after_key key_len [' ', ...rest] = parse_member_after_key key_len rest
 parse_member_after_key key_len ['\n', ...rest] = parse_member_after_key key_len rest
 parse_member_after_key key_len ['\t', ...rest] = parse_member_after_key key_len rest
 parse_member_after_key key_len ['\r', ...rest] = parse_member_after_key key_len rest
 parse_member_after_key key_len [':', ...rest] = parse_member_after_value key_len (parse_value rest)
-parse_member_after_key _ _ = (MErr 502)
+parse_member_after_key _ _ = Left 502
 
-parse_member_after_value : i64 -> ParseResult Json -> MemberResult i64 Json
-parse_member_after_value _ (PErr c) = (MErr c)
-parse_member_after_value key_len (POk value rest) = (MOk key_len value rest)
+parse_member_after_value : i64 -> Either i64 (Parsed Json) -> Either i64 (ParsedMember i64 Json)
+parse_member_after_value _ (Left c) = Left c
+parse_member_after_value key_len (Right (Parsed value rest)) = Right (ParsedMember key_len value rest)
 
 json_weight : Json -> i64
 json_weight JNull = 10
@@ -309,9 +286,9 @@ object_list_weight JObjNil = 0
 object_list_weight (JObjCons key_len value rest) = key_len + json_weight value + object_list_weight rest
 object_list_weight _ = 0
 
-parse_status : ParseResult Json -> i64
-parse_status (PErr c) = 0 - c
-parse_status (POk value rest) = parse_status_rest value rest
+parse_status : Either i64 (Parsed Json) -> i64
+parse_status (Left c) = 0 - c
+parse_status (Right (Parsed value rest)) = parse_status_rest value rest
 
 parse_status_rest : Json -> string -> i64
 parse_status_rest value [' ', ...rest] = parse_status_rest value rest
@@ -319,7 +296,7 @@ parse_status_rest value ['\n', ...rest] = parse_status_rest value rest
 parse_status_rest value ['\t', ...rest] = parse_status_rest value rest
 parse_status_rest value ['\r', ...rest] = parse_status_rest value rest
 parse_status_rest value [] = json_weight value
-parse_status_rest _ _ = (0 - 999)
+parse_status_rest _ _ = 0 - 999
 
 json_string_leaf_chars : Json -> i64
 json_string_leaf_chars JNull = 0
@@ -340,9 +317,9 @@ object_list_string_leaf_chars JObjNil = 0
 object_list_string_leaf_chars (JObjCons _ value rest) = json_string_leaf_chars value + object_list_string_leaf_chars rest
 object_list_string_leaf_chars _ = 0
 
-parse_string_leaf_chars : ParseResult Json -> i64
-parse_string_leaf_chars (PErr c) = 0 - c
-parse_string_leaf_chars (POk value rest) = parse_string_leaf_chars_rest value rest
+parse_string_leaf_chars : Either i64 (Parsed Json) -> i64
+parse_string_leaf_chars (Left c) = 0 - c
+parse_string_leaf_chars (Right (Parsed value rest)) = parse_string_leaf_chars_rest value rest
 
 parse_string_leaf_chars_rest : Json -> string -> i64
 parse_string_leaf_chars_rest value [' ', ...rest] = parse_string_leaf_chars_rest value rest
@@ -350,14 +327,14 @@ parse_string_leaf_chars_rest value ['\n', ...rest] = parse_string_leaf_chars_res
 parse_string_leaf_chars_rest value ['\t', ...rest] = parse_string_leaf_chars_rest value rest
 parse_string_leaf_chars_rest value ['\r', ...rest] = parse_string_leaf_chars_rest value rest
 parse_string_leaf_chars_rest value [] = json_string_leaf_chars value
-parse_string_leaf_chars_rest _ _ = (0 - 999)
+parse_string_leaf_chars_rest _ _ = 0 - 999
 
 main_string_leaf_chars : string -> i64
 main_string_leaf_chars s = parse_string_leaf_chars (parse_json s)
 
-parse_json_debug : ParseResult Json -> Json
-parse_json_debug (PErr c) = (JNum (0 - c))
-parse_json_debug (POk value rest) = parse_json_debug_rest value rest
+parse_json_debug : Either i64 (Parsed Json) -> Json
+parse_json_debug (Left c) = JNum (0 - c)
+parse_json_debug (Right (Parsed value rest)) = parse_json_debug_rest value rest
 
 parse_json_debug_rest : Json -> string -> Json
 parse_json_debug_rest value [' ', ...rest] = parse_json_debug_rest value rest
@@ -365,7 +342,7 @@ parse_json_debug_rest value ['\n', ...rest] = parse_json_debug_rest value rest
 parse_json_debug_rest value ['\t', ...rest] = parse_json_debug_rest value rest
 parse_json_debug_rest value ['\r', ...rest] = parse_json_debug_rest value rest
 parse_json_debug_rest value [] = value
-parse_json_debug_rest _ _ = (JNum (0 - 999))
+parse_json_debug_rest _ _ = JNum (0 - 999)
 
 main_json : string -> Json
 main_json s = parse_json_debug (parse_json s)

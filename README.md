@@ -4,6 +4,7 @@
 
 - scalar and bulk numerics
 - records with internal SoA lowering
+- native n-ary tuples
 - `char`, `string`, and slice-view clause patterns
 - recursive fixed-arity enums/ADTs
 - evaluator, lowered execution, and Wasm execution paths
@@ -36,6 +37,7 @@ Example programs:
 
 - [JSON parser ADT notes](./examples/README.md)
 - [JSON parser ADT source](./examples/json_parser_adt.simd)
+- [Tuple basics source](./examples/tuple_basics.simd)
 
 ## Benchmark Tracking
 
@@ -133,6 +135,7 @@ The current source language includes:
 - `char`
 - shaped bulks
 - `string`
+- tuples
 - records
 - recursive fixed-arity enums
 - clause patterns for literals, constructors, strings, chars, and prefix/suffix slice views
@@ -151,4 +154,7 @@ starts_car _ = 0
 enum List a =
   | Nil
   | Cons a (List a)
+
+swap : (i64, i64) -> (i64, i64)
+swap (x, y) = (y, x)
 ```

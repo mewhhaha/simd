@@ -12,8 +12,7 @@ use wasm_encoder::{
     MemArg, MemorySection, MemoryType, Module, TypeSection, ValType,
 };
 use wasmtime::{
-    Cache, Config, Engine, Func, Instance, Memory, Module as WasmtimeModule, OptLevel, Store,
-    Val,
+    Cache, Config, Engine, Func, Instance, Memory, Module as WasmtimeModule, OptLevel, Store, Val,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -35,9 +34,22 @@ pub struct WasmArtifact {
 pub struct WasmOptimizationReport {
     pub function: String,
     pub intent: IntentClass,
+    pub structural_exec: StructuralExecMode,
     pub vectorizable: bool,
     pub vector_unroll: usize,
     pub fallback_reason: Option<String>,
+    pub structural_scc: Option<usize>,
+    pub structural_state_count: usize,
+    pub structural_transition_count: usize,
+    pub structural_span_ops: usize,
+    pub structural_enum_ops: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum StructuralExecMode {
+    Scalar,
+    StructuralLoop,
+    StructuralBatched,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -117,6 +129,14 @@ pub struct WasmRunProfile {
     pub runtime_build_us: u128,
     pub execute_ms: u128,
     pub execute_us: u128,
+    pub structural_functions: usize,
+    pub fallback_functions: usize,
+    pub parser_fallback_functions: usize,
+    pub structural_sccs: usize,
+    pub structural_state_count: usize,
+    pub structural_transition_count: usize,
+    pub structural_span_ops: usize,
+    pub structural_enum_ops: usize,
     pub total_ms: u128,
     pub total_us: u128,
 }
@@ -158,10 +178,70 @@ impl WasmRunProfile {
             format!("runtime_build_us={}", self.runtime_build_us),
             format!("execute_ms={}", self.execute_ms),
             format!("execute_us={}", self.execute_us),
+            format!("structural_functions={}", self.structural_functions),
+            format!("fallback_functions={}", self.fallback_functions),
+            format!("parser_fallback_functions={}", self.parser_fallback_functions),
+            format!("structural_sccs={}", self.structural_sccs),
+            format!("structural_state_count={}", self.structural_state_count),
+            format!(
+                "structural_transition_count={}",
+                self.structural_transition_count
+            ),
+            format!("structural_span_ops={}", self.structural_span_ops),
+            format!("structural_enum_ops={}", self.structural_enum_ops),
             format!("total_ms={}", self.total_ms),
             format!("total_us={}", self.total_us),
         ]
         .join("\n")
+    }
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct StructuralOptimizerSummary {
+    structural_functions: usize,
+    fallback_functions: usize,
+    parser_fallback_functions: usize,
+    structural_sccs: usize,
+    structural_state_count: usize,
+    structural_transition_count: usize,
+    structural_span_ops: usize,
+    structural_enum_ops: usize,
+}
+
+fn summarize_structural_optimizer_reports(
+    reports: &[WasmOptimizationReport],
+) -> StructuralOptimizerSummary {
+    let structural_sccs = reports
+        .iter()
+        .filter_map(|report| report.structural_scc)
+        .collect::<BTreeSet<_>>()
+        .len();
+    StructuralOptimizerSummary {
+        structural_functions: reports
+            .iter()
+            .filter(|report| report.intent == IntentClass::Structural)
+            .count(),
+        fallback_functions: reports
+            .iter()
+            .filter(|report| report.intent == IntentClass::Fallback)
+            .count(),
+        parser_fallback_functions: reports
+            .iter()
+            .filter(|report| {
+                report.intent == IntentClass::Fallback && report.function.starts_with("parse_")
+            })
+            .count(),
+        structural_sccs,
+        structural_state_count: reports
+            .iter()
+            .map(|report| report.structural_state_count)
+            .sum(),
+        structural_transition_count: reports
+            .iter()
+            .map(|report| report.structural_transition_count)
+            .sum(),
+        structural_span_ops: reports.iter().map(|report| report.structural_span_ops).sum(),
+        structural_enum_ops: reports.iter().map(|report| report.structural_enum_ops).sum(),
     }
 }
 
@@ -387,16 +467,15 @@ fn build_wasm_execution_artifact_checked(
         .map(|function| function.signature.ty.fun_parts().1)
         .ok_or_else(|| SimdError::new(format!("unknown entry function '{}'", main)))?;
     let plan = build_wasm_plan(checked_program, main)?;
-    let grouped_export = if matches!(plan.result, WasmResultAbi::Record { .. })
-        && !plan.leaf_exports.is_empty()
-    {
-        Some(WasmGroupedExport {
-            export_name: main.to_string(),
-            leaf_exports: plan.leaf_exports.clone(),
-        })
-    } else {
-        None
-    };
+    let grouped_export =
+        if matches!(plan.result, WasmResultAbi::Record { .. }) && !plan.leaf_exports.is_empty() {
+            Some(WasmGroupedExport {
+                export_name: main.to_string(),
+                leaf_exports: plan.leaf_exports.clone(),
+            })
+        } else {
+            None
+        };
     Ok(WasmArtifact {
         bytes,
         export_name: main.to_string(),
@@ -525,9 +604,7 @@ pub fn run_wasm_prepared_main(
     iters: usize,
 ) -> Result<Value> {
     if iters == 0 {
-        return Err(SimdError::new(
-            "run-wasm-prepared requires --iters >= 1",
-        ));
+        return Err(SimdError::new("run-wasm-prepared requires --iters >= 1"));
     }
     let (_surface, _module, checked) = compile_frontend(source)?;
     let specialized = specialize_checked_program_for_main(&checked, main)?;
@@ -600,9 +677,7 @@ pub fn run_wasm_prepared_command(
     iters: usize,
 ) -> Result<String> {
     if iters == 0 {
-        return Err(SimdError::new(
-            "run-wasm-prepared requires --iters >= 1",
-        ));
+        return Err(SimdError::new("run-wasm-prepared requires --iters >= 1"));
     }
     let (canonical, artifact, _cache_hit) = load_or_compile_wasm_command_artifact(path, main)?;
     let args = parse_host_args(args_json, &canonical, main)?;
@@ -667,7 +742,7 @@ pub fn run_wasm_profile_main(source: &str, main: &str, args_json: &str) -> Resul
     let compile_normalize_us = compile_normalize_elapsed.as_micros();
 
     let start = Instant::now();
-    let profiled_lowered = optimize_lowered_program(&lower_program(&profiled_normalized)?);
+    let profiled_lowered = optimize_lowered_program(&prepare_lowered_program(&profiled_normalized)?);
     let compile_lower_elapsed = start.elapsed();
     let compile_lower_ms = compile_lower_elapsed.as_millis();
     let compile_lower_us = compile_lower_elapsed.as_micros();
@@ -714,6 +789,8 @@ pub fn run_wasm_profile_main(source: &str, main: &str, args_json: &str) -> Resul
         artifact,
         runtime: RefCell::new(runtime),
     };
+    let structural_summary =
+        summarize_structural_optimizer_reports(&executable.artifact.optimizer_reports);
 
     let start = Instant::now();
     let value = executable.run(&args)?;
@@ -758,6 +835,14 @@ pub fn run_wasm_profile_main(source: &str, main: &str, args_json: &str) -> Resul
         runtime_build_us,
         execute_ms,
         execute_us,
+        structural_functions: structural_summary.structural_functions,
+        fallback_functions: structural_summary.fallback_functions,
+        parser_fallback_functions: structural_summary.parser_fallback_functions,
+        structural_sccs: structural_summary.structural_sccs,
+        structural_state_count: structural_summary.structural_state_count,
+        structural_transition_count: structural_summary.structural_transition_count,
+        structural_span_ops: structural_summary.structural_span_ops,
+        structural_enum_ops: structural_summary.structural_enum_ops,
         total_ms: total_elapsed.as_millis(),
         total_us: total_elapsed.as_micros(),
     })
@@ -781,14 +866,36 @@ fn render_optimizer_report_comments(reports: &[WasmOptimizationReport]) -> Strin
             4 => "vec4",
             _ => "vecN",
         };
+        let exec = match report.structural_exec {
+            StructuralExecMode::Scalar => "scalar",
+            StructuralExecMode::StructuralLoop => "structural-loop",
+            StructuralExecMode::StructuralBatched => "structural-batched",
+        };
         let fallback = report
             .fallback_reason
             .as_ref()
             .map(|reason| format!(" fallback={reason}"))
             .unwrap_or_default();
+        let structural = if report.structural_state_count == 0
+            && report.structural_transition_count == 0
+            && report.structural_span_ops == 0
+            && report.structural_enum_ops == 0
+            && report.structural_scc.is_none()
+        {
+            String::new()
+        } else {
+            format!(
+                " scc={:?} structural=states:{} transitions:{} span:{} enum:{}",
+                report.structural_scc,
+                report.structural_state_count,
+                report.structural_transition_count,
+                report.structural_span_ops,
+                report.structural_enum_ops
+            )
+        };
         lines.push(format!(
-            ";; - fn={} intent={:?} plan={}{}",
-            report.function, report.intent, plan, fallback
+            ";; - fn={} intent={:?} exec={} plan={}{}{}",
+            report.function, report.intent, exec, plan, structural, fallback
         ));
     }
     lines.join("\n")
@@ -819,6 +926,185 @@ fn render_higher_order_report_comments(reports: &[WasmHigherOrderReport]) -> Str
         ));
     }
     lines.join("\n")
+}
+
+fn structural_cluster_membership(
+    analysis: &StructuralAnalysis,
+) -> BTreeMap<String, StructuralClusterReport> {
+    let mut membership = BTreeMap::new();
+    for cluster in &analysis.clusters {
+        for function in &cluster.functions {
+            membership.insert(function.clone(), cluster.clone());
+        }
+    }
+    membership
+}
+
+fn structural_report_fields(
+    lowered: &LoweredFunction,
+    cluster: Option<&StructuralClusterReport>,
+) -> (Option<usize>, usize, usize, usize, usize) {
+    let mut span_ops = 0usize;
+    let mut enum_ops = 0usize;
+    match &lowered.kind {
+        LoweredKind::Scalar { clauses } | LoweredKind::Structural { clauses, .. } => {
+            for clause in clauses {
+                span_ops += clause
+                    .patterns
+                    .iter()
+                    .filter(|pattern| matches!(pattern.pattern, Pattern::Slice { .. }))
+                    .count();
+                enum_ops += clause
+                    .patterns
+                    .iter()
+                    .filter(|pattern| matches!(pattern.pattern, Pattern::Ctor(_, _)))
+                    .count();
+                span_ops += count_ir_structural_span_ops(&clause.body);
+                enum_ops += count_ir_structural_enum_ops(&clause.body);
+            }
+        }
+        LoweredKind::Kernel { .. } => {}
+    }
+    if let Some(tail_loop) = &lowered.tail_loop {
+        for clause in &tail_loop.clauses {
+            span_ops += clause
+                .patterns
+                .iter()
+                .filter(|pattern| matches!(pattern.pattern, Pattern::Slice { .. }))
+                .count();
+            enum_ops += clause
+                .patterns
+                .iter()
+                .filter(|pattern| matches!(pattern.pattern, Pattern::Ctor(_, _)))
+                .count();
+            match &clause.action {
+                TailAction::Continue { args } => {
+                    for arg in args {
+                        span_ops += count_ir_structural_span_ops(arg);
+                        enum_ops += count_ir_structural_enum_ops(arg);
+                    }
+                }
+                TailAction::Return { expr } => {
+                    span_ops += count_ir_structural_span_ops(expr);
+                    enum_ops += count_ir_structural_enum_ops(expr);
+                }
+            }
+        }
+    }
+    (
+        cluster.map(|cluster| cluster.id),
+        cluster.map(|cluster| cluster.state_count).unwrap_or(0),
+        cluster.map(|cluster| cluster.transition_count).unwrap_or(0),
+        span_ops,
+        enum_ops,
+    )
+}
+
+fn lowered_calls_structural_candidate(
+    lowered: &LoweredFunction,
+    candidates: &BTreeSet<String>,
+) -> bool {
+    (match &lowered.kind {
+        LoweredKind::Scalar { clauses } | LoweredKind::Structural { clauses, .. } => {
+            clauses.iter().any(|clause| ir_calls_structural_candidate(&clause.body, candidates))
+        }
+        LoweredKind::Kernel { .. } => false,
+    }) || lowered.tail_loop.as_ref().is_some_and(|tail_loop| {
+        tail_loop.clauses.iter().any(|clause| match &clause.action {
+            TailAction::Continue { args } => args
+                .iter()
+                .any(|arg| ir_calls_structural_candidate(arg, candidates)),
+            TailAction::Return { expr } => ir_calls_structural_candidate(expr, candidates),
+        })
+    })
+}
+
+fn ir_calls_structural_candidate(expr: &IrExpr, candidates: &BTreeSet<String>) -> bool {
+    match &expr.kind {
+        IrExprKind::Call {
+            callee: Callee::Function(name),
+            args,
+        } => {
+            candidates.contains(name)
+                || args
+                    .iter()
+                    .any(|arg| ir_calls_structural_candidate(arg, candidates))
+        }
+        IrExprKind::Call { args, .. } => args.iter().any(|arg| ir_calls_structural_candidate(arg, candidates)),
+        IrExprKind::Record(fields) => fields
+            .values()
+            .any(|field| ir_calls_structural_candidate(field, candidates)),
+        IrExprKind::EnumCtor { args, .. } => args
+            .iter()
+            .any(|arg| ir_calls_structural_candidate(arg, candidates)),
+        IrExprKind::EnumTag { value }
+        | IrExprKind::EnumChildBySlot { value, .. }
+        | IrExprKind::EnumNonRecField { value, .. } => {
+            ir_calls_structural_candidate(value, candidates)
+        }
+        IrExprKind::Let { bindings, body } => {
+            bindings
+                .iter()
+                .any(|binding| ir_calls_structural_candidate(&binding.expr, candidates))
+                || ir_calls_structural_candidate(body, candidates)
+        }
+        IrExprKind::Local(_) | IrExprKind::Int(_, _) | IrExprKind::Float(_, _) => false,
+    }
+}
+
+fn count_ir_structural_span_ops(expr: &IrExpr) -> usize {
+    match &expr.kind {
+        IrExprKind::Call {
+            callee: Callee::Builtin(
+                BuiltinFamilyCallee::ConcatString
+                | BuiltinFamilyCallee::LenString
+                | BuiltinFamilyCallee::SliceString
+                | BuiltinFamilyCallee::ContainsString
+                | BuiltinFamilyCallee::EqString,
+            ),
+            args,
+        } => {
+            1 + args
+                .iter()
+                .map(count_ir_structural_span_ops)
+                .sum::<usize>()
+        }
+        IrExprKind::Call { args, .. } => args.iter().map(count_ir_structural_span_ops).sum(),
+        IrExprKind::Record(fields) => fields.values().map(count_ir_structural_span_ops).sum(),
+        IrExprKind::EnumCtor { args, .. } => args.iter().map(count_ir_structural_span_ops).sum(),
+        IrExprKind::EnumTag { value }
+        | IrExprKind::EnumChildBySlot { value, .. }
+        | IrExprKind::EnumNonRecField { value, .. } => count_ir_structural_span_ops(value),
+        IrExprKind::Let { bindings, body } => {
+            bindings
+                .iter()
+                .map(|binding| count_ir_structural_span_ops(&binding.expr))
+                .sum::<usize>()
+                + count_ir_structural_span_ops(body)
+        }
+        IrExprKind::Local(_) | IrExprKind::Int(_, _) | IrExprKind::Float(_, _) => 0,
+    }
+}
+
+fn count_ir_structural_enum_ops(expr: &IrExpr) -> usize {
+    match &expr.kind {
+        IrExprKind::EnumCtor { args, .. } => {
+            1 + args.iter().map(count_ir_structural_enum_ops).sum::<usize>()
+        }
+        IrExprKind::EnumTag { value }
+        | IrExprKind::EnumChildBySlot { value, .. }
+        | IrExprKind::EnumNonRecField { value, .. } => 1 + count_ir_structural_enum_ops(value),
+        IrExprKind::Call { args, .. } => args.iter().map(count_ir_structural_enum_ops).sum(),
+        IrExprKind::Record(fields) => fields.values().map(count_ir_structural_enum_ops).sum(),
+        IrExprKind::Let { bindings, body } => {
+            bindings
+                .iter()
+                .map(|binding| count_ir_structural_enum_ops(&binding.expr))
+                .sum::<usize>()
+                + count_ir_structural_enum_ops(body)
+        }
+        IrExprKind::Local(_) | IrExprKind::Int(_, _) | IrExprKind::Float(_, _) => 0,
+    }
 }
 
 impl WasmExecutable {
@@ -1531,6 +1817,11 @@ fn load_prepared_args(bound: &mut BoundPreparedRun, args: &[Value]) -> Result<()
             Value::Record(_) => {
                 return Err(SimdError::new(
                     "prepared flattened input should not contain record values",
+                ));
+            }
+            Value::Tuple(_) => {
+                return Err(SimdError::new(
+                    "prepared flattened input should not contain tuple values",
                 ));
             }
             Value::Bool(_) => {
@@ -2273,6 +2564,7 @@ fn specialize_function_instance(
                         | Pattern::Char(_)
                         | Pattern::Bool(_)
                         | Pattern::Type(_)
+                        | Pattern::Tuple(_)
                         | Pattern::Ctor(_, _)
                         | Pattern::Slice { .. } => {
                             return Err(SimdError::new(format!(
@@ -2294,6 +2586,7 @@ fn specialize_function_instance(
                         | Pattern::Float(_)
                         | Pattern::Char(_)
                         | Pattern::Bool(_)
+                        | Pattern::Tuple(_)
                         | Pattern::Ctor(_, _)
                         | Pattern::Slice { .. } => {
                             return Err(SimdError::new(format!(
@@ -2384,7 +2677,7 @@ fn specialize_expr(
         },
         TypedExprKind::ConstructorRef { name } => {
             TypedExprKind::ConstructorRef { name: name.clone() }
-        },
+        }
         TypedExprKind::Int(value, prim) => match &ty {
             Type::Scalar(target_prim) if target_prim.is_int() => {
                 TypedExprKind::Int(*value, *target_prim)
@@ -2443,7 +2736,8 @@ fn specialize_expr(
                     )?;
                     if binding.name != "_" {
                         if matches!(rewritten_expr.ty, Type::Fun(_, _)) {
-                            if let Some(template) = extract_known_function_binding(&rewritten_expr) {
+                            if let Some(template) = extract_known_function_binding(&rewritten_expr)
+                            {
                                 next_fun_subst.insert(binding.name.clone(), template);
                             } else {
                                 next_fun_subst.remove(&binding.name);
@@ -2497,6 +2791,25 @@ fn specialize_expr(
                 })
                 .collect::<Result<BTreeMap<_, _>>>()?,
         ),
+        TypedExprKind::Tuple(items) => TypedExprKind::Tuple(
+            items
+                .iter()
+                .map(|item| {
+                    specialize_expr(
+                        item,
+                        type_subst,
+                        fun_subst,
+                        scope_types,
+                        current_function,
+                        originals,
+                        lambda_lifts,
+                        queue,
+                        scheduled_names,
+                        generic_instances,
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?,
+        ),
         TypedExprKind::Project { base, field } => TypedExprKind::Project {
             base: Box::new(specialize_expr(
                 base,
@@ -2511,6 +2824,21 @@ fn specialize_expr(
                 generic_instances,
             )?),
             field: field.clone(),
+        },
+        TypedExprKind::TupleProject { base, index } => TypedExprKind::TupleProject {
+            base: Box::new(specialize_expr(
+                base,
+                type_subst,
+                fun_subst,
+                scope_types,
+                current_function,
+                originals,
+                lambda_lifts,
+                queue,
+                scheduled_names,
+                generic_instances,
+            )?),
+            index: *index,
         },
         TypedExprKind::RecordUpdate { base, fields } => TypedExprKind::RecordUpdate {
             base: Box::new(specialize_expr(
@@ -2672,8 +3000,10 @@ fn extract_known_function_binding(expr: &TypedExpr) -> Option<KnownFunctionBindi
         | TypedExprKind::ConstructorRef { .. }
         | TypedExprKind::Lambda { .. }
         | TypedExprKind::Let { .. }
+        | TypedExprKind::Tuple(_)
         | TypedExprKind::Record(_)
         | TypedExprKind::Project { .. }
+        | TypedExprKind::TupleProject { .. }
         | TypedExprKind::RecordUpdate { .. }
         | TypedExprKind::Call { .. }
         | TypedExprKind::Int(_, _)
@@ -2780,16 +3110,12 @@ fn try_inline_lambda_result_call(
     if clause.patterns.len() != args.len() {
         return Ok(None);
     }
-    if clause
-        .patterns
-        .iter()
-        .any(|pattern| {
-            matches!(
-                pattern.pattern,
-                Pattern::Int(_) | Pattern::Float(_) | Pattern::Char(_) | Pattern::Slice { .. }
-            )
-        })
-    {
+    if clause.patterns.iter().any(|pattern| {
+        matches!(
+            pattern.pattern,
+            Pattern::Int(_) | Pattern::Float(_) | Pattern::Char(_) | Pattern::Slice { .. }
+        )
+    }) {
         return Ok(None);
     }
     let (param_types, _) = callee.signature.ty.fun_parts();
@@ -2844,6 +3170,7 @@ fn try_inline_lambda_result_call(
             | Pattern::Char(_)
             | Pattern::Bool(_)
             | Pattern::Type(_)
+            | Pattern::Tuple(_)
             | Pattern::Ctor(_, _)
             | Pattern::Slice { .. } => {
                 return Ok(None);
@@ -3154,6 +3481,11 @@ fn estimate_closure_env_bytes(ty: &Type) -> Result<usize> {
         Type::TypeToken(_) => Err(SimdError::new(
             "closure env does not support type witness captures",
         )),
+        Type::Tuple(items) => items
+            .iter()
+            .map(estimate_closure_env_bytes)
+            .collect::<Result<Vec<_>>>()
+            .map(|items| items.into_iter().sum()),
         Type::Record(fields) => fields
             .values()
             .map(estimate_closure_env_bytes)
@@ -3442,6 +3774,10 @@ fn mangle_type(ty: &Type) -> String {
             shape.0.iter().map(mangle_dim).collect::<Vec<_>>().join("")
         ),
         Type::TypeToken(inner) => format!("t{}", mangle_type(inner)),
+        Type::Tuple(items) => format!(
+            "p{}",
+            items.iter().map(mangle_type).collect::<Vec<_>>().join("_")
+        ),
         Type::Record(fields) => format!(
             "r{}",
             fields
@@ -3478,6 +3814,7 @@ fn type_contains_unresolved_vars(ty: &Type) -> bool {
         Type::Scalar(_) | Type::Bulk(_, _) => false,
         Type::Named(_, args) => args.iter().any(type_contains_unresolved_vars),
         Type::TypeToken(inner) => type_contains_unresolved_vars(inner),
+        Type::Tuple(items) => items.iter().any(type_contains_unresolved_vars),
         Type::Record(fields) => fields.values().any(type_contains_unresolved_vars),
         Type::Fun(args, ret) => {
             args.iter().any(type_contains_unresolved_vars) || type_contains_unresolved_vars(ret)
@@ -3538,7 +3875,7 @@ fn eliminate_non_escaping_lambdas_expr(
         TypedExprKind::FunctionRef { name } => TypedExprKind::FunctionRef { name: name.clone() },
         TypedExprKind::ConstructorRef { name } => {
             TypedExprKind::ConstructorRef { name: name.clone() }
-        },
+        }
         TypedExprKind::Int(value, prim) => TypedExprKind::Int(*value, *prim),
         TypedExprKind::Float(value, prim) => TypedExprKind::Float(*value, *prim),
         TypedExprKind::Bool(value) => TypedExprKind::Bool(*value),
@@ -3643,6 +3980,12 @@ fn eliminate_non_escaping_lambdas_expr(
                 })
                 .collect::<Result<BTreeMap<_, _>>>()?,
         ),
+        TypedExprKind::Tuple(items) => TypedExprKind::Tuple(
+            items
+                .iter()
+                .map(|item| eliminate_non_escaping_lambdas_expr(item, lambda_env, scope_types))
+                .collect::<Result<Vec<_>>>()?,
+        ),
         TypedExprKind::Project { base, field } => TypedExprKind::Project {
             base: Box::new(eliminate_non_escaping_lambdas_expr(
                 base,
@@ -3650,6 +3993,14 @@ fn eliminate_non_escaping_lambdas_expr(
                 scope_types,
             )?),
             field: field.clone(),
+        },
+        TypedExprKind::TupleProject { base, index } => TypedExprKind::TupleProject {
+            base: Box::new(eliminate_non_escaping_lambdas_expr(
+                base,
+                lambda_env,
+                scope_types,
+            )?),
+            index: *index,
         },
         TypedExprKind::RecordUpdate { base, fields } => TypedExprKind::RecordUpdate {
             base: Box::new(eliminate_non_escaping_lambdas_expr(
@@ -3782,7 +4133,14 @@ fn collect_free_locals(
                 collect_free_locals(value, bound, free);
             }
         }
-        TypedExprKind::Project { base, .. } => collect_free_locals(base, bound, free),
+        TypedExprKind::Tuple(items) => {
+            for item in items {
+                collect_free_locals(item, bound, free);
+            }
+        }
+        TypedExprKind::Project { base, .. } | TypedExprKind::TupleProject { base, .. } => {
+            collect_free_locals(base, bound, free)
+        }
         TypedExprKind::RecordUpdate { base, fields } => {
             collect_free_locals(base, bound, free);
             for value in fields.values() {
@@ -3822,7 +4180,7 @@ fn rename_free_locals(
         TypedExprKind::FunctionRef { name } => TypedExprKind::FunctionRef { name: name.clone() },
         TypedExprKind::ConstructorRef { name } => {
             TypedExprKind::ConstructorRef { name: name.clone() }
-        },
+        }
         TypedExprKind::Int(value, prim) => TypedExprKind::Int(*value, *prim),
         TypedExprKind::Float(value, prim) => TypedExprKind::Float(*value, *prim),
         TypedExprKind::Bool(value) => TypedExprKind::Bool(*value),
@@ -3860,9 +4218,19 @@ fn rename_free_locals(
                 .map(|(name, value)| Ok((name.clone(), rename_free_locals(value, mapping, bound)?)))
                 .collect::<Result<BTreeMap<_, _>>>()?,
         ),
+        TypedExprKind::Tuple(items) => TypedExprKind::Tuple(
+            items
+                .iter()
+                .map(|item| rename_free_locals(item, mapping, bound))
+                .collect::<Result<Vec<_>>>()?,
+        ),
         TypedExprKind::Project { base, field } => TypedExprKind::Project {
             base: Box::new(rename_free_locals(base, mapping, bound)?),
             field: field.clone(),
+        },
+        TypedExprKind::TupleProject { base, index } => TypedExprKind::TupleProject {
+            base: Box::new(rename_free_locals(base, mapping, bound)?),
+            index: *index,
         },
         TypedExprKind::RecordUpdate { base, fields } => TypedExprKind::RecordUpdate {
             base: Box::new(rename_free_locals(base, mapping, bound)?),
@@ -3938,7 +4306,14 @@ fn collect_used_locals(expr: &TypedExpr, names: &mut BTreeSet<String>) {
                 collect_used_locals(value, names);
             }
         }
-        TypedExprKind::Project { base, .. } => collect_used_locals(base, names),
+        TypedExprKind::Tuple(items) => {
+            for item in items {
+                collect_used_locals(item, names);
+            }
+        }
+        TypedExprKind::Project { base, .. } | TypedExprKind::TupleProject { base, .. } => {
+            collect_used_locals(base, names)
+        }
         TypedExprKind::RecordUpdate { base, fields } => {
             collect_used_locals(base, names);
             for value in fields.values() {
@@ -4013,7 +4388,7 @@ fn canonicalize_backend_higher_order_expr(
         TypedExprKind::FunctionRef { name } => TypedExprKind::FunctionRef { name: name.clone() },
         TypedExprKind::ConstructorRef { name } => {
             TypedExprKind::ConstructorRef { name: name.clone() }
-        },
+        }
         TypedExprKind::Int(value, prim) => TypedExprKind::Int(*value, *prim),
         TypedExprKind::Float(value, prim) => TypedExprKind::Float(*value, *prim),
         TypedExprKind::Bool(value) => TypedExprKind::Bool(*value),
@@ -4070,6 +4445,14 @@ fn canonicalize_backend_higher_order_expr(
                 })
                 .collect::<Result<BTreeMap<_, _>>>()?,
         ),
+        TypedExprKind::Tuple(items) => TypedExprKind::Tuple(
+            items
+                .iter()
+                .map(|item| {
+                    canonicalize_backend_higher_order_expr(item, known_functions, signatures)
+                })
+                .collect::<Result<Vec<_>>>()?,
+        ),
         TypedExprKind::Project { base, field } => TypedExprKind::Project {
             base: Box::new(canonicalize_backend_higher_order_expr(
                 base,
@@ -4077,6 +4460,14 @@ fn canonicalize_backend_higher_order_expr(
                 signatures,
             )?),
             field: field.clone(),
+        },
+        TypedExprKind::TupleProject { base, index } => TypedExprKind::TupleProject {
+            base: Box::new(canonicalize_backend_higher_order_expr(
+                base,
+                known_functions,
+                signatures,
+            )?),
+            index: *index,
         },
         TypedExprKind::RecordUpdate { base, fields } => TypedExprKind::RecordUpdate {
             base: Box::new(canonicalize_backend_higher_order_expr(
@@ -4170,8 +4561,10 @@ fn classify_function_value_expr_for_backend(expr: &TypedExpr) -> FunctionValueCl
         | TypedExprKind::Char(_)
         | TypedExprKind::String(_)
         | TypedExprKind::TypeToken(_)
+        | TypedExprKind::Tuple(_)
         | TypedExprKind::Record(_)
         | TypedExprKind::Project { .. }
+        | TypedExprKind::TupleProject { .. }
         | TypedExprKind::RecordUpdate { .. } => FunctionValueClass::EscapingUnknown,
     }
 }
@@ -4286,6 +4679,12 @@ fn apply_type_subst(ty: &Type, subst: &BTreeMap<String, Type>) -> Type {
     match ty {
         Type::Var(name) => subst.get(name).cloned().unwrap_or_else(|| ty.clone()),
         Type::Scalar(_) | Type::Bulk(_, _) | Type::Infer(_) => ty.clone(),
+        Type::Tuple(items) => Type::Tuple(
+            items
+                .iter()
+                .map(|item| apply_type_subst(item, subst))
+                .collect(),
+        ),
         Type::Named(name, args) => Type::Named(
             name.clone(),
             args.iter()
@@ -4340,6 +4739,18 @@ fn collect_type_var_bindings(
             }
             _ => Err(SimdError::new(format!(
                 "specialization expected bulk {:?}, found {:?}",
+                template, actual
+            ))),
+        },
+        Type::Tuple(left_items) => match actual {
+            Type::Tuple(right_items) if left_items.len() == right_items.len() => {
+                for (left_item, right_item) in left_items.iter().zip(right_items.iter()) {
+                    collect_type_var_bindings(left_item, right_item, subst)?;
+                }
+                Ok(())
+            }
+            _ => Err(SimdError::new(format!(
+                "specialization expected tuple {:?}, found {:?}",
                 template, actual
             ))),
         },
@@ -4408,6 +4819,12 @@ fn specialization_arg_type(arg: &TypedArg) -> Result<Type> {
 fn lane_scalar_type(ty: &Type) -> Result<Type> {
     match ty {
         Type::Bulk(prim, _) => Ok(Type::Scalar(*prim)),
+        Type::Tuple(items) => Ok(Type::Tuple(
+            items
+                .iter()
+                .map(lane_scalar_type)
+                .collect::<Result<Vec<_>>>()?,
+        )),
         Type::Record(fields) => Ok(Type::Record(
             fields
                 .iter()
@@ -4568,12 +4985,24 @@ fn collect_higher_order_expr_counts(
                 );
             }
         }
-        TypedExprKind::Project { base, .. } => collect_higher_order_expr_counts(
-            base,
-            known_fn_values,
-            known_lambda_values,
-            escaping_unknown_values,
-        ),
+        TypedExprKind::Tuple(items) => {
+            for item in items {
+                collect_higher_order_expr_counts(
+                    item,
+                    known_fn_values,
+                    known_lambda_values,
+                    escaping_unknown_values,
+                );
+            }
+        }
+        TypedExprKind::Project { base, .. } | TypedExprKind::TupleProject { base, .. } => {
+            collect_higher_order_expr_counts(
+                base,
+                known_fn_values,
+                known_lambda_values,
+                escaping_unknown_values,
+            )
+        }
         TypedExprKind::RecordUpdate { base, fields } => {
             collect_higher_order_expr_counts(
                 base,
@@ -4639,8 +5068,11 @@ fn typed_expr_contains_lambda_or_apply(expr: &TypedExpr) -> bool {
                 .any(|binding| typed_expr_contains_lambda_or_apply(&binding.expr))
                 || typed_expr_contains_lambda_or_apply(body)
         }
+        TypedExprKind::Tuple(items) => items.iter().any(typed_expr_contains_lambda_or_apply),
         TypedExprKind::Record(fields) => fields.values().any(typed_expr_contains_lambda_or_apply),
-        TypedExprKind::Project { base, .. } => typed_expr_contains_lambda_or_apply(base),
+        TypedExprKind::Project { base, .. } | TypedExprKind::TupleProject { base, .. } => {
+            typed_expr_contains_lambda_or_apply(base)
+        }
         TypedExprKind::RecordUpdate { base, fields } => {
             typed_expr_contains_lambda_or_apply(base)
                 || fields.values().any(typed_expr_contains_lambda_or_apply)
@@ -4669,8 +5101,11 @@ fn typed_expr_contains_fun_local(expr: &TypedExpr) -> bool {
                 .any(|binding| typed_expr_contains_fun_local(&binding.expr))
                 || typed_expr_contains_fun_local(body)
         }
+        TypedExprKind::Tuple(items) => items.iter().any(typed_expr_contains_fun_local),
         TypedExprKind::Record(fields) => fields.values().any(typed_expr_contains_fun_local),
-        TypedExprKind::Project { base, .. } => typed_expr_contains_fun_local(base),
+        TypedExprKind::Project { base, .. } | TypedExprKind::TupleProject { base, .. } => {
+            typed_expr_contains_fun_local(base)
+        }
         TypedExprKind::RecordUpdate { base, fields } => {
             typed_expr_contains_fun_local(base)
                 || fields.values().any(typed_expr_contains_fun_local)
@@ -4727,9 +5162,19 @@ fn compile_wasm_artifact_checked(
         .ok_or_else(|| SimdError::new(format!("unknown entry function '{}'", main)))?;
     let mut plan = build_wasm_plan(checked_program, main)?;
     let normalized = normalize_records(&plan.checked)?;
-    let lowered_program = optimize_lowered_program(&lower_program(&normalized)?);
+    let lowered_program = optimize_lowered_program(&prepare_lowered_program(&normalized)?);
     let grouped_program = group_lowered_program(&normalized, &lowered_program)?;
     let intent_analysis = analyze_intents(&grouped_program);
+    let structural_analysis = analyze_structural_clusters(&lowered_program);
+    let structural_membership = structural_cluster_membership(&structural_analysis);
+    let structural_candidates = lowered_program
+        .functions
+        .iter()
+        .filter(|function| {
+            matches!(function.kind, LoweredKind::Structural { .. }) || function.tail_loop.is_some()
+        })
+        .map(|function| function.name.clone())
+        .collect::<BTreeSet<_>>();
     let lowered_map: BTreeMap<_, _> = lowered_program
         .functions
         .iter()
@@ -4826,24 +5271,69 @@ fn compile_wasm_artifact_checked(
         let lowered = lowered_map.get(&function.name).copied().ok_or_else(|| {
             SimdError::new(format!("missing lowered function '{}'", function.name))
         })?;
+        let structural_cluster = structural_membership.get(&function.name);
         let intent = intent_by_leaf
             .get(&function.name)
             .map(|report| report.intent.clone())
-            .unwrap_or(IntentClass::Fallback);
+            .unwrap_or_else(|| {
+                if matches!(lowered.kind, LoweredKind::Structural { .. })
+                    || structural_cluster.is_some()
+                    || lowered_calls_structural_candidate(lowered, &structural_candidates)
+                {
+                    IntentClass::Structural
+                } else if lowered.tail_loop.is_some() {
+                    IntentClass::ScalarTailRec
+                } else {
+                    IntentClass::Fallback
+                }
+            });
+        let (structural_scc, structural_state_count, structural_transition_count, structural_span_ops, structural_enum_ops) =
+            structural_report_fields(lowered, structural_cluster);
         let wasm_function = match lowered.kind {
-            LoweredKind::Scalar { .. } | LoweredKind::Structural { .. } => {
+            LoweredKind::Scalar { .. } => {
                 optimizer_reports.push(WasmOptimizationReport {
                     function: function.name.clone(),
-                    intent: if lowered.tail_loop.is_some() {
+                    intent: if intent == IntentClass::Structural {
+                        IntentClass::Structural
+                    } else if lowered.tail_loop.is_some() {
                         IntentClass::ScalarTailRec
                     } else {
                         intent
                     },
+                    structural_exec: StructuralExecMode::Scalar,
                     vectorizable: false,
                     vector_unroll: 0,
                     fallback_reason: None,
+                    structural_scc,
+                    structural_state_count,
+                    structural_transition_count,
+                    structural_span_ops,
+                    structural_enum_ops,
                 });
                 compile_scalar_function(
+                    lowered,
+                    function,
+                    &plan.checked.enum_ctors,
+                    &wasm_enum_layouts,
+                    &scalar_indices,
+                    &signatures,
+                )?
+            }
+            LoweredKind::Structural { .. } => {
+                optimizer_reports.push(WasmOptimizationReport {
+                    function: function.name.clone(),
+                    intent: IntentClass::Structural,
+                    structural_exec: StructuralExecMode::StructuralLoop,
+                    vectorizable: false,
+                    vector_unroll: 0,
+                    fallback_reason: None,
+                    structural_scc,
+                    structural_state_count,
+                    structural_transition_count,
+                    structural_span_ops,
+                    structural_enum_ops,
+                });
+                compile_structural_function(
                     lowered,
                     function,
                     &plan.checked.enum_ctors,
@@ -5901,9 +6391,15 @@ fn compile_grouped_kernel_function(
         report: WasmOptimizationReport {
             function: format!("{}{:?}", group.source_name, group.leaf_paths),
             intent,
+            structural_exec: StructuralExecMode::Scalar,
             vectorizable: !matches!(vector_plan, VectorPlan::ScalarOnly),
             vector_unroll: vector_plan_unroll(vector_plan),
             fallback_reason,
+            structural_scc: None,
+            structural_state_count: 0,
+            structural_transition_count: 0,
+            structural_span_ops: 0,
+            structural_enum_ops: 0,
         },
     }))
 }
@@ -6062,7 +6558,7 @@ fn try_inline_grouped_leaf_call(
     }
     let clauses = match &lowered.kind {
         LoweredKind::Scalar { clauses }
-        | LoweredKind::Structural { clauses }
+        | LoweredKind::Structural { clauses, .. }
         | LoweredKind::Kernel { clauses, .. } => clauses,
     };
     if clauses.len() != 1 {
@@ -6070,15 +6566,12 @@ fn try_inline_grouped_leaf_call(
     }
     let clause = &clauses[0];
     if clause.patterns.len() != args.len()
-        || clause
-            .patterns
-            .iter()
-            .any(|pattern| {
-                matches!(
-                    pattern.pattern,
-                    Pattern::Int(_) | Pattern::Float(_) | Pattern::Char(_) | Pattern::Slice { .. }
-                )
-            })
+        || clause.patterns.iter().any(|pattern| {
+            matches!(
+                pattern.pattern,
+                Pattern::Int(_) | Pattern::Float(_) | Pattern::Char(_) | Pattern::Slice { .. }
+            )
+        })
     {
         return Ok(None);
     }
@@ -6103,9 +6596,7 @@ fn ir_expr_node_count(expr: &IrExpr) -> usize {
     match &expr.kind {
         IrExprKind::Local(_) | IrExprKind::Int(_, _) | IrExprKind::Float(_, _) => 1,
         IrExprKind::Record(fields) => 1 + fields.values().map(ir_expr_node_count).sum::<usize>(),
-        IrExprKind::EnumCtor { args, .. } => {
-            1 + args.iter().map(ir_expr_node_count).sum::<usize>()
-        }
+        IrExprKind::EnumCtor { args, .. } => 1 + args.iter().map(ir_expr_node_count).sum::<usize>(),
         IrExprKind::EnumTag { value }
         | IrExprKind::EnumChildBySlot { value, .. }
         | IrExprKind::EnumNonRecField { value, .. } => 1 + ir_expr_node_count(value),
@@ -6263,7 +6754,13 @@ fn scalar_signature(function: &CheckedFunction) -> Result<(Vec<ValType>, Option<
             Type::Named(name, args) if is_wasm_enum_named_type(&name, &args) => {
                 expanded_params.push(ValType::I32);
             }
-            Type::Record(_) | Type::Var(_) | Type::Infer(_) | Type::TypeToken(_) | Type::Named(_, _) | Type::Fun(_, _) => {
+            Type::Tuple(_)
+            | Type::Record(_)
+            | Type::Var(_)
+            | Type::Infer(_)
+            | Type::TypeToken(_)
+            | Type::Named(_, _)
+            | Type::Fun(_, _) => {
                 // Already validated above; keep original error path.
                 return Err(SimdError::new(format!(
                     "scalar Wasm function '{}' has unsupported parameter form after validation",
@@ -6275,9 +6772,9 @@ fn scalar_signature(function: &CheckedFunction) -> Result<(Vec<ValType>, Option<
     let result = match result {
         Type::Scalar(prim) => Some(wasm_val_type(prim)),
         Type::Named(name, args) if is_wasm_enum_named_type(&name, &args) => Some(ValType::I32),
-        Type::Record(_) => {
+        Type::Tuple(_) | Type::Record(_) => {
             return Err(SimdError::new(format!(
-                "scalar Wasm function '{}' cannot return records",
+                "scalar Wasm function '{}' cannot return tuple/record products",
                 function.name
             )));
         }
@@ -6322,9 +6819,9 @@ fn entry_signature(function: &CheckedFunction) -> Result<(Vec<ValType>, Option<V
                     "Wasm backend does not support Type witness entry parameters",
                 ));
             }
-            Type::Record(_) => {
+            Type::Tuple(_) | Type::Record(_) => {
                 return Err(SimdError::new(
-                    "Wasm backend does not yet support record entry parameters",
+                    "Wasm backend does not yet support tuple/record entry parameters",
                 ));
             }
             Type::Named(_, _) | Type::Var(_) | Type::Infer(_) => {
@@ -6357,9 +6854,9 @@ fn entry_signature(function: &CheckedFunction) -> Result<(Vec<ValType>, Option<V
                 "Wasm backend does not support Type witness entry results",
             ));
         }
-        Type::Record(_) => {
+        Type::Tuple(_) | Type::Record(_) => {
             return Err(SimdError::new(
-                "Wasm backend does not yet support record entry results",
+                "Wasm backend does not yet support tuple/record entry results",
             ));
         }
         Type::Named(_, _) | Type::Var(_) | Type::Infer(_) => {
@@ -6534,7 +7031,7 @@ fn compile_scalar_function(
     let mut shared_named_locals = BTreeMap::<String, (u32, Type)>::new();
     match (&lowered.kind, tail_loop) {
         (LoweredKind::Scalar { clauses: _ }, Some(tail_loop))
-        | (LoweredKind::Structural { clauses: _ }, Some(tail_loop)) => {
+        | (LoweredKind::Structural { clauses: _, .. }, Some(tail_loop)) => {
             for clause in &tail_loop.clauses {
                 let map = build_clause_local_map(
                     &clause.patterns,
@@ -6547,7 +7044,7 @@ fn compile_scalar_function(
             }
         }
         (LoweredKind::Scalar { clauses }, None)
-        | (LoweredKind::Structural { clauses }, None) => {
+        | (LoweredKind::Structural { clauses, .. }, None) => {
             for clause in clauses {
                 let map = build_clause_local_map(
                     &clause.patterns,
@@ -6578,7 +7075,7 @@ fn compile_scalar_function(
 
     match (&lowered.kind, tail_loop) {
         (LoweredKind::Scalar { clauses: _ }, Some(tail_loop))
-        | (LoweredKind::Structural { clauses: _ }, Some(tail_loop)) => {
+        | (LoweredKind::Structural { clauses: _, .. }, Some(tail_loop)) => {
             let result_local =
                 result_local.ok_or_else(|| SimdError::new("missing tail-loop result local"))?;
             function.instruction(&Instruction::Block(BlockType::Empty));
@@ -6654,7 +7151,7 @@ fn compile_scalar_function(
             function.instruction(&Instruction::LocalGet(result_local));
         }
         (LoweredKind::Scalar { clauses }, None)
-        | (LoweredKind::Structural { clauses }, None) => {
+        | (LoweredKind::Structural { clauses, .. }, None) => {
             for clause in clauses {
                 let locals = clause_locals
                     .get(&(clause as *const _ as usize))
@@ -6723,6 +7220,315 @@ fn compile_scalar_function(
     Ok(function)
 }
 
+fn emit_structural_state_action(
+    function: &mut Function,
+    action: &StructuralAction,
+    locals: &BTreeMap<String, u32>,
+    temp_locals: &[(u32, u32)],
+    param_local_ranges: &[(u32, u32)],
+    loop_branch_depth: u32,
+    state_local: u32,
+    scalar_indices: &BTreeMap<String, u32>,
+    signatures: &BTreeMap<String, &CheckedFunction>,
+    enum_ctors: &BTreeMap<String, EnumCtorInfo>,
+    wasm_enum_layouts: &BTreeMap<String, WasmEnumLayout>,
+    enum_state: EnumWasmState,
+) -> Result<()> {
+    match action {
+        StructuralAction::Transition { state, args } => {
+            for ((temp_local, width), arg) in temp_locals.iter().zip(args) {
+                compile_scalar_ir_expr(
+                    function,
+                    arg,
+                    locals,
+                    scalar_indices,
+                    signatures,
+                    enum_ctors,
+                    wasm_enum_layouts,
+                    Some(enum_state),
+                )?;
+                if *width == 2 {
+                    function.instruction(&Instruction::LocalSet(*temp_local + 1));
+                }
+                function.instruction(&Instruction::LocalSet(*temp_local));
+            }
+            for ((temp_local, width), (param_local, _)) in
+                temp_locals.iter().zip(param_local_ranges.iter())
+            {
+                function.instruction(&Instruction::LocalGet(*temp_local));
+                function.instruction(&Instruction::LocalSet(*param_local));
+                if *width == 2 {
+                    function.instruction(&Instruction::LocalGet(*temp_local + 1));
+                    function.instruction(&Instruction::LocalSet(*param_local + 1));
+                }
+            }
+            function.instruction(&Instruction::I32Const(*state as i32));
+            function.instruction(&Instruction::LocalSet(state_local));
+            function.instruction(&Instruction::Br(loop_branch_depth));
+        }
+        StructuralAction::Return { expr } => {
+            emit_tail_position_scalar_return(
+                function,
+                expr,
+                locals,
+                scalar_indices,
+                signatures,
+                enum_ctors,
+                wasm_enum_layouts,
+                Some(enum_state),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn compile_structural_function(
+    lowered: &LoweredFunction,
+    checked: &CheckedFunction,
+    enum_ctors: &BTreeMap<String, EnumCtorInfo>,
+    wasm_enum_layouts: &BTreeMap<String, WasmEnumLayout>,
+    scalar_indices: &BTreeMap<String, u32>,
+    signatures: &BTreeMap<String, &CheckedFunction>,
+) -> Result<Function> {
+    let (param_types, result_ty) = checked.signature.ty.fun_parts();
+    let LoweredKind::Structural { program, .. } = &lowered.kind else {
+        return Err(SimdError::new(format!(
+            "compile_structural_function received non-structural '{}'",
+            checked.name
+        )));
+    };
+    let result_val_type = match result_ty {
+        Type::Scalar(prim) => wasm_val_type(prim),
+        Type::Named(name, args) if is_wasm_enum_named_type(&name, &args) => ValType::I32,
+        other => {
+            return Err(SimdError::new(format!(
+                "structural function '{}' has unsupported result {:?}",
+                checked.name, other
+            )));
+        }
+    };
+    let mut locals = Vec::<(u32, ValType)>::new();
+    let mut next_local = 0u32;
+    let mut param_local_ranges = Vec::<(u32, u32)>::new();
+    for ty in &param_types {
+        let width = if is_wasm_bulk_like_type(ty) { 2 } else { 1 };
+        param_local_ranges.push((next_local, width));
+        next_local += width;
+    }
+    let mut temp_locals = Vec::new();
+    for ty in &param_types {
+        let start_local = next_local;
+        if is_wasm_bulk_like_type(ty) {
+            next_local += 2;
+            locals.push((2, ValType::I32));
+            temp_locals.push((start_local, 2));
+            continue;
+        }
+        let val_type = match ty {
+            Type::Scalar(prim) => Ok(wasm_val_type(*prim)),
+            Type::Named(name, args) if is_wasm_enum_named_type(name, args) => Ok(ValType::I32),
+            Type::Record(_) => Err(SimdError::new(format!(
+                "structural function '{}' has unsupported record parameters",
+                checked.name
+            ))),
+            other => Err(SimdError::new(format!(
+                "structural function '{}' has unsupported parameter {:?}",
+                checked.name, other
+            ))),
+        }?;
+        next_local += 1;
+        locals.push((1, val_type));
+        temp_locals.push((start_local, 1));
+    }
+    let state_local = next_local;
+    next_local += 1;
+    locals.push((1, ValType::I32));
+    let _result_local = result_val_type;
+    let enum_ptr_local = next_local;
+    next_local += 1;
+    locals.push((1, ValType::I32));
+    let enum_base_local = next_local;
+    next_local += 1;
+    locals.push((1, ValType::I32));
+    let enum_save_sp_local = next_local;
+    next_local += 1;
+    locals.push((1, ValType::I32));
+    let enum_base_tmp_local = next_local;
+    next_local += 1;
+    locals.push((1, ValType::I32));
+    let enum_scratch_sp_local = next_local;
+    next_local += 1;
+    locals.push((1, ValType::I32));
+    let enum_alloc_end_local = next_local;
+    next_local += 1;
+    locals.push((1, ValType::I32));
+    let enum_alloc_capacity_local = next_local;
+    next_local += 1;
+    locals.push((1, ValType::I32));
+    let enum_alloc_delta_local = next_local;
+    next_local += 1;
+    locals.push((1, ValType::I32));
+    let enum_aux0_local = next_local;
+    next_local += 1;
+    locals.push((1, ValType::I32));
+    let enum_aux1_local = next_local;
+    next_local += 1;
+    locals.push((1, ValType::I32));
+    let enum_aux2_local = next_local;
+    next_local += 1;
+    locals.push((1, ValType::I32));
+    let enum_aux3_local = next_local;
+    next_local += 1;
+    locals.push((1, ValType::I32));
+    let enum_aux4_local = next_local;
+    next_local += 1;
+    locals.push((1, ValType::I32));
+    let enum_aux5_local = next_local;
+    next_local += 1;
+    locals.push((1, ValType::I32));
+    let enum_aux6_local = next_local;
+    next_local += 1;
+    locals.push((1, ValType::I32));
+    let enum_aux7_local = next_local;
+    next_local += 1;
+    locals.push((1, ValType::I32));
+    let enum_aux8_local = next_local;
+    next_local += 1;
+    locals.push((1, ValType::I32));
+    let mut enum_child_locals = [0u32; 8];
+    for local in &mut enum_child_locals {
+        *local = next_local;
+        next_local += 1;
+        locals.push((1, ValType::I32));
+    }
+    let enum_state = EnumWasmState {
+        ptr_local: enum_ptr_local,
+        base_local: enum_base_local,
+        save_sp_local: enum_save_sp_local,
+        base_tmp_local: enum_base_tmp_local,
+        scratch_sp_local: enum_scratch_sp_local,
+        alloc_end_local: enum_alloc_end_local,
+        alloc_capacity_local: enum_alloc_capacity_local,
+        alloc_delta_local: enum_alloc_delta_local,
+        aux0_local: enum_aux0_local,
+        aux1_local: enum_aux1_local,
+        aux2_local: enum_aux2_local,
+        aux3_local: enum_aux3_local,
+        aux4_local: enum_aux4_local,
+        aux5_local: enum_aux5_local,
+        aux6_local: enum_aux6_local,
+        aux7_local: enum_aux7_local,
+        aux8_local: enum_aux8_local,
+        child_locals: enum_child_locals,
+    };
+
+    let mut state_locals = BTreeMap::<usize, BTreeMap<String, u32>>::new();
+    let mut shared_named_locals = BTreeMap::<String, (u32, Type)>::new();
+    for (index, state) in program.states.iter().enumerate() {
+        let map = build_clause_local_map(
+            &state.patterns,
+            &mut locals,
+            &mut next_local,
+            &mut shared_named_locals,
+            enum_ctors,
+        )?;
+        state_locals.insert(index, map);
+    }
+
+    let mut function = Function::new(locals);
+    function.instruction(&Instruction::I32Const(ENUM_SAVE_STACK_PTR_ADDR as i32));
+    function.instruction(&Instruction::I32Load(memarg(0, 2)));
+    function.instruction(&Instruction::LocalTee(enum_state.scratch_sp_local));
+    function.instruction(&Instruction::I32Eqz);
+    function.instruction(&Instruction::If(BlockType::Empty));
+    function.instruction(&Instruction::I32Const(ENUM_SAVE_STACK_START));
+    function.instruction(&Instruction::LocalSet(enum_state.scratch_sp_local));
+    function.instruction(&Instruction::End);
+    function.instruction(&Instruction::I32Const(program.entry_state as i32));
+    function.instruction(&Instruction::LocalSet(state_local));
+    function.instruction(&Instruction::Loop(BlockType::Empty));
+    for _ in (0..program.states.len()).rev() {
+        function.instruction(&Instruction::Block(BlockType::Empty));
+    }
+    function.instruction(&Instruction::LocalGet(state_local));
+    function.instruction(&Instruction::BrTable(
+        (0..program.states.len() as u32).collect(),
+        program.states.len() as u32,
+    ));
+    for (index, state) in program.states.iter().enumerate() {
+        let locals = state_locals.get(&index).cloned().unwrap_or_default();
+        let loop_branch_depth = (program.states.len() - index - 1) as u32;
+        function.instruction(&Instruction::End);
+        if clause_has_condition(&state.patterns, enum_ctors) {
+            emit_matching_if(
+                &mut function,
+                &state.patterns,
+                enum_ctors,
+                wasm_enum_layouts,
+                Some(enum_state),
+            )?;
+            emit_clause_bindings(
+                &mut function,
+                &state.patterns,
+                &locals,
+                enum_ctors,
+                wasm_enum_layouts,
+                Some(enum_state),
+            )?;
+            emit_structural_state_action(
+                &mut function,
+                &state.on_match,
+                &locals,
+                &temp_locals,
+                &param_local_ranges,
+                loop_branch_depth + 1,
+                state_local,
+                scalar_indices,
+                signatures,
+                enum_ctors,
+                wasm_enum_layouts,
+                enum_state,
+            )?;
+            function.instruction(&Instruction::End);
+            if let Some(next_state) = state.on_miss {
+                function.instruction(&Instruction::I32Const(next_state as i32));
+                function.instruction(&Instruction::LocalSet(state_local));
+                function.instruction(&Instruction::Br(loop_branch_depth));
+            } else {
+                function.instruction(&Instruction::Unreachable);
+            }
+        } else {
+            emit_clause_bindings(
+                &mut function,
+                &state.patterns,
+                &locals,
+                enum_ctors,
+                wasm_enum_layouts,
+                Some(enum_state),
+            )?;
+            emit_structural_state_action(
+                &mut function,
+                &state.on_match,
+                &locals,
+                &temp_locals,
+                &param_local_ranges,
+                loop_branch_depth,
+                state_local,
+                scalar_indices,
+                signatures,
+                enum_ctors,
+                wasm_enum_layouts,
+                enum_state,
+            )?;
+        }
+    }
+    function.instruction(&Instruction::Unreachable);
+    function.instruction(&Instruction::End);
+    function.instruction(&Instruction::Unreachable);
+    function.instruction(&Instruction::End);
+    Ok(function)
+}
+
 fn compile_kernel_entry(
     lowered: &LoweredFunction,
     checked: &CheckedFunction,
@@ -6783,9 +7589,9 @@ fn compile_kernel_entry(
                     "Wasm backend does not support Type witness kernel parameters",
                 ));
             }
-            Type::Record(_) => {
+            Type::Tuple(_) | Type::Record(_) => {
                 return Err(SimdError::new(
-                    "Wasm backend does not yet support record kernel parameters",
+                    "Wasm backend does not yet support tuple/record kernel parameters",
                 ));
             }
             Type::Named(_, _) | Type::Var(_) | Type::Infer(_) => {
@@ -7291,9 +8097,15 @@ fn compile_kernel_entry(
         report: WasmOptimizationReport {
             function: checked.name.clone(),
             intent,
+            structural_exec: StructuralExecMode::Scalar,
             vectorizable: !matches!(vector_plan, VectorPlan::ScalarOnly),
             vector_unroll: vector_plan_unroll(vector_plan),
             fallback_reason,
+            structural_scc: None,
+            structural_state_count: 0,
+            structural_transition_count: 0,
+            structural_span_ops: 0,
+            structural_enum_ops: 0,
         },
     })
 }
@@ -7795,7 +8607,10 @@ fn emit_enum_tag_load_from_value(
 ) {
     emit_enum_load_header_root(function, value_local, enum_state);
     function.instruction(&Instruction::LocalGet(enum_state.base_local));
-    function.instruction(&Instruction::I32Load(memarg(ENUM_HEADER_TAGS_PTR_OFFSET, 2)));
+    function.instruction(&Instruction::I32Load(memarg(
+        ENUM_HEADER_TAGS_PTR_OFFSET,
+        2,
+    )));
     function.instruction(&Instruction::LocalGet(enum_state.save_sp_local));
     function.instruction(&Instruction::I32Const(ENUM_TAG_BYTES));
     function.instruction(&Instruction::I32Mul);
@@ -7816,7 +8631,10 @@ fn emit_enum_child_root(
     function.instruction(&Instruction::LocalSet(enum_state.base_tmp_local));
     for _ in 0..recursive_slot {
         function.instruction(&Instruction::LocalGet(enum_state.base_local));
-        function.instruction(&Instruction::I32Load(memarg(ENUM_HEADER_ENDS_PTR_OFFSET, 2)));
+        function.instruction(&Instruction::I32Load(memarg(
+            ENUM_HEADER_ENDS_PTR_OFFSET,
+            2,
+        )));
         function.instruction(&Instruction::LocalGet(enum_state.base_tmp_local));
         function.instruction(&Instruction::I32Const(ENUM_END_BYTES));
         function.instruction(&Instruction::I32Mul);
@@ -7846,7 +8664,10 @@ fn emit_enum_row_base_ptr_from_header(
     _enum_state: EnumWasmState,
 ) {
     function.instruction(&Instruction::LocalGet(header_local));
-    function.instruction(&Instruction::I32Load(memarg(ENUM_HEADER_CTOR_TABLE_PTR_OFFSET, 2)));
+    function.instruction(&Instruction::I32Load(memarg(
+        ENUM_HEADER_CTOR_TABLE_PTR_OFFSET,
+        2,
+    )));
     function.instruction(&Instruction::I32Const(
         i32::from(ctor_layout.tag) * ENUM_CTOR_TABLE_ENTRY_BYTES
             + ENUM_CTOR_TABLE_ROWS_PTR_OFFSET as i32,
@@ -8018,7 +8839,10 @@ fn emit_enum_field_load_with_layout(
         })?;
     emit_enum_load_header_root(function, value_local, enum_state);
     function.instruction(&Instruction::LocalGet(enum_state.base_local));
-    function.instruction(&Instruction::I32Load(memarg(ENUM_HEADER_SLOTS_PTR_OFFSET, 2)));
+    function.instruction(&Instruction::I32Load(memarg(
+        ENUM_HEADER_SLOTS_PTR_OFFSET,
+        2,
+    )));
     function.instruction(&Instruction::LocalGet(enum_state.save_sp_local));
     function.instruction(&Instruction::I32Const(ENUM_SLOT_BYTES));
     function.instruction(&Instruction::I32Mul);
@@ -8153,9 +8977,9 @@ fn is_wasm_direct_self_recursive_field(field_ty: &Type, ctor: &EnumCtorInfo) -> 
     if name != &ctor.enum_name || args.len() != ctor.enum_params.len() {
         return false;
     }
-    args.iter().zip(&ctor.enum_params).all(|(arg, param)| {
-        matches!(arg, Type::Var(var) if var == param)
-    })
+    args.iter()
+        .zip(&ctor.enum_params)
+        .all(|(arg, param)| matches!(arg, Type::Var(var) if var == param))
 }
 
 fn enum_ctor_recursive_field_indices(ctor: &EnumCtorInfo) -> Vec<usize> {
@@ -8246,6 +9070,25 @@ fn collect_pattern_binding_types(
             }
             Ok(())
         }
+        Pattern::Tuple(items) => {
+            let Type::Tuple(item_types) = ty else {
+                return Err(SimdError::new(format!(
+                    "tuple pattern expects tuple type, found {:?}",
+                    ty
+                )));
+            };
+            if items.len() != item_types.len() {
+                return Err(SimdError::new(format!(
+                    "tuple pattern expects {} elements, found {}",
+                    item_types.len(),
+                    items.len()
+                )));
+            }
+            for (item, item_ty) in items.iter().zip(item_types.iter()) {
+                collect_pattern_binding_types(item, item_ty, enum_ctors, out)?;
+            }
+            Ok(())
+        }
         Pattern::Ctor(name, subpatterns) => {
             let ctor = enum_ctors
                 .get(name)
@@ -8279,9 +9122,7 @@ fn collect_pattern_binding_types(
         | Pattern::Float(_)
         | Pattern::Char(_)
         | Pattern::Bool(_)
-        | Pattern::Type(_) => {
-            Ok(())
-        }
+        | Pattern::Type(_) => Ok(()),
         Pattern::Slice {
             prefix,
             suffix,
@@ -8404,7 +9245,13 @@ fn emit_matching_if(
     wasm_enum_layouts: &BTreeMap<String, WasmEnumLayout>,
     enum_state: Option<EnumWasmState>,
 ) -> Result<()> {
-    emit_clause_condition(function, patterns, enum_ctors, wasm_enum_layouts, enum_state)?;
+    emit_clause_condition(
+        function,
+        patterns,
+        enum_ctors,
+        wasm_enum_layouts,
+        enum_state,
+    )?;
     function.instruction(&Instruction::If(BlockType::Empty));
     Ok(())
 }
@@ -8556,6 +9403,9 @@ fn emit_slice_element_pattern_condition(
         Pattern::Ctor(_, _) => Err(SimdError::new(
             "Wasm backend does not support constructor slice element patterns",
         )),
+        Pattern::Tuple(_) => Err(SimdError::new(
+            "Wasm backend does not support tuple slice element patterns",
+        )),
         Pattern::Slice { .. } => Err(SimdError::new(
             "Wasm backend does not support nested slice element patterns",
         )),
@@ -8663,9 +9513,10 @@ fn emit_single_pattern_condition(
                 )));
             }
             function.instruction(&Instruction::LocalGet(value_local));
-            function.instruction(&Instruction::I32Const(i32::try_from(u32::from(*expected)).map_err(
-                |_| SimdError::new("char literal codepoint does not fit in i32"),
-            )?));
+            function.instruction(&Instruction::I32Const(
+                i32::try_from(u32::from(*expected))
+                    .map_err(|_| SimdError::new("char literal codepoint does not fit in i32"))?,
+            ));
             function.instruction(&Instruction::I32Eq);
             Ok(true)
         }
@@ -8674,6 +9525,9 @@ fn emit_single_pattern_condition(
         )),
         Pattern::Type(_) => Err(SimdError::new(
             "Wasm backend does not support type witness clause patterns",
+        )),
+        Pattern::Tuple(_) => Err(SimdError::new(
+            "Wasm backend does not support tuple clause patterns after flattening",
         )),
         Pattern::Slice {
             prefix,
@@ -8775,8 +9629,12 @@ fn emit_single_pattern_condition(
             };
             let wasm_layout =
                 lookup_specialized_wasm_enum_layout(wasm_enum_layouts, enum_name, enum_args)?;
-            let ctor_layout =
-                lookup_specialized_wasm_enum_ctor_layout(wasm_enum_layouts, enum_name, enum_args, name)?;
+            let ctor_layout = lookup_specialized_wasm_enum_ctor_layout(
+                wasm_enum_layouts,
+                enum_name,
+                enum_args,
+                name,
+            )?;
             emit_enum_tag_load_from_value(function, value_local, enum_state);
             function.instruction(&Instruction::I32Const(i32::from(ctor.tag)));
             function.instruction(&Instruction::I32Eq);
@@ -8861,14 +9719,18 @@ fn emit_single_pattern_condition(
                                 name, field_ty
                             )));
                         }
-                        function.instruction(&Instruction::I32Const(i32::try_from(u32::from(*expected)).map_err(
-                            |_| SimdError::new("char literal codepoint does not fit in i32"),
-                        )?));
+                        function.instruction(&Instruction::I32Const(
+                            i32::try_from(u32::from(*expected)).map_err(|_| {
+                                SimdError::new("char literal codepoint does not fit in i32")
+                            })?,
+                        ));
                         function.instruction(&Instruction::I32Eq);
                         function.instruction(&Instruction::I32And);
                         terms += 1;
                     }
-                    Pattern::Name(ctor_name) if is_pattern_constructor_name(ctor_name, enum_ctors) => {
+                    Pattern::Name(ctor_name)
+                        if is_pattern_constructor_name(ctor_name, enum_ctors) =>
+                    {
                         emit_enum_field_load(
                             function,
                             value_local,
@@ -8920,6 +9782,11 @@ fn emit_single_pattern_condition(
                     Pattern::Bool(_) => {
                         return Err(SimdError::new(
                             "Wasm backend does not support bool clause patterns",
+                        ));
+                    }
+                    Pattern::Tuple(_) => {
+                        return Err(SimdError::new(
+                            "Wasm backend does not support tuple clause patterns after flattening",
                         ));
                     }
                     Pattern::Type(_) => {
@@ -8988,6 +9855,9 @@ fn emit_pattern_bindings(
             }
             Ok(())
         }
+        Pattern::Tuple(_) => Err(SimdError::new(
+            "Wasm backend does not support tuple clause patterns after flattening",
+        )),
         Pattern::Ctor(name, subpatterns) => {
             let ctor = enum_ctors
                 .get(name)
@@ -9012,8 +9882,12 @@ fn emit_pattern_bindings(
                 .collect::<BTreeMap<_, _>>();
             let wasm_layout =
                 lookup_specialized_wasm_enum_layout(wasm_enum_layouts, enum_name, enum_args)?;
-            let ctor_layout =
-                lookup_specialized_wasm_enum_ctor_layout(wasm_enum_layouts, enum_name, enum_args, name)?;
+            let ctor_layout = lookup_specialized_wasm_enum_ctor_layout(
+                wasm_enum_layouts,
+                enum_name,
+                enum_args,
+                name,
+            )?;
             for (field_index, (subpattern, field_ty_template)) in
                 subpatterns.iter().zip(ctor.fields.iter()).enumerate()
             {
@@ -9024,8 +9898,11 @@ fn emit_pattern_bindings(
                     | Pattern::Float(_)
                     | Pattern::Char(_)
                     | Pattern::Bool(_)
+                    | Pattern::Tuple(_)
                     | Pattern::Type(_) => {}
-                    Pattern::Name(local_name) if !is_pattern_constructor_name(local_name, enum_ctors) => {
+                    Pattern::Name(local_name)
+                        if !is_pattern_constructor_name(local_name, enum_ctors) =>
+                    {
                         if let Some(target_local) = clause_locals.get(local_name).copied() {
                             let Some(enum_state) = enum_state else {
                                 return Err(SimdError::new(
@@ -9043,12 +9920,13 @@ fn emit_pattern_bindings(
                             )?;
                             if is_wasm_bulk_like_type(&field_ty) {
                                 let len_key = bulk_len_local_name(local_name);
-                                let len_local = clause_locals.get(&len_key).copied().ok_or_else(|| {
-                                    SimdError::new(format!(
-                                        "missing clause local '{}' for enum bulk field binding",
-                                        len_key
-                                    ))
-                                })?;
+                                let len_local =
+                                    clause_locals.get(&len_key).copied().ok_or_else(|| {
+                                        SimdError::new(format!(
+                                            "missing clause local '{}' for enum bulk field binding",
+                                            len_key
+                                        ))
+                                    })?;
                                 function.instruction(&Instruction::LocalSet(len_local));
                                 function.instruction(&Instruction::LocalSet(target_local));
                             } else {
@@ -9122,6 +10000,11 @@ fn emit_pattern_bindings(
                             "Wasm backend does not support bool slice element bindings",
                         ));
                     }
+                    Pattern::Tuple(_) => {
+                        return Err(SimdError::new(
+                            "Wasm backend does not support tuple slice element bindings",
+                        ));
+                    }
                     Pattern::Type(_) => {
                         return Err(SimdError::new(
                             "Wasm backend does not support type witness slice element bindings",
@@ -9158,6 +10041,11 @@ fn emit_pattern_bindings(
                     Pattern::Bool(_) => {
                         return Err(SimdError::new(
                             "Wasm backend does not support bool slice element bindings",
+                        ));
+                    }
+                    Pattern::Tuple(_) => {
+                        return Err(SimdError::new(
+                            "Wasm backend does not support tuple slice element bindings",
                         ));
                     }
                     Pattern::Type(_) => {
@@ -9205,12 +10093,10 @@ fn emit_pattern_bindings(
                         rest_len_key
                     )));
                 };
-                let prefix_i32 = i32::try_from(prefix.len()).map_err(|_| {
-                    SimdError::new("slice prefix length does not fit in i32")
-                })?;
-                let suffix_i32 = i32::try_from(suffix.len()).map_err(|_| {
-                    SimdError::new("slice suffix length does not fit in i32")
-                })?;
+                let prefix_i32 = i32::try_from(prefix.len())
+                    .map_err(|_| SimdError::new("slice prefix length does not fit in i32"))?;
+                let suffix_i32 = i32::try_from(suffix.len())
+                    .map_err(|_| SimdError::new("slice suffix length does not fit in i32"))?;
                 let start_byte = i32::try_from(prefix.len())
                     .ok()
                     .and_then(|prefix_len| {
@@ -9553,7 +10439,9 @@ fn compile_scalar_ir_expr_with_hoists(
         }
         IrExprKind::EnumCtor { ctor, args } => {
             let enum_state = enum_state.ok_or_else(|| {
-                SimdError::new("internal error: missing enum scratch local for constructor emission")
+                SimdError::new(
+                    "internal error: missing enum scratch local for constructor emission",
+                )
             })?;
             let ctor_info = enum_ctors
                 .get(ctor)
@@ -9564,8 +10452,11 @@ fn compile_scalar_ir_expr_with_hoists(
                     ctor, expr.ty
                 )));
             };
-            let wasm_layout =
-                lookup_specialized_wasm_enum_layout(wasm_enum_layouts, &ctor_info.enum_name, enum_args)?;
+            let wasm_layout = lookup_specialized_wasm_enum_layout(
+                wasm_enum_layouts,
+                &ctor_info.enum_name,
+                enum_args,
+            )?;
             let ctor_layout = lookup_specialized_wasm_enum_ctor_layout(
                 wasm_enum_layouts,
                 &ctor_info.enum_name,
@@ -9584,8 +10475,8 @@ fn compile_scalar_ir_expr_with_hoists(
                 )));
             }
             let tag_count = usize::from(wasm_layout.max_tag) + 1;
-            let tag_count_i32 =
-                i32::try_from(tag_count).map_err(|_| SimdError::new("enum tag-count does not fit in i32"))?;
+            let tag_count_i32 = i32::try_from(tag_count)
+                .map_err(|_| SimdError::new("enum tag-count does not fit in i32"))?;
             if ctor_layout.recursive_field_indices.len() > enum_state.child_locals.len() {
                 return Err(SimdError::new(format!(
                     "constructor '{}' has too many recursive fields for Wasm codegen",
@@ -9606,21 +10497,29 @@ fn compile_scalar_ir_expr_with_hoists(
             }
             let counts_base_offset = arg_scratch_bytes;
             let child_offsets_base_offset = counts_base_offset
-                .checked_add(tag_count_i32.checked_mul(4).ok_or_else(|| {
-                    SimdError::new("enum tag-count scratch size overflow")
-                })?)
+                .checked_add(
+                    tag_count_i32
+                        .checked_mul(4)
+                        .ok_or_else(|| SimdError::new("enum tag-count scratch size overflow"))?,
+                )
                 .ok_or_else(|| SimdError::new("enum scratch offset overflow"))?;
             let child_handles_base_offset = child_offsets_base_offset
-                .checked_add(tag_count_i32.checked_mul(4).ok_or_else(|| {
-                    SimdError::new("enum child-offset scratch size overflow")
-                })?)
+                .checked_add(
+                    tag_count_i32
+                        .checked_mul(4)
+                        .ok_or_else(|| SimdError::new("enum child-offset scratch size overflow"))?,
+                )
                 .ok_or_else(|| SimdError::new("enum scratch offset overflow"))?;
             let child_handle_count_i32 = i32::try_from(ctor_layout.recursive_field_indices.len())
-                .map_err(|_| SimdError::new("enum recursive child count does not fit in i32"))?;
+                .map_err(|_| {
+                SimdError::new("enum recursive child count does not fit in i32")
+            })?;
             let total_scratch_bytes = child_handles_base_offset
-                .checked_add(child_handle_count_i32.checked_mul(4).ok_or_else(|| {
-                    SimdError::new("enum child-handle scratch size overflow")
-                })?)
+                .checked_add(
+                    child_handle_count_i32
+                        .checked_mul(4)
+                        .ok_or_else(|| SimdError::new("enum child-handle scratch size overflow"))?,
+                )
                 .ok_or_else(|| SimdError::new("enum scratch size overflow"))?;
 
             function.instruction(&Instruction::LocalGet(enum_state.scratch_sp_local));
@@ -9709,8 +10608,7 @@ fn compile_scalar_ir_expr_with_hoists(
             function.instruction(&Instruction::LocalSet(enum_state.aux1_local));
 
             let mut recursive_local_index = 0usize;
-            for (field_index, field_ty) in ctor_info.fields.iter().enumerate()
-            {
+            for (field_index, field_ty) in ctor_info.fields.iter().enumerate() {
                 if !is_wasm_direct_self_recursive_field(field_ty, ctor_info) {
                     continue;
                 }
@@ -9729,7 +10627,10 @@ fn compile_scalar_ir_expr_with_hoists(
                 emit_enum_load_header_root(function, enum_state.ptr_local, enum_state);
                 function.instruction(&Instruction::LocalGet(enum_state.aux1_local));
                 function.instruction(&Instruction::LocalGet(enum_state.base_local));
-                function.instruction(&Instruction::I32Load(memarg(ENUM_HEADER_NODE_COUNT_OFFSET, 2)));
+                function.instruction(&Instruction::I32Load(memarg(
+                    ENUM_HEADER_NODE_COUNT_OFFSET,
+                    2,
+                )));
                 function.instruction(&Instruction::I32Add);
                 function.instruction(&Instruction::LocalSet(enum_state.aux1_local));
                 for child_ctor_layout in &enum_ctor_layouts {
@@ -9741,7 +10642,10 @@ fn compile_scalar_ir_expr_with_hoists(
                     function.instruction(&Instruction::LocalTee(enum_state.aux2_local));
                     function.instruction(&Instruction::I32Load(memarg(0, 2)));
                     function.instruction(&Instruction::LocalGet(enum_state.base_local));
-                    function.instruction(&Instruction::I32Load(memarg(ENUM_HEADER_CTOR_TABLE_PTR_OFFSET, 2)));
+                    function.instruction(&Instruction::I32Load(memarg(
+                        ENUM_HEADER_CTOR_TABLE_PTR_OFFSET,
+                        2,
+                    )));
                     function.instruction(&Instruction::I32Const(
                         i32::from(child_ctor_layout.tag) * ENUM_CTOR_TABLE_ENTRY_BYTES,
                     ));
@@ -9760,7 +10664,9 @@ fn compile_scalar_ir_expr_with_hoists(
             }
 
             function.instruction(&Instruction::LocalGet(enum_state.aux0_local));
-            function.instruction(&Instruction::I32Const(counts_base_offset + i32::from(ctor_layout.tag) * 4));
+            function.instruction(&Instruction::I32Const(
+                counts_base_offset + i32::from(ctor_layout.tag) * 4,
+            ));
             function.instruction(&Instruction::I32Add);
             function.instruction(&Instruction::LocalTee(enum_state.aux2_local));
             function.instruction(&Instruction::I32Load(memarg(0, 2)));
@@ -9827,10 +10733,16 @@ fn compile_scalar_ir_expr_with_hoists(
 
             function.instruction(&Instruction::LocalGet(enum_state.aux4_local));
             function.instruction(&Instruction::I32Const(wasm_layout.enum_id as i32));
-            function.instruction(&Instruction::I32Store(memarg(ENUM_HEADER_ENUM_ID_OFFSET, 2)));
+            function.instruction(&Instruction::I32Store(memarg(
+                ENUM_HEADER_ENUM_ID_OFFSET,
+                2,
+            )));
             function.instruction(&Instruction::LocalGet(enum_state.aux4_local));
             function.instruction(&Instruction::LocalGet(enum_state.aux1_local));
-            function.instruction(&Instruction::I32Store(memarg(ENUM_HEADER_NODE_COUNT_OFFSET, 2)));
+            function.instruction(&Instruction::I32Store(memarg(
+                ENUM_HEADER_NODE_COUNT_OFFSET,
+                2,
+            )));
 
             function.instruction(&Instruction::LocalGet(enum_state.aux4_local));
             function.instruction(&Instruction::I32Const(ENUM_HEADER_BYTES));
@@ -9838,7 +10750,10 @@ fn compile_scalar_ir_expr_with_hoists(
             function.instruction(&Instruction::LocalSet(enum_state.aux5_local));
             function.instruction(&Instruction::LocalGet(enum_state.aux4_local));
             function.instruction(&Instruction::LocalGet(enum_state.aux5_local));
-            function.instruction(&Instruction::I32Store(memarg(ENUM_HEADER_TAGS_PTR_OFFSET, 2)));
+            function.instruction(&Instruction::I32Store(memarg(
+                ENUM_HEADER_TAGS_PTR_OFFSET,
+                2,
+            )));
 
             function.instruction(&Instruction::LocalGet(enum_state.aux5_local));
             function.instruction(&Instruction::LocalGet(enum_state.aux1_local));
@@ -9848,7 +10763,10 @@ fn compile_scalar_ir_expr_with_hoists(
             function.instruction(&Instruction::LocalSet(enum_state.aux6_local));
             function.instruction(&Instruction::LocalGet(enum_state.aux4_local));
             function.instruction(&Instruction::LocalGet(enum_state.aux6_local));
-            function.instruction(&Instruction::I32Store(memarg(ENUM_HEADER_ENDS_PTR_OFFSET, 2)));
+            function.instruction(&Instruction::I32Store(memarg(
+                ENUM_HEADER_ENDS_PTR_OFFSET,
+                2,
+            )));
 
             function.instruction(&Instruction::LocalGet(enum_state.aux6_local));
             function.instruction(&Instruction::LocalGet(enum_state.aux1_local));
@@ -9858,7 +10776,10 @@ fn compile_scalar_ir_expr_with_hoists(
             function.instruction(&Instruction::LocalSet(enum_state.aux7_local));
             function.instruction(&Instruction::LocalGet(enum_state.aux4_local));
             function.instruction(&Instruction::LocalGet(enum_state.aux7_local));
-            function.instruction(&Instruction::I32Store(memarg(ENUM_HEADER_SLOTS_PTR_OFFSET, 2)));
+            function.instruction(&Instruction::I32Store(memarg(
+                ENUM_HEADER_SLOTS_PTR_OFFSET,
+                2,
+            )));
 
             function.instruction(&Instruction::LocalGet(enum_state.aux7_local));
             function.instruction(&Instruction::LocalGet(enum_state.aux1_local));
@@ -9868,7 +10789,10 @@ fn compile_scalar_ir_expr_with_hoists(
             function.instruction(&Instruction::LocalSet(enum_state.aux2_local));
             function.instruction(&Instruction::LocalGet(enum_state.aux4_local));
             function.instruction(&Instruction::LocalGet(enum_state.aux2_local));
-            function.instruction(&Instruction::I32Store(memarg(ENUM_HEADER_CTOR_TABLE_PTR_OFFSET, 2)));
+            function.instruction(&Instruction::I32Store(memarg(
+                ENUM_HEADER_CTOR_TABLE_PTR_OFFSET,
+                2,
+            )));
 
             for tag in 0..tag_count {
                 function.instruction(&Instruction::LocalGet(enum_state.aux2_local));
@@ -9880,14 +10804,22 @@ fn compile_scalar_ir_expr_with_hoists(
                 function.instruction(&Instruction::I32Add);
                 function.instruction(&Instruction::LocalTee(enum_state.aux3_local));
                 function.instruction(&Instruction::I32Const(0));
-                function.instruction(&Instruction::I32Store(memarg(ENUM_CTOR_TABLE_ROWS_PTR_OFFSET, 2)));
+                function.instruction(&Instruction::I32Store(memarg(
+                    ENUM_CTOR_TABLE_ROWS_PTR_OFFSET,
+                    2,
+                )));
                 function.instruction(&Instruction::LocalGet(enum_state.aux3_local));
                 function.instruction(&Instruction::I32Const(0));
-                function.instruction(&Instruction::I32Store(memarg(ENUM_CTOR_TABLE_ROW_COUNT_OFFSET, 2)));
+                function.instruction(&Instruction::I32Store(memarg(
+                    ENUM_CTOR_TABLE_ROW_COUNT_OFFSET,
+                    2,
+                )));
             }
 
             function.instruction(&Instruction::LocalGet(enum_state.aux2_local));
-            function.instruction(&Instruction::I32Const(tag_count_i32 * ENUM_CTOR_TABLE_ENTRY_BYTES));
+            function.instruction(&Instruction::I32Const(
+                tag_count_i32 * ENUM_CTOR_TABLE_ENTRY_BYTES,
+            ));
             function.instruction(&Instruction::I32Add);
             function.instruction(&Instruction::LocalSet(enum_state.aux3_local));
             for child_ctor_layout in &enum_ctor_layouts {
@@ -9909,14 +10841,21 @@ fn compile_scalar_ir_expr_with_hoists(
                 } else {
                     function.instruction(&Instruction::LocalGet(enum_state.aux3_local));
                 }
-                function.instruction(&Instruction::I32Store(memarg(ENUM_CTOR_TABLE_ROWS_PTR_OFFSET, 2)));
+                function.instruction(&Instruction::I32Store(memarg(
+                    ENUM_CTOR_TABLE_ROWS_PTR_OFFSET,
+                    2,
+                )));
                 function.instruction(&Instruction::LocalGet(enum_state.base_tmp_local));
                 function.instruction(&Instruction::LocalGet(enum_state.base_local));
-                function.instruction(&Instruction::I32Store(memarg(ENUM_CTOR_TABLE_ROW_COUNT_OFFSET, 2)));
+                function.instruction(&Instruction::I32Store(memarg(
+                    ENUM_CTOR_TABLE_ROW_COUNT_OFFSET,
+                    2,
+                )));
                 if child_ctor_layout.row_stride != 0 {
                     function.instruction(&Instruction::LocalGet(enum_state.aux3_local));
                     function.instruction(&Instruction::LocalGet(enum_state.base_local));
-                    function.instruction(&Instruction::I32Const(child_ctor_layout.row_stride as i32));
+                    function
+                        .instruction(&Instruction::I32Const(child_ctor_layout.row_stride as i32));
                     function.instruction(&Instruction::I32Mul);
                     function.instruction(&Instruction::I32Add);
                     function.instruction(&Instruction::LocalSet(enum_state.aux3_local));
@@ -9939,7 +10878,9 @@ fn compile_scalar_ir_expr_with_hoists(
             }
 
             function.instruction(&Instruction::LocalGet(enum_state.aux2_local));
-            function.instruction(&Instruction::I32Const(tag_count_i32 * ENUM_CTOR_TABLE_ENTRY_BYTES));
+            function.instruction(&Instruction::I32Const(
+                tag_count_i32 * ENUM_CTOR_TABLE_ENTRY_BYTES,
+            ));
             function.instruction(&Instruction::I32Add);
             function.instruction(&Instruction::LocalSet(enum_state.aux3_local));
             for child_ctor_layout in &enum_ctor_layouts {
@@ -9961,11 +10902,15 @@ fn compile_scalar_ir_expr_with_hoists(
                 } else {
                     function.instruction(&Instruction::LocalGet(enum_state.aux3_local));
                 }
-                function.instruction(&Instruction::I32Store(memarg(ENUM_CTOR_TABLE_ROWS_PTR_OFFSET, 2)));
+                function.instruction(&Instruction::I32Store(memarg(
+                    ENUM_CTOR_TABLE_ROWS_PTR_OFFSET,
+                    2,
+                )));
                 if child_ctor_layout.row_stride != 0 {
                     function.instruction(&Instruction::LocalGet(enum_state.aux3_local));
                     function.instruction(&Instruction::LocalGet(enum_state.base_local));
-                    function.instruction(&Instruction::I32Const(child_ctor_layout.row_stride as i32));
+                    function
+                        .instruction(&Instruction::I32Const(child_ctor_layout.row_stride as i32));
                     function.instruction(&Instruction::I32Mul);
                     function.instruction(&Instruction::I32Add);
                     function.instruction(&Instruction::LocalSet(enum_state.aux3_local));
@@ -9982,7 +10927,9 @@ fn compile_scalar_ir_expr_with_hoists(
             function.instruction(&Instruction::I32Const(0));
             function.instruction(&Instruction::I32Store(memarg(0, 2)));
             function.instruction(&Instruction::LocalGet(enum_state.aux0_local));
-            function.instruction(&Instruction::I32Const(counts_base_offset + i32::from(ctor_layout.tag) * 4));
+            function.instruction(&Instruction::I32Const(
+                counts_base_offset + i32::from(ctor_layout.tag) * 4,
+            ));
             function.instruction(&Instruction::I32Add);
             function.instruction(&Instruction::I32Const(1));
             function.instruction(&Instruction::I32Store(memarg(0, 2)));
@@ -10052,7 +10999,10 @@ fn compile_scalar_ir_expr_with_hoists(
                     function.instruction(&Instruction::I32Store(memarg(0, 2)));
 
                     function.instruction(&Instruction::LocalGet(enum_state.base_local));
-                    function.instruction(&Instruction::I32Load(memarg(ENUM_HEADER_CTOR_TABLE_PTR_OFFSET, 2)));
+                    function.instruction(&Instruction::I32Load(memarg(
+                        ENUM_HEADER_CTOR_TABLE_PTR_OFFSET,
+                        2,
+                    )));
                     function.instruction(&Instruction::I32Const(
                         i32::from(child_ctor_layout.tag) * ENUM_CTOR_TABLE_ENTRY_BYTES,
                     ));
@@ -10081,14 +11031,17 @@ fn compile_scalar_ir_expr_with_hoists(
                             enum_state,
                         );
                         function.instruction(&Instruction::LocalGet(enum_state.save_sp_local));
-                        function.instruction(&Instruction::I32Const(child_ctor_layout.row_stride as i32));
+                        function.instruction(&Instruction::I32Const(
+                            child_ctor_layout.row_stride as i32,
+                        ));
                         function.instruction(&Instruction::I32Mul);
                         function.instruction(&Instruction::I32Add);
                         function.instruction(&Instruction::LocalSet(enum_state.aux3_local));
                         function.instruction(&Instruction::LocalGet(enum_state.aux8_local));
                         function.instruction(&Instruction::I32Const(
-                            i32::try_from(child_ctor_layout.row_stride / 4)
-                                .map_err(|_| SimdError::new("enum row stride words do not fit in i32"))?,
+                            i32::try_from(child_ctor_layout.row_stride / 4).map_err(|_| {
+                                SimdError::new("enum row stride words do not fit in i32")
+                            })?,
                         ));
                         function.instruction(&Instruction::I32Mul);
                         function.instruction(&Instruction::LocalSet(enum_state.scratch_sp_local));
@@ -10117,12 +11070,18 @@ fn compile_scalar_ir_expr_with_hoists(
                 function.instruction(&Instruction::Loop(BlockType::Empty));
                 function.instruction(&Instruction::LocalGet(enum_state.ptr_local));
                 function.instruction(&Instruction::LocalGet(enum_state.base_local));
-                function.instruction(&Instruction::I32Load(memarg(ENUM_HEADER_NODE_COUNT_OFFSET, 2)));
+                function.instruction(&Instruction::I32Load(memarg(
+                    ENUM_HEADER_NODE_COUNT_OFFSET,
+                    2,
+                )));
                 function.instruction(&Instruction::I32GeU);
                 function.instruction(&Instruction::BrIf(1));
 
                 function.instruction(&Instruction::LocalGet(enum_state.base_local));
-                function.instruction(&Instruction::I32Load(memarg(ENUM_HEADER_TAGS_PTR_OFFSET, 2)));
+                function.instruction(&Instruction::I32Load(memarg(
+                    ENUM_HEADER_TAGS_PTR_OFFSET,
+                    2,
+                )));
                 function.instruction(&Instruction::LocalGet(enum_state.ptr_local));
                 function.instruction(&Instruction::I32Const(ENUM_TAG_BYTES));
                 function.instruction(&Instruction::I32Mul);
@@ -10148,7 +11107,10 @@ fn compile_scalar_ir_expr_with_hoists(
                 function.instruction(&Instruction::I32Mul);
                 function.instruction(&Instruction::I32Add);
                 function.instruction(&Instruction::LocalGet(enum_state.base_local));
-                function.instruction(&Instruction::I32Load(memarg(ENUM_HEADER_ENDS_PTR_OFFSET, 2)));
+                function.instruction(&Instruction::I32Load(memarg(
+                    ENUM_HEADER_ENDS_PTR_OFFSET,
+                    2,
+                )));
                 function.instruction(&Instruction::LocalGet(enum_state.ptr_local));
                 function.instruction(&Instruction::I32Const(ENUM_END_BYTES));
                 function.instruction(&Instruction::I32Mul);
@@ -10166,7 +11128,10 @@ fn compile_scalar_ir_expr_with_hoists(
                 function.instruction(&Instruction::I32Mul);
                 function.instruction(&Instruction::I32Add);
                 function.instruction(&Instruction::LocalGet(enum_state.base_local));
-                function.instruction(&Instruction::I32Load(memarg(ENUM_HEADER_SLOTS_PTR_OFFSET, 2)));
+                function.instruction(&Instruction::I32Load(memarg(
+                    ENUM_HEADER_SLOTS_PTR_OFFSET,
+                    2,
+                )));
                 function.instruction(&Instruction::LocalGet(enum_state.ptr_local));
                 function.instruction(&Instruction::I32Const(ENUM_SLOT_BYTES));
                 function.instruction(&Instruction::I32Mul);
@@ -10193,7 +11158,10 @@ fn compile_scalar_ir_expr_with_hoists(
 
                 function.instruction(&Instruction::LocalGet(enum_state.aux1_local));
                 function.instruction(&Instruction::LocalGet(enum_state.base_local));
-                function.instruction(&Instruction::I32Load(memarg(ENUM_HEADER_NODE_COUNT_OFFSET, 2)));
+                function.instruction(&Instruction::I32Load(memarg(
+                    ENUM_HEADER_NODE_COUNT_OFFSET,
+                    2,
+                )));
                 function.instruction(&Instruction::I32Add);
                 function.instruction(&Instruction::LocalSet(enum_state.aux1_local));
             }
@@ -10252,7 +11220,9 @@ fn compile_scalar_ir_expr_with_hoists(
         }
         IrExprKind::EnumChildBySlot { value, ctor, slot } => {
             let enum_state = enum_state.ok_or_else(|| {
-                SimdError::new("internal error: missing enum scratch local for enum child projection")
+                SimdError::new(
+                    "internal error: missing enum scratch local for enum child projection",
+                )
             })?;
             let ctor_info = enum_ctors
                 .get(ctor)
@@ -10263,8 +11233,11 @@ fn compile_scalar_ir_expr_with_hoists(
                     ctor, value.ty
                 )));
             };
-            let wasm_layout =
-                lookup_specialized_wasm_enum_layout(wasm_enum_layouts, &ctor_info.enum_name, enum_args)?;
+            let wasm_layout = lookup_specialized_wasm_enum_layout(
+                wasm_enum_layouts,
+                &ctor_info.enum_name,
+                enum_args,
+            )?;
             let ctor_layout = lookup_specialized_wasm_enum_ctor_layout(
                 wasm_enum_layouts,
                 &ctor_info.enum_name,
@@ -10322,8 +11295,11 @@ fn compile_scalar_ir_expr_with_hoists(
                     ctor, value.ty
                 )));
             };
-            let wasm_layout =
-                lookup_specialized_wasm_enum_layout(wasm_enum_layouts, &ctor_info.enum_name, enum_args)?;
+            let wasm_layout = lookup_specialized_wasm_enum_layout(
+                wasm_enum_layouts,
+                &ctor_info.enum_name,
+                enum_args,
+            )?;
             let ctor_layout = lookup_specialized_wasm_enum_ctor_layout(
                 wasm_enum_layouts,
                 &ctor_info.enum_name,
@@ -10383,26 +11359,26 @@ fn compile_scalar_ir_expr_with_hoists(
                 compile_scalar_ir_expr_with_hoists(
                     function,
                     &args[0],
-                locals,
-                scalar_indices,
-                signatures,
-                enum_ctors,
-                wasm_enum_layouts,
-                enum_state,
-                hoisted_locals,
-                inline_bindings,
+                    locals,
+                    scalar_indices,
+                    signatures,
+                    enum_ctors,
+                    wasm_enum_layouts,
+                    enum_state,
+                    hoisted_locals,
+                    inline_bindings,
                 )?;
                 compile_scalar_ir_expr_with_hoists(
                     function,
                     &args[1],
-                locals,
-                scalar_indices,
-                signatures,
-                enum_ctors,
-                wasm_enum_layouts,
-                enum_state,
-                hoisted_locals,
-                inline_bindings,
+                    locals,
+                    scalar_indices,
+                    signatures,
+                    enum_ctors,
+                    wasm_enum_layouts,
+                    enum_state,
+                    hoisted_locals,
+                    inline_bindings,
                 )?;
                 emit_scalar_primitive(function, *op, expr.ty.prim().unwrap_or(Prim::I64), args)?;
             }
@@ -10415,14 +11391,14 @@ fn compile_scalar_ir_expr_with_hoists(
                     compile_scalar_ir_expr_with_hoists(
                         function,
                         arg,
-                    locals,
-                    scalar_indices,
-                    signatures,
-                    enum_ctors,
-                    wasm_enum_layouts,
-                    enum_state,
-                    hoisted_locals,
-                    inline_bindings,
+                        locals,
+                        scalar_indices,
+                        signatures,
+                        enum_ctors,
+                        wasm_enum_layouts,
+                        enum_state,
+                        hoisted_locals,
+                        inline_bindings,
                     )?;
                     if arg.ty != ty {
                         return Err(SimdError::new(format!(
@@ -10689,6 +11665,7 @@ fn patterns_are_vectorizable(
             }
             Pattern::Bool(_) => return false,
             Pattern::Type(_) => return false,
+            Pattern::Tuple(_) => return false,
             Pattern::Ctor(_, _) => return false,
             Pattern::Slice { .. } => return false,
             Pattern::Name(_) | Pattern::Wildcard => {}
@@ -10740,10 +11717,7 @@ fn is_vectorizable_expr(
                         return false;
                     };
                     result_prim == Prim::I64
-                        && matches!(
-                            operand_prim,
-                            Prim::I32 | Prim::I64 | Prim::Char | Prim::F64
-                        )
+                        && matches!(operand_prim, Prim::I32 | Prim::I64 | Prim::Char | Prim::F64)
                 }
                 _ => false,
             },
@@ -10787,6 +11761,11 @@ fn emit_vector_clause_mask(
             Pattern::Bool(_) => {
                 return Err(SimdError::new(
                     "Wasm backend does not support bool clause patterns",
+                ));
+            }
+            Pattern::Tuple(_) => {
+                return Err(SimdError::new(
+                    "Wasm backend does not support tuple vector clause patterns",
                 ));
             }
             Pattern::Ctor(_, _) => {
@@ -11495,10 +12474,15 @@ fn build_specialized_wasm_enum_layout(
     let enum_id = enum_names
         .iter()
         .position(|name| name == enum_name)
-        .ok_or_else(|| SimdError::new(format!("unknown enum '{}' in Wasm layout build", enum_name)))?;
+        .ok_or_else(|| {
+            SimdError::new(format!("unknown enum '{}' in Wasm layout build", enum_name))
+        })?;
     let mut max_tag = 0u16;
     let mut ctors = BTreeMap::new();
-    for (ctor_name, ctor) in enum_ctors.iter().filter(|(_, ctor)| ctor.enum_name == enum_name) {
+    for (ctor_name, ctor) in enum_ctors
+        .iter()
+        .filter(|(_, ctor)| ctor.enum_name == enum_name)
+    {
         max_tag = max_tag.max(ctor.tag);
         ctors.insert(
             ctor_name.clone(),
@@ -11507,7 +12491,8 @@ fn build_specialized_wasm_enum_layout(
     }
     Ok(WasmEnumLayout {
         enum_name: enum_name.to_string(),
-        enum_id: u32::try_from(enum_id).map_err(|_| SimdError::new("enum id does not fit in u32"))?,
+        enum_id: u32::try_from(enum_id)
+            .map_err(|_| SimdError::new("enum id does not fit in u32"))?,
         max_tag,
         ctors,
     })
@@ -11526,6 +12511,11 @@ fn enqueue_precomputed_wasm_enum_layout_types(
         Type::Scalar(_) | Type::Bulk(_, _) | Type::Var(_) | Type::Infer(_) => {}
         Type::TypeToken(inner) => {
             enqueue_precomputed_wasm_enum_layout_types(inner, seen, queue);
+        }
+        Type::Tuple(items) => {
+            for item_ty in items {
+                enqueue_precomputed_wasm_enum_layout_types(item_ty, seen, queue);
+            }
         }
         Type::Record(fields) => {
             for field_ty in fields.values() {
@@ -11577,12 +12567,17 @@ fn enqueue_precomputed_wasm_enum_layout_expr_types(
             }
             enqueue_precomputed_wasm_enum_layout_expr_types(body, seen, queue);
         }
+        TypedExprKind::Tuple(items) => {
+            for item in items {
+                enqueue_precomputed_wasm_enum_layout_expr_types(item, seen, queue);
+            }
+        }
         TypedExprKind::Record(fields) => {
             for field in fields.values() {
                 enqueue_precomputed_wasm_enum_layout_expr_types(field, seen, queue);
             }
         }
-        TypedExprKind::Project { base, .. } => {
+        TypedExprKind::Project { base, .. } | TypedExprKind::TupleProject { base, .. } => {
             enqueue_precomputed_wasm_enum_layout_expr_types(base, seen, queue);
         }
         TypedExprKind::RecordUpdate { base, fields } => {
@@ -11624,15 +12619,14 @@ fn build_precomputed_wasm_enum_layouts(
         if layouts.contains_key(&key) {
             continue;
         }
-        let layout =
-            build_specialized_wasm_enum_layout(&enum_name, &enum_args, &checked_program.enum_ctors)?;
+        let layout = build_specialized_wasm_enum_layout(
+            &enum_name,
+            &enum_args,
+            &checked_program.enum_ctors,
+        )?;
         for ctor_layout in layout.ctors.values() {
             for field_layout in &ctor_layout.non_recursive_fields {
-                enqueue_precomputed_wasm_enum_layout_types(
-                    &field_layout.ty,
-                    &mut seen,
-                    &mut queue,
-                );
+                enqueue_precomputed_wasm_enum_layout_types(&field_layout.ty, &mut seen, &mut queue);
             }
         }
         layouts.insert(key, layout);
@@ -11817,16 +12811,99 @@ fn build_clause_env(
     let mut local_types = BTreeMap::new();
     let mut local_leaf_names = BTreeMap::new();
     for (pattern, ty) in clause.patterns.iter().zip(param_types) {
-        if let Pattern::Name(name) = &pattern.pattern {
-            local_types.insert(name.clone(), ty.clone());
+        let mut bindings = Vec::new();
+        collect_non_ctor_pattern_bindings(&pattern.pattern, ty, &mut bindings);
+        for (name, binding_ty) in bindings {
+            local_types.insert(name.clone(), binding_ty.clone());
             let mut leaf_names = BTreeMap::new();
-            for leaf in flatten_type_leaves(ty) {
-                leaf_names.insert(leaf.path.clone(), leaf_symbol_name(name, &leaf.path));
+            for leaf in flatten_type_leaves(&binding_ty) {
+                leaf_names.insert(leaf.path.clone(), leaf_symbol_name(&name, &leaf.path));
             }
-            local_leaf_names.insert(name.clone(), leaf_names);
+            local_leaf_names.insert(name, leaf_names);
         }
     }
     (local_types, local_leaf_names)
+}
+
+fn collect_non_ctor_pattern_bindings(pattern: &Pattern, ty: &Type, out: &mut Vec<(String, Type)>) {
+    match pattern {
+        Pattern::Name(name) => {
+            if name != "_" && !is_constructor_name(name) {
+                out.push((name.clone(), ty.clone()));
+            }
+        }
+        Pattern::Tuple(items) => {
+            if let Type::Tuple(item_types) = ty {
+                for (item, item_ty) in items.iter().zip(item_types.iter()) {
+                    collect_non_ctor_pattern_bindings(item, item_ty, out);
+                }
+            }
+        }
+        Pattern::Ctor(_, _)
+        | Pattern::Wildcard
+        | Pattern::Int(_)
+        | Pattern::Float(_)
+        | Pattern::Char(_)
+        | Pattern::Bool(_)
+        | Pattern::Type(_)
+        | Pattern::Slice { .. } => {}
+    }
+}
+
+fn tuple_leaf_name(index: usize) -> String {
+    index.to_string()
+}
+
+fn parse_tuple_leaf_name(name: &str) -> Option<usize> {
+    name.parse::<usize>().ok()
+}
+
+fn pattern_at_leaf(pattern: &Pattern, ty: &Type, path: &LeafPath) -> Result<Pattern> {
+    if path.is_root() {
+        return Ok(pattern.clone());
+    }
+    let Some((head, tail)) = path.split_first() else {
+        unreachable!("non-root tuple/record leaf path must have a head");
+    };
+    match (pattern, ty) {
+        (Pattern::Name(name), _) => Ok(Pattern::Name(leaf_symbol_name(name, path))),
+        (Pattern::Wildcard, _) => Ok(Pattern::Wildcard),
+        (Pattern::Tuple(items), Type::Tuple(item_types)) => {
+            let Some(index) = parse_tuple_leaf_name(head) else {
+                return Err(SimdError::new(format!(
+                    "tuple leaf '{}' is not a valid tuple index",
+                    head
+                )));
+            };
+            let item = items.get(index).ok_or_else(|| {
+                SimdError::new(format!("tuple pattern is missing element {}", index))
+            })?;
+            let item_ty = item_types.get(index).ok_or_else(|| {
+                SimdError::new(format!("tuple type is missing element {}", index))
+            })?;
+            pattern_at_leaf(item, item_ty, &tail)
+        }
+        (
+            Pattern::Ctor(_, _)
+            | Pattern::Slice { .. }
+            | Pattern::Int(_)
+            | Pattern::Float(_)
+            | Pattern::Char(_)
+            | Pattern::Bool(_)
+            | Pattern::Type(_),
+            Type::Tuple(_) | Type::Record(_),
+        ) => Err(SimdError::new(
+            "tuple/record parameters cannot use literal patterns",
+        )),
+        (pattern, Type::Record(_)) => Err(SimdError::new(format!(
+            "cannot select leaf {:?} from record pattern {:?}",
+            path, pattern
+        ))),
+        (pattern, other) => Err(SimdError::new(format!(
+            "cannot select leaf {:?} from pattern {:?} over {:?}",
+            path, pattern, other
+        ))),
+    }
 }
 
 fn flatten_clause_patterns(
@@ -11857,23 +12934,9 @@ fn flatten_clause_patterns(
                     "Wasm backend does not support type witness parameters in flattened clauses",
                 ));
             }
-            Type::Record(_) => {
+            Type::Record(_) | Type::Tuple(_) => {
                 for leaf in flatten_type_leaves(ty) {
-                    let leaf_pattern = match &pattern.pattern {
-                        Pattern::Name(name) => Pattern::Name(leaf_symbol_name(name, &leaf.path)),
-                        Pattern::Wildcard => Pattern::Wildcard,
-                        Pattern::Int(_)
-                        | Pattern::Float(_)
-                        | Pattern::Char(_)
-                        | Pattern::Bool(_)
-                        | Pattern::Type(_)
-                        | Pattern::Ctor(_, _)
-                        | Pattern::Slice { .. } => {
-                            return Err(SimdError::new(
-                                "record parameters cannot use literal patterns",
-                            ));
-                        }
-                    };
+                    let leaf_pattern = pattern_at_leaf(&pattern.pattern, ty, &leaf.path)?;
                     flattened.push(TypedPattern {
                         pattern: leaf_pattern,
                         ty: leaf.ty,
@@ -11937,9 +13000,7 @@ fn normalize_expr_for_leaf(
                 let projected = project_local_path(name, local_ty, leaf_path)?;
                 return Ok(projected);
             }
-            if local_leaf_names
-                .get(name)
-                .is_some()
+            if local_leaf_names.get(name).is_some()
                 && local_leaf_names
                     .get(name)
                     .and_then(|names| names.get(leaf_path))
@@ -12017,7 +13078,10 @@ fn normalize_expr_for_leaf(
         }
         TypedExprKind::FunctionRef { name } => {
             let function = checked_map.get(name).ok_or_else(|| {
-                SimdError::new(format!("unknown function '{}' in Wasm record normalization", name))
+                SimdError::new(format!(
+                    "unknown function '{}' in Wasm record normalization",
+                    name
+                ))
             })?;
             let expected_arity = function.signature.ty.arity();
             if expected_arity != 0 {
@@ -12035,7 +13099,7 @@ fn normalize_expr_for_leaf(
                     return Err(SimdError::new(format!(
                         "unsupported zero-arity function '{}' type in Wasm record normalization: {:?}",
                         name, other
-                    )))
+                    )));
                 }
             }
             if function.clauses.len() != 1 || !function.clauses[0].patterns.is_empty() {
@@ -12092,6 +13156,28 @@ fn normalize_expr_for_leaf(
                 },
             })
         }
+        TypedExprKind::Tuple(items) => {
+            let (field, tail) = leaf_path
+                .split_first()
+                .ok_or_else(|| SimdError::new("tuple expression requires a non-empty leaf path"))?;
+            let Some(index) = parse_tuple_leaf_name(field) else {
+                return Err(SimdError::new(format!(
+                    "tuple leaf '{}' is not a valid tuple index",
+                    field
+                )));
+            };
+            let item_expr = items.get(index).ok_or_else(|| {
+                SimdError::new(format!("tuple expression is missing element {}", index))
+            })?;
+            normalize_expr_for_leaf(
+                item_expr,
+                &tail,
+                local_types,
+                local_leaf_names,
+                checked_map,
+                result_leaf_names,
+            )
+        }
         TypedExprKind::Record(fields) => {
             let (field, tail) = leaf_path.split_first().ok_or_else(|| {
                 SimdError::new("record expression requires a non-empty leaf path")
@@ -12111,6 +13197,14 @@ fn normalize_expr_for_leaf(
         TypedExprKind::Project { base, field } => normalize_expr_for_leaf(
             base,
             &advance_field_for_projection(base, leaf_path, field),
+            local_types,
+            local_leaf_names,
+            checked_map,
+            result_leaf_names,
+        ),
+        TypedExprKind::TupleProject { base, index } => normalize_expr_for_leaf(
+            base,
+            &advance_field_for_projection(base, leaf_path, &tuple_leaf_name(*index)),
             local_types,
             local_leaf_names,
             checked_map,
@@ -12293,6 +13387,7 @@ fn project_local_path(name: &str, local_ty: &Type, path: &LeafPath) -> Result<Ty
     };
     for index in 0..path.0.len() {
         let field = &path.0[index];
+        let is_tuple_base = matches!(expr.ty, Type::Tuple(_));
         let field_ty = match &expr.ty {
             Type::Record(fields) => fields.get(field).cloned().ok_or_else(|| {
                 SimdError::new(format!(
@@ -12300,6 +13395,20 @@ fn project_local_path(name: &str, local_ty: &Type, path: &LeafPath) -> Result<Ty
                     field, local_ty, name
                 ))
             })?,
+            Type::Tuple(items) => {
+                let Some(tuple_index) = parse_tuple_leaf_name(field) else {
+                    return Err(SimdError::new(format!(
+                        "cannot project tuple field '{}' from type {:?} for local '{}'",
+                        field, local_ty, name
+                    )));
+                };
+                items.get(tuple_index).cloned().ok_or_else(|| {
+                    SimdError::new(format!(
+                        "cannot project tuple field '{}' from type {:?} for local '{}'",
+                        field, local_ty, name
+                    ))
+                })?
+            }
             _ => {
                 return Err(SimdError::new(format!(
                     "cannot project field '{}' from type {:?} for local '{}'",
@@ -12309,9 +13418,16 @@ fn project_local_path(name: &str, local_ty: &Type, path: &LeafPath) -> Result<Ty
         };
         expr = TypedExpr {
             ty: field_ty,
-            kind: TypedExprKind::Project {
-                base: Box::new(expr),
-                field: field.clone(),
+            kind: if is_tuple_base {
+                TypedExprKind::TupleProject {
+                    base: Box::new(expr),
+                    index: parse_tuple_leaf_name(field).unwrap_or(0),
+                }
+            } else {
+                TypedExprKind::Project {
+                    base: Box::new(expr),
+                    field: field.clone(),
+                }
             },
         };
         if index + 1 == path.0.len() {
@@ -12321,13 +13437,9 @@ fn project_local_path(name: &str, local_ty: &Type, path: &LeafPath) -> Result<Ty
     Ok(expr)
 }
 
-fn advance_field_for_projection(
-    base: &TypedExpr,
-    leaf_path: &LeafPath,
-    field: &str,
-) -> LeafPath {
+fn advance_field_for_projection(base: &TypedExpr, leaf_path: &LeafPath, field: &str) -> LeafPath {
     if leaf_path.is_root() {
-        if matches!(base.ty, Type::Record(_)) {
+        if matches!(base.ty, Type::Record(_) | Type::Tuple(_)) {
             return LeafPath(vec![field.to_string()]);
         }
         return leaf_path.clone();
@@ -12352,6 +13464,18 @@ fn wasm_param_abi_from_single_type(ty: &Type) -> Result<WasmParamAbi> {
         Type::TypeToken(_) => Err(SimdError::new(
             "Wasm backend does not support Type witness entry parameters",
         )),
+        Type::Tuple(items) => Ok(WasmParamAbi::Record {
+            fields: items
+                .iter()
+                .enumerate()
+                .map(|(index, item_ty)| {
+                    Ok((
+                        tuple_leaf_name(index),
+                        wasm_param_abi_from_single_type(item_ty)?,
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?,
+        }),
         Type::Record(fields) => Ok(WasmParamAbi::Record {
             fields: fields
                 .iter()
@@ -12392,6 +13516,18 @@ fn wasm_result_abi_from_type(ty: &Type, param_types: &[Type]) -> Result<WasmResu
         Type::TypeToken(_) => Err(SimdError::new(
             "Wasm backend does not support Type witness entry results",
         )),
+        Type::Tuple(items) => Ok(WasmResultAbi::Record {
+            fields: items
+                .iter()
+                .enumerate()
+                .map(|(index, item_ty)| {
+                    Ok((
+                        tuple_leaf_name(index),
+                        wasm_result_abi_from_type(item_ty, param_types)?,
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?,
+        }),
         Type::Record(fields) => Ok(WasmResultAbi::Record {
             fields: fields
                 .iter()
@@ -12419,6 +13555,7 @@ fn type_contains_bulk_leaf(ty: &Type) -> bool {
     match ty {
         Type::Bulk(_, _) => true,
         Type::Named(name, args) if is_wasm_string_named_type(name, args) => true,
+        Type::Tuple(items) => items.iter().any(type_contains_bulk_leaf),
         Type::Record(fields) => fields
             .iter()
             .any(|(_, field_ty)| type_contains_bulk_leaf(field_ty)),
@@ -12439,7 +13576,9 @@ fn wasm_leaf_result_abi_from_type(ty: &Type) -> Result<WasmLeafResultAbi> {
         Type::TypeToken(_) => Err(SimdError::new(
             "leaf result ABI cannot contain Type witness values",
         )),
-        Type::Record(_) => Err(SimdError::new("leaf result ABI cannot contain records")),
+        Type::Tuple(_) | Type::Record(_) => Err(SimdError::new(
+            "leaf result ABI cannot contain tuple/record products",
+        )),
         Type::Fun(_, _) => Err(SimdError::new("leaf result ABI cannot contain functions")),
         Type::Named(name, args) if is_wasm_enum_named_type(name, args) => {
             Ok(WasmLeafResultAbi::Scalar { prim: Prim::I32 })
@@ -12480,7 +13619,9 @@ fn type_at_leaf_path(ty: &Type, leaf_path: &LeafPath) -> Result<Type> {
             Type::TypeToken(_) => Err(SimdError::new(
                 "Type witness values cannot be used as leaf values",
             )),
-            Type::Record(_) => Err(SimdError::new("record type requires a non-empty leaf path")),
+            Type::Tuple(_) | Type::Record(_) => Err(SimdError::new(
+                "tuple/record type requires a non-empty leaf path",
+            )),
             Type::Fun(_, _) => Err(SimdError::new(
                 "function types cannot be used as leaf values",
             )),
@@ -12494,6 +13635,18 @@ fn type_at_leaf_path(ty: &Type, leaf_path: &LeafPath) -> Result<Type> {
         unreachable!("non-root leaf path must have a head");
     };
     match ty {
+        Type::Tuple(items) => {
+            let Some(index) = parse_tuple_leaf_name(head) else {
+                return Err(SimdError::new(format!(
+                    "tuple leaf '{}' is not a valid tuple index",
+                    head
+                )));
+            };
+            let item = items
+                .get(index)
+                .ok_or_else(|| SimdError::new(format!("tuple type is missing field '{}'", head)))?;
+            type_at_leaf_path(item, &tail)
+        }
         Type::Record(fields) => {
             let field = fields.get(head).ok_or_else(|| {
                 SimdError::new(format!("record type is missing field '{}'", head))
@@ -12501,7 +13654,7 @@ fn type_at_leaf_path(ty: &Type, leaf_path: &LeafPath) -> Result<Type> {
             type_at_leaf_path(field, &tail)
         }
         _ => Err(SimdError::new(format!(
-            "cannot select field '{}' from non-record type {:?}",
+            "cannot select field '{}' from non-product type {:?}",
             head, ty
         ))),
     }
@@ -12553,10 +13706,9 @@ fn build_engine() -> Result<Engine> {
     config.cranelift_opt_level(OptLevel::Speed);
     let cache_config_path = ensure_wasmtime_cache_config()?;
     config.cache(Some(
-        Cache::from_file(Some(std::path::Path::new(&cache_config_path)))
-            .map_err(|error| {
-                SimdError::new(format!("failed to load Wasmtime cache config: {error}"))
-            })?,
+        Cache::from_file(Some(std::path::Path::new(&cache_config_path))).map_err(|error| {
+            SimdError::new(format!("failed to load Wasmtime cache config: {error}"))
+        })?,
     ));
     Engine::new(&config).map_err(|error| SimdError::new(format!("wasmtime engine error: {error}")))
 }
@@ -12603,7 +13755,7 @@ fn summarize_function_param_uses(
     let mut summary = vec![UsageCount::Zero; arity];
     let clauses = match &function.kind {
         LoweredKind::Scalar { clauses }
-        | LoweredKind::Structural { clauses }
+        | LoweredKind::Structural { clauses, .. }
         | LoweredKind::Kernel { clauses, .. } => clauses,
     };
     for clause in clauses {
@@ -13309,6 +14461,23 @@ fn flatten_wasm_value(
                 flatten_wasm_value(field_value, field_abi, out, bulk_info)?;
             }
         }
+        (Value::Tuple(items), WasmParamAbi::Record { fields: abi_fields }) => {
+            for (name, field_abi) in abi_fields {
+                let Some(index) = parse_tuple_leaf_name(name) else {
+                    return Err(SimdError::new(format!(
+                        "tuple Wasm ABI field '{}' is not a numeric tuple index",
+                        name
+                    )));
+                };
+                let field_value = items.get(index).ok_or_else(|| {
+                    SimdError::new(format!(
+                        "tuple runtime argument is missing element {}",
+                        index
+                    ))
+                })?;
+                flatten_wasm_value(field_value, field_abi, out, bulk_info)?;
+            }
+        }
         (Value::Scalar(_), WasmParamAbi::Bulk { prim }) => {
             return Err(SimdError::new(format!(
                 "Wasm bulk argument expected {:?}, found scalar",
@@ -13330,6 +14499,18 @@ fn flatten_wasm_value(
         (Value::Record(_), WasmParamAbi::Bulk { prim }) => {
             return Err(SimdError::new(format!(
                 "Wasm bulk argument expected {:?}, found record",
+                prim
+            )));
+        }
+        (Value::Tuple(_), WasmParamAbi::Scalar { prim }) => {
+            return Err(SimdError::new(format!(
+                "Wasm scalar argument expected {:?}, found tuple",
+                prim
+            )));
+        }
+        (Value::Tuple(_), WasmParamAbi::Bulk { prim }) => {
+            return Err(SimdError::new(format!(
+                "Wasm bulk argument expected {:?}, found tuple",
                 prim
             )));
         }
@@ -13387,7 +14568,7 @@ fn flatten_wasm_value(
         }
         (value, WasmParamAbi::Record { .. }) => {
             return Err(SimdError::new(format!(
-                "record Wasm ABI expected a record value, found {:?}",
+                "record/tuple Wasm ABI expected a product value, found {:?}",
                 value
             )));
         }
@@ -13406,14 +14587,30 @@ fn rebuild_wasm_value_from_abi(
             .cloned()
             .ok_or_else(|| SimdError::new(format!("missing leaf result for path {:?}", prefix))),
         WasmResultAbi::Record { fields } => {
-            let mut record = BTreeMap::new();
-            for (name, field_abi) in fields {
-                record.insert(
-                    name.clone(),
-                    rebuild_wasm_value_from_abi(field_abi, leaves, &prefix.child(name))?,
-                );
+            let tuple_like = fields
+                .iter()
+                .enumerate()
+                .all(|(index, (name, _))| parse_tuple_leaf_name(name) == Some(index));
+            if tuple_like {
+                let mut items = Vec::with_capacity(fields.len());
+                for (name, field_abi) in fields {
+                    items.push(rebuild_wasm_value_from_abi(
+                        field_abi,
+                        leaves,
+                        &prefix.child(name),
+                    )?);
+                }
+                Ok(Value::Tuple(items))
+            } else {
+                let mut record = BTreeMap::new();
+                for (name, field_abi) in fields {
+                    record.insert(
+                        name.clone(),
+                        rebuild_wasm_value_from_abi(field_abi, leaves, &prefix.child(name))?,
+                    );
+                }
+                Ok(Value::Record(record))
             }
-            Ok(Value::Record(record))
         }
     }
 }
@@ -13602,7 +14799,7 @@ fn execute_wasm_artifact_direct_in_runtime(
             _ => {
                 return Err(SimdError::new(
                     "Wasm bulk result shape must come from a bulk/string input argument",
-                ))
+                ));
             }
         };
         let bulk = BulkShapeInfo {
@@ -13644,7 +14841,7 @@ fn execute_wasm_artifact_direct_in_runtime(
                             return Err(SimdError::new(format!(
                                 "Wasm enum entry '{}' returned non-i32 handle: {:?}",
                                 artifact.export_name, other
-                            )))
+                            )));
                         }
                     };
                     let wasm_layout = lookup_specialized_wasm_enum_layout(
@@ -13817,15 +15014,12 @@ fn decode_wasm_enum_value_from_ptr(
     let mut ctor_rows = BTreeMap::<String, Vec<EnumCtorRow>>::new();
     let mut ctor_layouts = wasm_layout.ctors.values().cloned().collect::<Vec<_>>();
     ctor_layouts.sort_by_key(|layout| layout.tag);
-    let mut row_cursor = ctor_table_ptr + (usize::from(wasm_layout.max_tag) + 1) * ENUM_CTOR_TABLE_ENTRY_BYTES as usize;
+    let mut row_cursor = ctor_table_ptr
+        + (usize::from(wasm_layout.max_tag) + 1) * ENUM_CTOR_TABLE_ENTRY_BYTES as usize;
     for ctor_layout in &ctor_layouts {
-        let row_count = usize::try_from(
-            next_slot_by_tag
-                .get(&ctor_layout.tag)
-                .copied()
-                .unwrap_or(0),
-        )
-        .map_err(|_| SimdError::new("enum reconstructed row-count conversion failed"))?;
+        let row_count =
+            usize::try_from(next_slot_by_tag.get(&ctor_layout.tag).copied().unwrap_or(0))
+                .map_err(|_| SimdError::new("enum reconstructed row-count conversion failed"))?;
         let rows_ptr = row_cursor;
         let mut rows = Vec::with_capacity(row_count);
         for row_index in 0..row_count {
@@ -13911,8 +15105,10 @@ fn decode_wasm_enum_row_field_value(
                 usize::try_from(string_len)
                     .map_err(|_| SimdError::new("string field length conversion failed"))?,
                 Prim::Char,
-                vec![usize::try_from(string_len)
-                    .map_err(|_| SimdError::new("string field shape conversion failed"))?],
+                vec![
+                    usize::try_from(string_len)
+                        .map_err(|_| SimdError::new("string field shape conversion failed"))?,
+                ],
             )?;
             let mut text = String::new();
             for scalar in bulk.elements {
@@ -14087,8 +15283,9 @@ fn wasmtime_to_scalar(value: Val, prim: Prim) -> Result<ScalarValue> {
     match (value, prim) {
         (Val::I32(value), Prim::I32) => Ok(ScalarValue::I32(value)),
         (Val::I32(value), Prim::Char) => {
-            let codepoint = u32::try_from(value)
-                .map_err(|_| SimdError::new(format!("invalid negative char codepoint '{}'", value)))?;
+            let codepoint = u32::try_from(value).map_err(|_| {
+                SimdError::new(format!("invalid negative char codepoint '{}'", value))
+            })?;
             let ch = char::from_u32(codepoint).ok_or_else(|| {
                 SimdError::new(format!(
                     "invalid char codepoint '{}' returned from Wasm",
@@ -14156,6 +15353,21 @@ mod tests {
         assert!(
             wat.contains("plan=vec1") || wat.contains("plan=vec2") || wat.contains("plan=vec4")
         );
+    }
+
+    #[test]
+    fn structural_optimizer_reports_use_structural_loop_exec() {
+        let src = "enum List a =\n  | Nil\n  | Cons a (List a)\n\nlen : List i64 -> i64\nlen Nil = 0\nlen (Cons _ xs) = 1 + len xs\n\nmain : i64\nmain = len (Cons 1 (Cons 2 Nil))\n";
+        let artifact = compile_wasm_main(src, "main").expect("artifact should compile");
+        let report = artifact
+            .optimizer_reports
+            .iter()
+            .find(|report| report.function == "len")
+            .expect("len optimizer report should exist");
+        assert_eq!(report.intent, IntentClass::Structural);
+        assert_eq!(report.structural_exec, StructuralExecMode::StructuralLoop);
+        let wat = wat_main(src, "main").expect("WAT should be printable");
+        assert!(wat.contains("fn=len intent=Structural exec=structural-loop"));
     }
 
     #[test]
@@ -14247,7 +15459,7 @@ mod tests {
             result: WasmResultAbi::Scalar { prim: Prim::I64 },
             result_type: Type::Scalar(Prim::I64),
             enum_ctors: BTreeMap::new(),
-        wasm_enum_layouts: BTreeMap::new(),
+            wasm_enum_layouts: BTreeMap::new(),
             grouped_export: None,
             leaf_exports: vec![WasmLeafExport {
                 leaf_path: LeafPath::root(),
@@ -14576,7 +15788,7 @@ mod tests {
             eprintln!("    result={:?}", function.result);
             match &function.kind {
                 LoweredKind::Scalar { clauses }
-                | LoweredKind::Structural { clauses }
+                | LoweredKind::Structural { clauses, .. }
                 | LoweredKind::Kernel { clauses, .. } => {
                     for (idx, clause) in clauses.iter().enumerate() {
                         eprintln!("    clause {} patterns={:?}", idx, clause.patterns);
@@ -14592,8 +15804,7 @@ mod tests {
 
     #[test]
     fn debug_axpy2_record_wasm_pipeline() {
-        let src =
-            "axpy2 : i64 -> {x:i64,y:i64} -> {x:i64,y:i64} -> {x:i64,y:i64}\naxpy2 a u v = { x = a * u.x + v.x, y = a * u.y + v.y }\nmain : i64 -> {x:i64[n],y:i64[n]} -> {x:i64[n],y:i64[n]} -> {x:i64[n],y:i64[n]}\nmain a us vs = axpy2 a us vs";
+        let src = "axpy2 : i64 -> {x:i64,y:i64} -> {x:i64,y:i64} -> {x:i64,y:i64}\naxpy2 a u v = { x = a * u.x + v.x, y = a * u.y + v.y }\nmain : i64 -> {x:i64[n],y:i64[n]} -> {x:i64[n],y:i64[n]} -> {x:i64[n],y:i64[n]}\nmain a us vs = axpy2 a us vs";
         let (_surface, _module, checked) = compile_frontend(src).unwrap();
         let specialized = specialize_checked_program_for_main(&checked, "main").unwrap();
         let lowered_ready = eliminate_non_escaping_lambdas_program(&specialized.checked).unwrap();
@@ -14623,7 +15834,10 @@ mod tests {
         let canonical = canonicalize_backend_higher_order_program(&lowered_ready).unwrap();
         eprintln!("canonical checked:\n{:#?}", canonical);
         let normalized = normalize_records(&canonical);
-        eprintln!("normalize_records result: {:?}", normalized.as_ref().map(|_| "ok"));
+        eprintln!(
+            "normalize_records result: {:?}",
+            normalized.as_ref().map(|_| "ok")
+        );
         let normalized = normalized.unwrap();
         eprintln!("normalized functions:");
         for function in &normalized.functions {
@@ -14644,7 +15858,10 @@ mod tests {
             }
         }
         let normalized_from_plan = normalize_records(&plan.checked);
-        eprintln!("normalize plan.checked result: {:?}", normalized_from_plan.as_ref().map(|_| "ok"));
+        eprintln!(
+            "normalize plan.checked result: {:?}",
+            normalized_from_plan.as_ref().map(|_| "ok")
+        );
         let _ = normalized_from_plan.expect("plan checked should normalize");
     }
 
@@ -14944,9 +16161,10 @@ mod tests {
         let eval_long_spaced = run_main(src, "main", "[\"[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]\"]")
             .expect("json parser adt example should handle spaced longer arrays in evaluator")
             .to_json_string();
-        let wasm_long_spaced = run_wasm_main(src, "main", "[\"[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]\"]")
-            .expect("json parser adt example should handle spaced longer arrays in wasm")
-            .to_json_string();
+        let wasm_long_spaced =
+            run_wasm_main(src, "main", "[\"[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]\"]")
+                .expect("json parser adt example should handle spaced longer arrays in wasm")
+                .to_json_string();
         assert_eq!(eval_long_spaced, wasm_long_spaced);
         assert_eq!(wasm_long_spaced, "1400");
 
@@ -14967,7 +16185,8 @@ mod tests {
         )
         .expect("json parser adt example should run in evaluator with direct string args")
         .to_json_string();
-        let artifact = compile_wasm_main(src, "main").expect("json parser adt example should compile to wasm");
+        let artifact =
+            compile_wasm_main(src, "main").expect("json parser adt example should compile to wasm");
         let wasm_object = run_wasm_artifact(
             &artifact,
             &[Value::String("{\"a\":1,\"b\":[2]}".to_string())],
@@ -15012,12 +16231,10 @@ mod tests {
         )
         .expect("json parser adt example should parse unicode escape shape in evaluator")
         .to_json_string();
-        let wasm_unicode = run_wasm_artifact(
-            &artifact,
-            &[Value::String("\"\\u1234\"".to_string())],
-        )
-        .expect("json parser adt example should parse unicode escape shape in wasm")
-        .to_json_string();
+        let wasm_unicode =
+            run_wasm_artifact(&artifact, &[Value::String("\"\\u1234\"".to_string())])
+                .expect("json parser adt example should parse unicode escape shape in wasm")
+                .to_json_string();
         assert_eq!(eval_unicode, wasm_unicode);
         assert_eq!(wasm_unicode, "201");
 
@@ -15028,28 +16245,21 @@ mod tests {
         )
         .expect("json parser adt example should parse lowercase unicode escape in evaluator")
         .to_json_string();
-        let wasm_unicode_12af = run_wasm_artifact(
-            &artifact,
-            &[Value::String("\"\\u12af\"".to_string())],
-        )
-        .expect("json parser adt example should parse lowercase unicode escape in wasm")
-        .to_json_string();
+        let wasm_unicode_12af =
+            run_wasm_artifact(&artifact, &[Value::String("\"\\u12af\"".to_string())])
+                .expect("json parser adt example should parse lowercase unicode escape in wasm")
+                .to_json_string();
         assert_eq!(eval_unicode_12af, wasm_unicode_12af);
         assert_eq!(wasm_unicode_12af, "201");
 
-        let eval_invalid_escape = run_compiled_main(
-            &compiled,
-            "main",
-            &[Value::String("\"\\x\"".to_string())],
-        )
-        .expect("json parser adt example should report invalid escape in evaluator")
-        .to_json_string();
-        let wasm_invalid_escape = run_wasm_artifact(
-            &artifact,
-            &[Value::String("\"\\x\"".to_string())],
-        )
-        .expect("json parser adt example should report invalid escape in wasm")
-        .to_json_string();
+        let eval_invalid_escape =
+            run_compiled_main(&compiled, "main", &[Value::String("\"\\x\"".to_string())])
+                .expect("json parser adt example should report invalid escape in evaluator")
+                .to_json_string();
+        let wasm_invalid_escape =
+            run_wasm_artifact(&artifact, &[Value::String("\"\\x\"".to_string())])
+                .expect("json parser adt example should report invalid escape in wasm")
+                .to_json_string();
         assert_eq!(eval_invalid_escape, wasm_invalid_escape);
         assert_eq!(wasm_invalid_escape, "-202");
 
@@ -15060,19 +16270,18 @@ mod tests {
         )
         .expect("json parser adt example should reject non-hex unicode escape in evaluator")
         .to_json_string();
-        let wasm_invalid_unicode = run_wasm_artifact(
-            &artifact,
-            &[Value::String("\"\\u12x4\"".to_string())],
-        )
-        .expect("json parser adt example should reject non-hex unicode escape in wasm")
-        .to_json_string();
+        let wasm_invalid_unicode =
+            run_wasm_artifact(&artifact, &[Value::String("\"\\u12x4\"".to_string())])
+                .expect("json parser adt example should reject non-hex unicode escape in wasm")
+                .to_json_string();
         assert_eq!(eval_invalid_unicode, wasm_invalid_unicode);
         assert_eq!(wasm_invalid_unicode, "-202");
 
         let surrogate_pair_input = Value::String("\"\\ud834\\udd1e\"".to_string());
-        let eval_surrogate_pair = run_compiled_main(&compiled, "main", &[surrogate_pair_input.clone()])
-            .expect("json parser adt example should reject surrogate pairs in evaluator")
-            .to_json_string();
+        let eval_surrogate_pair =
+            run_compiled_main(&compiled, "main", &[surrogate_pair_input.clone()])
+                .expect("json parser adt example should reject surrogate pairs in evaluator")
+                .to_json_string();
         let wasm_surrogate_pair = run_wasm_artifact(&artifact, &[surrogate_pair_input])
             .expect("json parser adt example should reject surrogate pairs in wasm")
             .to_json_string();
@@ -15086,12 +16295,10 @@ mod tests {
         )
         .expect("json parser adt example should reject unpaired high surrogates in evaluator")
         .to_json_string();
-        let wasm_unpaired_high = run_wasm_artifact(
-            &artifact,
-            &[Value::String("\"\\ud834\"".to_string())],
-        )
-        .expect("json parser adt example should reject unpaired high surrogates in wasm")
-        .to_json_string();
+        let wasm_unpaired_high =
+            run_wasm_artifact(&artifact, &[Value::String("\"\\ud834\"".to_string())])
+                .expect("json parser adt example should reject unpaired high surrogates in wasm")
+                .to_json_string();
         assert_eq!(eval_unpaired_high, wasm_unpaired_high);
         assert_eq!(wasm_unpaired_high, "-202");
 
@@ -15102,27 +16309,27 @@ mod tests {
         )
         .expect("json parser adt example should reject unpaired low surrogates in evaluator")
         .to_json_string();
-        let wasm_unpaired_low = run_wasm_artifact(
-            &artifact,
-            &[Value::String("\"\\udd1e\"".to_string())],
-        )
-        .expect("json parser adt example should reject unpaired low surrogates in wasm")
-        .to_json_string();
+        let wasm_unpaired_low =
+            run_wasm_artifact(&artifact, &[Value::String("\"\\udd1e\"".to_string())])
+                .expect("json parser adt example should reject unpaired low surrogates in wasm")
+                .to_json_string();
         assert_eq!(eval_unpaired_low, wasm_unpaired_low);
         assert_eq!(wasm_unpaired_low, "-202");
 
-        let eval_trailing = run_compiled_main(&compiled, "main", &[Value::String("nullx".to_string())])
-            .expect("json parser adt example should report trailing garbage in evaluator")
-            .to_json_string();
+        let eval_trailing =
+            run_compiled_main(&compiled, "main", &[Value::String("nullx".to_string())])
+                .expect("json parser adt example should report trailing garbage in evaluator")
+                .to_json_string();
         let wasm_trailing = run_wasm_artifact(&artifact, &[Value::String("nullx".to_string())])
             .expect("json parser adt example should report trailing garbage in wasm")
             .to_json_string();
         assert_eq!(eval_trailing, wasm_trailing);
         assert_eq!(wasm_trailing, "-999");
 
-        let eval_decimal = run_compiled_main(&compiled, "main", &[Value::String("1.25".to_string())])
-            .expect("json parser adt example should parse decimal number in evaluator")
-            .to_json_string();
+        let eval_decimal =
+            run_compiled_main(&compiled, "main", &[Value::String("1.25".to_string())])
+                .expect("json parser adt example should parse decimal number in evaluator")
+                .to_json_string();
         let wasm_decimal = run_wasm_artifact(&artifact, &[Value::String("1.25".to_string())])
             .expect("json parser adt example should parse decimal number in wasm")
             .to_json_string();
@@ -15138,45 +16345,51 @@ mod tests {
         assert_eq!(eval_exp, wasm_exp);
         assert_eq!(wasm_exp, "102");
 
-        let eval_exp_negative = run_compiled_main(&compiled, "main", &[Value::String("-3.4e5".to_string())])
-            .expect("json parser adt example should parse signed exponent number in evaluator")
-            .to_json_string();
-        let wasm_exp_negative = run_wasm_artifact(&artifact, &[Value::String("-3.4e5".to_string())])
-            .expect("json parser adt example should parse signed exponent number in wasm")
-            .to_json_string();
+        let eval_exp_negative =
+            run_compiled_main(&compiled, "main", &[Value::String("-3.4e5".to_string())])
+                .expect("json parser adt example should parse signed exponent number in evaluator")
+                .to_json_string();
+        let wasm_exp_negative =
+            run_wasm_artifact(&artifact, &[Value::String("-3.4e5".to_string())])
+                .expect("json parser adt example should parse signed exponent number in wasm")
+                .to_json_string();
         assert_eq!(eval_exp_negative, wasm_exp_negative);
         assert_eq!(wasm_exp_negative, "97");
 
-        let eval_decimal_dot = run_compiled_main(&compiled, "main", &[Value::String("1.".to_string())])
-            .expect("json parser adt example should reject dangling decimal point in evaluator")
-            .to_json_string();
+        let eval_decimal_dot =
+            run_compiled_main(&compiled, "main", &[Value::String("1.".to_string())])
+                .expect("json parser adt example should reject dangling decimal point in evaluator")
+                .to_json_string();
         let wasm_decimal_dot = run_wasm_artifact(&artifact, &[Value::String("1.".to_string())])
             .expect("json parser adt example should reject dangling decimal point in wasm")
             .to_json_string();
         assert_eq!(eval_decimal_dot, wasm_decimal_dot);
         assert_eq!(wasm_decimal_dot, "-302");
 
-        let eval_exponent = run_compiled_main(&compiled, "main", &[Value::String("1e".to_string())])
-            .expect("json parser adt example should reject dangling exponent in evaluator")
-            .to_json_string();
+        let eval_exponent =
+            run_compiled_main(&compiled, "main", &[Value::String("1e".to_string())])
+                .expect("json parser adt example should reject dangling exponent in evaluator")
+                .to_json_string();
         let wasm_exponent = run_wasm_artifact(&artifact, &[Value::String("1e".to_string())])
             .expect("json parser adt example should reject dangling exponent in wasm")
             .to_json_string();
         assert_eq!(eval_exponent, wasm_exponent);
         assert_eq!(wasm_exponent, "-303");
 
-        let eval_empty_array = run_compiled_main(&compiled, "main", &[Value::String("[]".to_string())])
-            .expect("json parser adt example should parse empty array in evaluator")
-            .to_json_string();
+        let eval_empty_array =
+            run_compiled_main(&compiled, "main", &[Value::String("[]".to_string())])
+                .expect("json parser adt example should parse empty array in evaluator")
+                .to_json_string();
         let wasm_empty_array = run_wasm_artifact(&artifact, &[Value::String("[]".to_string())])
             .expect("json parser adt example should parse empty array in wasm")
             .to_json_string();
         assert_eq!(eval_empty_array, wasm_empty_array);
         assert_eq!(wasm_empty_array, "300");
 
-        let eval_empty_object = run_compiled_main(&compiled, "main", &[Value::String("{}".to_string())])
-            .expect("json parser adt example should parse empty object in evaluator")
-            .to_json_string();
+        let eval_empty_object =
+            run_compiled_main(&compiled, "main", &[Value::String("{}".to_string())])
+                .expect("json parser adt example should parse empty object in evaluator")
+                .to_json_string();
         let wasm_empty_object = run_wasm_artifact(&artifact, &[Value::String("{}".to_string())])
             .expect("json parser adt example should parse empty object in wasm")
             .to_json_string();
@@ -15224,13 +16437,17 @@ mod tests {
             "[{\"id\":1},{\"id\":2},{\"id\":3},{\"id\":4},{\"id\":5},{\"id\":6},{\"id\":7},{\"id\":8},{\"id\":9},{\"id\":10}]",
         ];
         for input in valid_json_corpus {
-            let eval_value = run_compiled_main(&compiled, "main", &[Value::String(input.to_string())])
-                .expect("json parser adt valid corpus should run in evaluator")
-                .to_json_string();
+            let eval_value =
+                run_compiled_main(&compiled, "main", &[Value::String(input.to_string())])
+                    .expect("json parser adt valid corpus should run in evaluator")
+                    .to_json_string();
             let wasm_value = run_wasm_artifact(&artifact, &[Value::String(input.to_string())])
                 .expect("json parser adt valid corpus should run in wasm")
                 .to_json_string();
-            assert_eq!(eval_value, wasm_value, "json corpus parity mismatch for input: {input}");
+            assert_eq!(
+                eval_value, wasm_value,
+                "json corpus parity mismatch for input: {input}"
+            );
             let score = eval_value
                 .parse::<i64>()
                 .expect("json parser adt corpus output should be numeric i64");
@@ -15240,12 +16457,14 @@ mod tests {
             );
         }
 
-        let eval_malformed_minus = run_compiled_main(&compiled, "main", &[Value::String("-abc".to_string())])
-            .expect("json parser adt example should report malformed minus in evaluator")
-            .to_json_string();
-        let wasm_malformed_minus = run_wasm_artifact(&artifact, &[Value::String("-abc".to_string())])
-            .expect("json parser adt example should report malformed minus in wasm")
-            .to_json_string();
+        let eval_malformed_minus =
+            run_compiled_main(&compiled, "main", &[Value::String("-abc".to_string())])
+                .expect("json parser adt example should report malformed minus in evaluator")
+                .to_json_string();
+        let wasm_malformed_minus =
+            run_wasm_artifact(&artifact, &[Value::String("-abc".to_string())])
+                .expect("json parser adt example should report malformed minus in wasm")
+                .to_json_string();
         assert_eq!(eval_malformed_minus, wasm_malformed_minus);
         assert_eq!(wasm_malformed_minus, "-301");
 
@@ -15278,7 +16497,6 @@ mod tests {
         assert_eq!(eval_debug_err, wasm_debug_err);
         assert!(wasm_debug_err.contains("JNum"));
         assert!(wasm_debug_err.contains("-302"));
-
     }
 
     #[test]
@@ -15296,7 +16514,10 @@ mod tests {
                 11_i64,
             ),
             ("[{\"x\":\"aa\"},{\"y\":[\"bbb\",\"cccc\"]},\"d\"]", 10_i64),
-            ("[\n  \"a\",\n  {\"b\": [\"cd\", \"efg\"]},\n  \"hij\"\n]", 9_i64),
+            (
+                "[\n  \"a\",\n  {\"b\": [\"cd\", \"efg\"]},\n  \"hij\"\n]",
+                9_i64,
+            ),
         ];
 
         for (input, expected) in cases {
@@ -15333,12 +16554,16 @@ mod tests {
     #[test]
     fn wasm_returns_recursive_enum_nil_debug() {
         let src = "enum List a =\n  | Nil\n  | Cons a (List a)\n\nmain : List i64\nmain = Nil\n";
-        assert_eq!(wasm_run(src, "main", "[]"), "{\"$enum\":\"Nil\",\"fields\":[]}");
+        assert_eq!(
+            wasm_run(src, "main", "[]"),
+            "{\"$enum\":\"Nil\",\"fields\":[]}"
+        );
     }
 
     #[test]
     fn wasm_returns_recursive_enum_cons_debug() {
-        let src = "enum List a =\n  | Nil\n  | Cons a (List a)\n\nmain : List i64\nmain = Cons 1 Nil\n";
+        let src =
+            "enum List a =\n  | Nil\n  | Cons a (List a)\n\nmain : List i64\nmain = Cons 1 Nil\n";
         let value = run_wasm_main(src, "main", "[]").expect("cons debug should run");
         assert_eq!(
             value.to_json_string(),
@@ -15434,6 +16659,30 @@ mod tests {
     fn wasm_matches_enum_payload_row_string_field_as_empty_slice() {
         let src = "enum Json =\n  | JNull\n\nenum ParseResult a =\n  | POk a string\n  | PErr i64\n\nrest_score : string -> i64\nrest_score [] = 10\nrest_score _ = 0 - 999\n\nunwrap : ParseResult Json -> i64\nunwrap (POk JNull rest) = rest_score rest\nunwrap _ = 0 - 999\n\nmain : string -> i64\nmain s = unwrap (POk JNull s)\n";
         assert_eq!(wasm_run(src, "main", "[\"\"]"), "10");
+    }
+
+    #[test]
+    fn wasm_returns_tuple_json_array() {
+        let src = "main : (i64, i64)\nmain = (1, 2)\n";
+        assert_eq!(wasm_run(src, "main", "[]"), "[1,2]");
+    }
+
+    #[test]
+    fn wasm_matches_tuple_argument_destructuring() {
+        let src = "fst : (i64, i64) -> i64\nfst (x, y) = x\nmain : i64\nmain = fst (4, 9)\n";
+        assert_eq!(wasm_run(src, "main", "[]"), "4");
+    }
+
+    #[test]
+    fn wasm_matches_tuple_projection() {
+        let src = "main : i64\nmain = (1, true).0\n";
+        assert_eq!(wasm_run(src, "main", "[]"), "1");
+    }
+
+    #[test]
+    fn wasm_accepts_tuple_json_array_argument() {
+        let src = "swap : (i64, i64) -> (i64, i64)\nswap (x, y) = (y, x)\nmain : (i64, i64) -> (i64, i64)\nmain p = swap p\n";
+        assert_eq!(wasm_run(src, "main", "[[3,4]]"), "[4,3]");
     }
 
     #[test]

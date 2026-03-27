@@ -235,7 +235,11 @@ fn hover_for_position(source: &str, position: Position) -> Option<Hover> {
         });
     }
 
-    if let Some(enum_decl) = module.enums.iter().find(|enum_decl| enum_decl.name == ident.name) {
+    if let Some(enum_decl) = module
+        .enums
+        .iter()
+        .find(|enum_decl| enum_decl.name == ident.name)
+    {
         let params = if enum_decl.params.is_empty() {
             String::new()
         } else {
@@ -672,12 +676,19 @@ fn collect_expr_local_types(expr: &TypedExpr, map: &mut BTreeMap<String, Vec<Typ
             }
             collect_expr_local_types(body, map);
         }
+        TypedExprKind::Tuple(items) => {
+            for item in items {
+                collect_expr_local_types(item, map);
+            }
+        }
         TypedExprKind::Record(fields) => {
             for value in fields.values() {
                 collect_expr_local_types(value, map);
             }
         }
-        TypedExprKind::Project { base, .. } => collect_expr_local_types(base, map),
+        TypedExprKind::Project { base, .. } | TypedExprKind::TupleProject { base, .. } => {
+            collect_expr_local_types(base, map)
+        }
         TypedExprKind::RecordUpdate { base, fields } => {
             collect_expr_local_types(base, map);
             for value in fields.values() {

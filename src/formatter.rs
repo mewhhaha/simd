@@ -206,6 +206,10 @@ fn format_type_atom(ty: &Type) -> String {
         Type::Scalar(prim) => format_prim(*prim).to_string(),
         Type::Bulk(prim, shape) => format!("{}{}", format_prim(*prim), format_shape(shape)),
         Type::TypeToken(inner) => format!("Type {}", format_type_atom(inner)),
+        Type::Tuple(items) => format!(
+            "({})",
+            items.iter().map(format_type).collect::<Vec<_>>().join(", ")
+        ),
         Type::Record(fields) => {
             let mut parts = Vec::with_capacity(fields.len());
             for (name, field_ty) in fields {
@@ -248,6 +252,14 @@ fn format_pattern(pattern: &Pattern) -> String {
         Pattern::Bool(value) => value.to_string(),
         Pattern::Char(value) => format_char_literal(*value),
         Pattern::Type(prim) => format_prim(*prim).to_string(),
+        Pattern::Tuple(items) => format!(
+            "({})",
+            items
+                .iter()
+                .map(format_pattern)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
         Pattern::Ctor(name, subpatterns) => {
             let mut out = name.to_string();
             for subpattern in subpatterns {
@@ -281,9 +293,20 @@ fn format_expr(expr: &Expr, min_prec: u8) -> String {
             format!("\\{} -> {}", param, format_expr(body, PREC_LET))
         }
         Expr::Let { bindings, body } => format_let_expr(bindings, body),
+        Expr::Tuple(items) => format!(
+            "({})",
+            items
+                .iter()
+                .map(|item| format_expr(item, PREC_LET))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
         Expr::Record(fields) => format_record_fields(fields),
         Expr::Project(base, field) => {
             format!("{}.{}", format_expr(base, PREC_POSTFIX), field)
+        }
+        Expr::TupleProject(base, index) => {
+            format!("{}.{}", format_expr(base, PREC_POSTFIX), index)
         }
         Expr::RecordUpdate { base, fields } => format!(
             "{} {}",
@@ -377,7 +400,7 @@ fn expr_precedence(expr: &Expr) -> u8 {
             PrimOp::Mul | PrimOp::Div | PrimOp::Mod => PREC_MUL,
         },
         Expr::App(_, _) => PREC_APP,
-        Expr::Project(_, _) | Expr::RecordUpdate { .. } => PREC_POSTFIX,
+        Expr::Project(_, _) | Expr::TupleProject(_, _) | Expr::RecordUpdate { .. } => PREC_POSTFIX,
         Expr::Lambda { .. } => PREC_LET,
         Expr::Ref(_)
         | Expr::Int(_)
@@ -385,6 +408,7 @@ fn expr_precedence(expr: &Expr) -> u8 {
         | Expr::Bool(_)
         | Expr::Char(_)
         | Expr::String(_)
+        | Expr::Tuple(_)
         | Expr::Record(_) => PREC_ATOM,
     }
 }
@@ -436,7 +460,11 @@ fn format_char_literal(value: char) -> String {
     out
 }
 
-fn format_slice_pattern(prefix: &[Pattern], suffix: &[Pattern], rest: Option<&crate::SliceRest>) -> String {
+fn format_slice_pattern(
+    prefix: &[Pattern],
+    suffix: &[Pattern],
+    rest: Option<&crate::SliceRest>,
+) -> String {
     let mut parts = Vec::<String>::new();
     for pattern in prefix {
         parts.push(format_pattern(pattern));

@@ -1,6 +1,6 @@
 use super::*;
 use crate::wasm_backend::{
-    LambdaLoweringMode, WasmHigherOrderReport, WasmLeafExport, WasmLeafResultAbi,
+    LambdaLoweringMode, StructuralExecMode, WasmHigherOrderReport, WasmLeafExport, WasmLeafResultAbi,
     WasmOptimizationReport,
 };
 use serde_json::Value as SerdeJsonValue;
@@ -519,6 +519,7 @@ fn summarize_optimizer_reports(reports: &[WasmOptimizationReport]) -> String {
         left.function
             .cmp(&right.function)
             .then(intent_label(&left.intent).cmp(intent_label(&right.intent)))
+            .then(left.structural_exec.cmp(&right.structural_exec))
             .then(left.vector_unroll.cmp(&right.vector_unroll))
             .then(left.vectorizable.cmp(&right.vectorizable))
             .then(left.fallback_reason.cmp(&right.fallback_reason))
@@ -533,19 +534,45 @@ fn summarize_optimizer_reports(reports: &[WasmOptimizationReport]) -> String {
                 4 => "vec4",
                 _ => "vecN",
             };
+            let exec = match report.structural_exec {
+                StructuralExecMode::Scalar => "scalar",
+                StructuralExecMode::StructuralLoop => "structural-loop",
+                StructuralExecMode::StructuralBatched => "structural-batched",
+            };
+            let structural = if report.structural_state_count == 0
+                && report.structural_transition_count == 0
+                && report.structural_span_ops == 0
+                && report.structural_enum_ops == 0
+                && report.structural_scc.is_none()
+            {
+                String::new()
+            } else {
+                format!(
+                    " scc={:?} structural=states:{} transitions:{} span:{} enum:{}",
+                    report.structural_scc,
+                    report.structural_state_count,
+                    report.structural_transition_count,
+                    report.structural_span_ops,
+                    report.structural_enum_ops
+                )
+            };
             match report.fallback_reason {
                 Some(reason) => format!(
-                    "{}:{} plan={} fallback={}",
+                    "{}:{} exec={} plan={}{} fallback={}",
                     report.function,
                     intent_label(&report.intent),
+                    exec,
                     plan,
+                    structural,
                     reason
                 ),
                 None => format!(
-                    "{}:{} plan={}",
+                    "{}:{} exec={} plan={}{}",
                     report.function,
                     intent_label(&report.intent),
-                    plan
+                    exec,
+                    plan,
+                    structural
                 ),
             }
         })
@@ -2341,9 +2368,15 @@ fn handcrafted_matrix_axpy2_record_artifact(prim: Prim) -> Result<WasmArtifact> 
         optimizer_reports: vec![WasmOptimizationReport {
             function: format!("handcrafted_matrix_axpy2_record_{}", prim_label(prim)),
             intent: IntentClass::GroupedMap,
+            structural_exec: StructuralExecMode::Scalar,
             vectorizable: true,
             vector_unroll: 1,
             fallback_reason: None,
+            structural_scc: None,
+            structural_state_count: 0,
+            structural_transition_count: 0,
+            structural_span_ops: 0,
+            structural_enum_ops: 0,
         }],
         higher_order_reports: vec![WasmHigherOrderReport {
             function: format!("handcrafted_matrix_axpy2_record_{}", prim_label(prim)),
@@ -2453,9 +2486,15 @@ fn handcrafted_matrix_image_tone_rgb_f32_artifact() -> Result<WasmArtifact> {
         optimizer_reports: vec![WasmOptimizationReport {
             function: "handcrafted_matrix_image_tone_rgb_f32".to_string(),
             intent: IntentClass::GroupedMap,
+            structural_exec: StructuralExecMode::Scalar,
             vectorizable: true,
             vector_unroll: 1,
             fallback_reason: None,
+            structural_scc: None,
+            structural_state_count: 0,
+            structural_transition_count: 0,
+            structural_span_ops: 0,
+            structural_enum_ops: 0,
         }],
         higher_order_reports: vec![WasmHigherOrderReport {
             function: "handcrafted_matrix_image_tone_rgb_f32".to_string(),
@@ -2607,9 +2646,15 @@ fn handcrafted_matrix_image_blend_rgb_f32_artifact() -> Result<WasmArtifact> {
         optimizer_reports: vec![WasmOptimizationReport {
             function: "handcrafted_matrix_image_blend_rgb_f32".to_string(),
             intent: IntentClass::GroupedMap,
+            structural_exec: StructuralExecMode::Scalar,
             vectorizable: true,
             vector_unroll: 1,
             fallback_reason: None,
+            structural_scc: None,
+            structural_state_count: 0,
+            structural_transition_count: 0,
+            structural_span_ops: 0,
+            structural_enum_ops: 0,
         }],
         higher_order_reports: vec![WasmHigherOrderReport {
             function: "handcrafted_matrix_image_blend_rgb_f32".to_string(),
@@ -2659,9 +2704,15 @@ fn build_handcrafted_single_leaf_artifact(
         optimizer_reports: vec![WasmOptimizationReport {
             function: report_name,
             intent,
+            structural_exec: StructuralExecMode::Scalar,
             vectorizable: true,
             vector_unroll: 1,
             fallback_reason: None,
+            structural_scc: None,
+            structural_state_count: 0,
+            structural_transition_count: 0,
+            structural_span_ops: 0,
+            structural_enum_ops: 0,
         }],
         higher_order_reports: vec![WasmHigherOrderReport {
             function: "handcrafted_single_leaf".to_string(),
@@ -3517,9 +3568,15 @@ fn handcrafted_unary_i64_artifact(
         optimizer_reports: vec![WasmOptimizationReport {
             function: report_name.to_string(),
             intent: IntentClass::MapUnary,
+            structural_exec: StructuralExecMode::Scalar,
             vectorizable: true,
             vector_unroll: 1,
             fallback_reason: None,
+            structural_scc: None,
+            structural_state_count: 0,
+            structural_transition_count: 0,
+            structural_span_ops: 0,
+            structural_enum_ops: 0,
         }],
         higher_order_reports: vec![WasmHigherOrderReport {
             function: report_name.to_string(),
@@ -3667,9 +3724,15 @@ fn handcrafted_square_f32_artifact() -> Result<WasmArtifact> {
         optimizer_reports: vec![WasmOptimizationReport {
             function: "handcrafted_square_f32".to_string(),
             intent: IntentClass::MapUnary,
+            structural_exec: StructuralExecMode::Scalar,
             vectorizable: true,
             vector_unroll: 1,
             fallback_reason: None,
+            structural_scc: None,
+            structural_state_count: 0,
+            structural_transition_count: 0,
+            structural_span_ops: 0,
+            structural_enum_ops: 0,
         }],
         higher_order_reports: vec![WasmHigherOrderReport {
             function: "handcrafted_square_f32".to_string(),
@@ -3865,9 +3928,15 @@ fn handcrafted_axpy_i64_artifact() -> Result<WasmArtifact> {
         optimizer_reports: vec![WasmOptimizationReport {
             function: "handwritten_axpy_i64".to_string(),
             intent: IntentClass::MapTernaryBroadcast,
+            structural_exec: StructuralExecMode::Scalar,
             vectorizable: true,
             vector_unroll: 1,
             fallback_reason: None,
+            structural_scc: None,
+            structural_state_count: 0,
+            structural_transition_count: 0,
+            structural_span_ops: 0,
+            structural_enum_ops: 0,
         }],
         higher_order_reports: vec![WasmHigherOrderReport {
             function: "handwritten_axpy_i64".to_string(),
@@ -3989,9 +4058,15 @@ fn handcrafted_axpy2_record_i64_artifact() -> Result<WasmArtifact> {
         optimizer_reports: vec![WasmOptimizationReport {
             function: "handcrafted_axpy2_record_i64".to_string(),
             intent: IntentClass::GroupedMap,
+            structural_exec: StructuralExecMode::Scalar,
             vectorizable: true,
             vector_unroll: 1,
             fallback_reason: None,
+            structural_scc: None,
+            structural_state_count: 0,
+            structural_transition_count: 0,
+            structural_span_ops: 0,
+            structural_enum_ops: 0,
         }],
         higher_order_reports: vec![WasmHigherOrderReport {
             function: "handcrafted_axpy2_record_i64".to_string(),
