@@ -11,7 +11,7 @@ fn run() -> simd::Result<()> {
     let mut args = env::args().skip(1).collect::<Vec<_>>();
     if args.is_empty() {
         return Err(simd::SimdError::new(
-            "usage: simd <parse|check|fmt|run|run-profile|wasm|wat|run-wasm|run-wasm-prepared|run-wasm-profile|bench|inspect-html|lsp> ...",
+            "usage: simd <parse|check|fmt|run|run-profile|run-profile-fns|wasm|wat|run-wasm|run-wasm-prepared|run-wasm-profile|run-wasm-profile-fns|bench|inspect-html|lsp> ...",
         ));
     }
     let command = args.remove(0);
@@ -122,6 +122,54 @@ fn run() -> simd::Result<()> {
             let json =
                 json.ok_or_else(|| simd::SimdError::new("run-profile requires --args <json>"))?;
             println!("{}", simd::run_profile_command(&path, &main, &json)?);
+        }
+        "run-profile-fns" => {
+            if args.is_empty() {
+                return Err(simd::SimdError::new(
+                    "usage: simd run-profile-fns <file> --main <fn> --args <json> [--json]",
+                ));
+            }
+            let path = args.remove(0);
+            let mut main = None::<String>;
+            let mut json = None::<String>;
+            let mut json_output = false;
+            let mut index = 0usize;
+            while index < args.len() {
+                match args[index].as_str() {
+                    "--main" => {
+                        let value = args
+                            .get(index + 1)
+                            .ok_or_else(|| simd::SimdError::new("missing value after --main"))?;
+                        main = Some(value.clone());
+                        index += 2;
+                    }
+                    "--args" => {
+                        let value = args
+                            .get(index + 1)
+                            .ok_or_else(|| simd::SimdError::new("missing value after --args"))?;
+                        json = Some(value.clone());
+                        index += 2;
+                    }
+                    "--json" => {
+                        json_output = true;
+                        index += 1;
+                    }
+                    flag => {
+                        return Err(simd::SimdError::new(format!(
+                            "unknown run-profile-fns flag '{}'",
+                            flag
+                        )));
+                    }
+                }
+            }
+            let main =
+                main.ok_or_else(|| simd::SimdError::new("run-profile-fns requires --main <fn>"))?;
+            let json =
+                json.ok_or_else(|| simd::SimdError::new("run-profile-fns requires --args <json>"))?;
+            println!(
+                "{}",
+                simd::run_profile_fns_command(&path, &main, &json, json_output)?
+            );
         }
         "wasm" => {
             if args.is_empty() {
@@ -318,6 +366,55 @@ fn run() -> simd::Result<()> {
             let json = json
                 .ok_or_else(|| simd::SimdError::new("run-wasm-profile requires --args <json>"))?;
             println!("{}", simd::run_wasm_profile_command(&path, &main, &json)?);
+        }
+        "run-wasm-profile-fns" => {
+            if args.is_empty() {
+                return Err(simd::SimdError::new(
+                    "usage: simd run-wasm-profile-fns <file> --main <fn> --args <json> [--json]",
+                ));
+            }
+            let path = args.remove(0);
+            let mut main = None::<String>;
+            let mut json = None::<String>;
+            let mut json_output = false;
+            let mut index = 0usize;
+            while index < args.len() {
+                match args[index].as_str() {
+                    "--main" => {
+                        let value = args
+                            .get(index + 1)
+                            .ok_or_else(|| simd::SimdError::new("missing value after --main"))?;
+                        main = Some(value.clone());
+                        index += 2;
+                    }
+                    "--args" => {
+                        let value = args
+                            .get(index + 1)
+                            .ok_or_else(|| simd::SimdError::new("missing value after --args"))?;
+                        json = Some(value.clone());
+                        index += 2;
+                    }
+                    "--json" => {
+                        json_output = true;
+                        index += 1;
+                    }
+                    flag => {
+                        return Err(simd::SimdError::new(format!(
+                            "unknown run-wasm-profile-fns flag '{}'",
+                            flag
+                        )));
+                    }
+                }
+            }
+            let main = main
+                .ok_or_else(|| simd::SimdError::new("run-wasm-profile-fns requires --main <fn>"))?;
+            let json = json.ok_or_else(|| {
+                simd::SimdError::new("run-wasm-profile-fns requires --args <json>")
+            })?;
+            println!(
+                "{}",
+                simd::run_wasm_profile_fns_command(&path, &main, &json, json_output)?
+            );
         }
         "bench" => {
             let (mut selection, mut index) = match args.first() {

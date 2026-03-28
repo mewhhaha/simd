@@ -1,0 +1,35 @@
+type Cell = { home_x: f32, home_y: f32, radius: f32, alpha: f32, cluster_scale: f32, cluster_dx: f32, cluster_dy: f32 }
+
+shape_tone : f32 -> f32
+shape_tone tone = tone * tone * (3.0 - 2.0 * tone)
+
+style_cell : f32 -> f32 -> f32 -> f32 -> f32 -> f32 -> f32 -> f32 -> f32 -> f32 -> f32 -> Cell
+style_cell cell_size dot_scale tone visible base_x base_y jitter_x jitter_y cluster_dir_x cluster_dir_y cluster_offset = let
+  tone_curve = shape_tone tone;
+  radius = visible * cell_size * (0.1 + tone_curve * 0.72 * dot_scale);
+  alpha = visible * (0.16 + tone_curve * 0.84);
+  cluster_scale = visible * (0.16 + tone_curve * 0.24);
+  cluster_dx = visible * cluster_dir_x * cluster_offset;
+  cluster_dy = visible * cluster_dir_y * cluster_offset;
+  home_x = base_x + visible * jitter_x;
+  home_y = base_y + visible * jitter_y
+in { home_x = home_x, home_y = home_y, radius = radius, alpha = alpha, cluster_scale = cluster_scale, cluster_dx = cluster_dx, cluster_dy = cluster_dy }
+
+tone_from_samples : f32 -> f32 -> f32 -> f32 -> f32 -> { tone: f32, visible: f32 }
+tone_from_samples dither_strength threshold lum_0 lum_1 lum_2 = let
+  luminance = lum_0 * 0.55 + lum_1 * 0.2 + lum_2 * 0.25;
+  darkness = 1.0 - luminance / 255.0;
+  dithered = darkness + (threshold - 0.5) * dither_strength * (0.45 + darkness * 0.55);
+  tone = dithered * dithered * (3.0 - 2.0 * dithered);
+  visible = tone * tone
+in { tone = tone, visible = visible }
+
+main : f32 -> f32 -> f32 -> f32[*] -> i64[n] -> i64[n] -> i64[n] -> f32[n] -> f32[n] -> f32[n] -> f32[n] -> f32[n] -> f32[n] -> f32[n] -> f32[n] -> { home_x: f32[n], home_y: f32[n], radius: f32[n], alpha: f32[n], cluster_scale: f32[n], cluster_dx: f32[n], cluster_dy: f32[n] }
+main cell_size dot_scale dither_strength pixels sample_0 sample_1 sample_2 threshold base_x base_y jitter_x jitter_y cluster_dir_x cluster_dir_y cluster_offset = let
+  lum_0 = gather pixels sample_0;
+  lum_1 = gather pixels sample_1;
+  lum_2 = gather pixels sample_2;
+  styled = tone_from_samples dither_strength threshold lum_0 lum_1 lum_2;
+  tone = styled.tone;
+  visible = styled.visible
+in style_cell cell_size dot_scale tone visible base_x base_y jitter_x jitter_y cluster_dir_x cluster_dir_y cluster_offset

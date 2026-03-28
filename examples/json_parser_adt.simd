@@ -3,12 +3,9 @@ enum Json =
   | JBool i64
   | JNum i64
   | JStrTok i64
-  | JArray Json
-  | JObject Json
-  | JArrNil
-  | JArrCons Json Json
-  | JObjNil
-  | JObjCons i64 Json Json
+  | JArray Json[*]
+  | JObject Json[*]
+  | JField i64 Json
 
 enum Either a b =
   | Left a
@@ -206,41 +203,44 @@ parse_array_after_open [' ', ...rest] = parse_array_after_open rest
 parse_array_after_open ['\n', ...rest] = parse_array_after_open rest
 parse_array_after_open ['\t', ...rest] = parse_array_after_open rest
 parse_array_after_open ['\r', ...rest] = parse_array_after_open rest
-parse_array_after_open [']', ...rest] = Right (Parsed (JArray JArrNil) rest)
-parse_array_after_open s = parse_array_seed JArrNil (parse_value s)
+parse_array_after_open [']', ...rest] = Right (Parsed (JArray []) rest)
+parse_array_after_open s = parse_array_seed [] (parse_value s)
 
-parse_array_seed : Json -> Either i64 (Parsed Json) -> Either i64 (Parsed Json)
+parse_array_seed : Json[*] -> Either i64 (Parsed Json) -> Either i64 (Parsed Json)
 parse_array_seed _ (Left c) = Left c
-parse_array_seed acc (Right (Parsed value rest)) = parse_array_items (JArrCons value acc) rest
+parse_array_seed acc (Right (Parsed value rest)) = parse_array_items [value, ...acc] rest
 
-parse_array_items : Json -> string -> Either i64 (Parsed Json)
+parse_array_items : Json[*] -> string -> Either i64 (Parsed Json)
 parse_array_items acc [' ', ...rest] = parse_array_items acc rest
 parse_array_items acc ['\n', ...rest] = parse_array_items acc rest
 parse_array_items acc ['\t', ...rest] = parse_array_items acc rest
 parse_array_items acc ['\r', ...rest] = parse_array_items acc rest
 parse_array_items acc [',', ...rest] = parse_array_seed acc (parse_value rest)
-parse_array_items acc [']', ...rest] = Right (Parsed (JArray acc) rest)
+parse_array_items acc [']', ...rest] = Right (Parsed (JArray (reverse_json_seq acc)) rest)
 parse_array_items _ _ = Left 401
+
+reverse_json_seq : Json[*] -> Json[*]
+reverse_json_seq xs = reverse xs
 
 parse_object_after_open : string -> Either i64 (Parsed Json)
 parse_object_after_open [' ', ...rest] = parse_object_after_open rest
 parse_object_after_open ['\n', ...rest] = parse_object_after_open rest
 parse_object_after_open ['\t', ...rest] = parse_object_after_open rest
 parse_object_after_open ['\r', ...rest] = parse_object_after_open rest
-parse_object_after_open ['}', ...rest] = Right (Parsed (JObject JObjNil) rest)
-parse_object_after_open s = parse_object_seed JObjNil (parse_member s)
+parse_object_after_open ['}', ...rest] = Right (Parsed (JObject []) rest)
+parse_object_after_open s = parse_object_seed [] (parse_member s)
 
-parse_object_seed : Json -> Either i64 (ParsedMember i64 Json) -> Either i64 (Parsed Json)
+parse_object_seed : Json[*] -> Either i64 (ParsedMember i64 Json) -> Either i64 (Parsed Json)
 parse_object_seed _ (Left c) = Left c
-parse_object_seed acc (Right (ParsedMember key_len value rest)) = parse_object_items (JObjCons key_len value acc) rest
+parse_object_seed acc (Right (ParsedMember key_len value rest)) = parse_object_items [JField key_len value, ...acc] rest
 
-parse_object_items : Json -> string -> Either i64 (Parsed Json)
+parse_object_items : Json[*] -> string -> Either i64 (Parsed Json)
 parse_object_items acc [' ', ...rest] = parse_object_items acc rest
 parse_object_items acc ['\n', ...rest] = parse_object_items acc rest
 parse_object_items acc ['\t', ...rest] = parse_object_items acc rest
 parse_object_items acc ['\r', ...rest] = parse_object_items acc rest
 parse_object_items acc [',', ...rest] = parse_object_seed acc (parse_member rest)
-parse_object_items acc ['}', ...rest] = Right (Parsed (JObject acc) rest)
+parse_object_items acc ['}', ...rest] = Right (Parsed (JObject (reverse_json_seq acc)) rest)
 parse_object_items _ _ = Left 501
 
 parse_member : string -> Either i64 (ParsedMember i64 Json)
@@ -272,19 +272,22 @@ json_weight JNull = 10
 json_weight (JBool b) = 20 + b
 json_weight (JNum n) = 100 + n
 json_weight (JStrTok n) = 200 + n
-json_weight (JArray items) = 300 + array_list_weight items
-json_weight (JObject fields) = 400 + object_list_weight fields
+json_weight (JArray items) = 300 + array_seq_weight items
+json_weight (JObject fields) = 400 + object_seq_weight fields
+json_weight (JField key_len value) = key_len + json_weight value
 json_weight _ = 0
 
-array_list_weight : Json -> i64
-array_list_weight JArrNil = 0
-array_list_weight (JArrCons value rest) = json_weight value + array_list_weight rest
-array_list_weight _ = 0
+array_seq_weight : Json[*] -> i64
+array_seq_weight [] = 0
+array_seq_weight [value, ...rest] = json_weight value + array_seq_weight rest
 
-object_list_weight : Json -> i64
-object_list_weight JObjNil = 0
-object_list_weight (JObjCons key_len value rest) = key_len + json_weight value + object_list_weight rest
-object_list_weight _ = 0
+object_seq_weight : Json[*] -> i64
+object_seq_weight [] = 0
+object_seq_weight [entry, ...rest] = object_entry_weight entry + object_seq_weight rest
+
+object_entry_weight : Json -> i64
+object_entry_weight (JField key_len value) = key_len + json_weight value
+object_entry_weight _ = 0
 
 parse_status : Either i64 (Parsed Json) -> i64
 parse_status (Left c) = 0 - c
@@ -303,19 +306,22 @@ json_string_leaf_chars JNull = 0
 json_string_leaf_chars (JBool _) = 0
 json_string_leaf_chars (JNum _) = 0
 json_string_leaf_chars (JStrTok len) = len
-json_string_leaf_chars (JArray items) = array_list_string_leaf_chars items
-json_string_leaf_chars (JObject fields) = object_list_string_leaf_chars fields
+json_string_leaf_chars (JArray items) = array_seq_string_leaf_chars items
+json_string_leaf_chars (JObject fields) = object_seq_string_leaf_chars fields
+json_string_leaf_chars (JField _ value) = json_string_leaf_chars value
 json_string_leaf_chars _ = 0
 
-array_list_string_leaf_chars : Json -> i64
-array_list_string_leaf_chars JArrNil = 0
-array_list_string_leaf_chars (JArrCons value rest) = json_string_leaf_chars value + array_list_string_leaf_chars rest
-array_list_string_leaf_chars _ = 0
+array_seq_string_leaf_chars : Json[*] -> i64
+array_seq_string_leaf_chars [] = 0
+array_seq_string_leaf_chars [value, ...rest] = json_string_leaf_chars value + array_seq_string_leaf_chars rest
 
-object_list_string_leaf_chars : Json -> i64
-object_list_string_leaf_chars JObjNil = 0
-object_list_string_leaf_chars (JObjCons _ value rest) = json_string_leaf_chars value + object_list_string_leaf_chars rest
-object_list_string_leaf_chars _ = 0
+object_seq_string_leaf_chars : Json[*] -> i64
+object_seq_string_leaf_chars [] = 0
+object_seq_string_leaf_chars [entry, ...rest] = object_entry_string_leaf_chars entry + object_seq_string_leaf_chars rest
+
+object_entry_string_leaf_chars : Json -> i64
+object_entry_string_leaf_chars (JField _ value) = json_string_leaf_chars value
+object_entry_string_leaf_chars _ = 0
 
 parse_string_leaf_chars : Either i64 (Parsed Json) -> i64
 parse_string_leaf_chars (Left c) = 0 - c

@@ -1,0 +1,17 @@
+enum Tree =
+  | Leaf i64
+  | Branch Tree[*]
+
+sum_tree : Tree -> i64
+sum_tree (Leaf n) = n
+sum_tree (Branch xs) = sum_forest xs
+
+sum_forest : Tree[*] -> i64
+sum_forest [] = 0
+sum_forest [x, ...xs] = sum_tree x + sum_forest xs
+
+main : i64
+main = sum_tree (Branch [Leaf 1, Branch [Leaf 2, Leaf 3], Leaf 4])
+
+main_tree : Tree
+main_tree = Branch [Leaf 1, Leaf 2, Branch [Leaf 3]]

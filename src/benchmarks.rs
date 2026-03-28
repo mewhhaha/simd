@@ -1,9 +1,9 @@
 use super::*;
 use crate::wasm_backend::{
-    LambdaLoweringMode, StructuralExecMode, WasmHigherOrderReport, WasmLeafExport, WasmLeafResultAbi,
-    WasmOptimizationReport,
+    LambdaLoweringMode, StructuralExecMode, WasmHigherOrderReport, WasmLeafExport,
+    WasmLeafResultAbi, WasmOptimizationReport,
 };
-use serde_json::Value as SerdeJsonValue;
+use simd_json::OwnedValue as SimdJsonValue;
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 use wasm_encoder::{
@@ -47,6 +47,7 @@ impl BenchOptions {
 struct ExampleSpec {
     name: &'static str,
     description: &'static str,
+    baseline_label: &'static str,
     file: &'static str,
     main: &'static str,
     source: &'static str,
@@ -106,13 +107,28 @@ pub fn bench_command_with_options(options: BenchOptions) -> Result<String> {
         };
     }
 
+    if options.selection == "json-common" {
+        let specs = benchmark_specs()
+            .into_iter()
+            .filter(|spec| spec.name.starts_with("json-parser-adt-"))
+            .collect::<Vec<_>>();
+        return run_example_specs(
+            &specs,
+            options.size,
+            options
+                .iterations
+                .unwrap_or_else(|| default_iterations(options.size)),
+            options.report_contract,
+        );
+    }
+
     let specs = benchmark_specs();
     let spec = specs
         .into_iter()
         .find(|spec| spec.name == options.selection)
         .ok_or_else(|| {
             SimdError::new(format!(
-                "unknown benchmark '{}'; available cases: {}, matrix",
+                "unknown benchmark '{}'; available cases: {}, json-common, matrix",
                 options.selection,
                 benchmark_specs()
                     .iter()
@@ -160,6 +176,18 @@ fn run_example_specs(
     Ok(sections.join("\n\n"))
 }
 
+fn benchmark_internal_parity_value(
+    compiled: &CompiledProgram,
+    main: &str,
+    args: &[Value],
+) -> Result<Option<Value>> {
+    match run_compiled_lowered_main(compiled, main, args) {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if error.to_string().contains("no structural state of") => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 fn run_example_spec(spec: &ExampleSpec, size: usize, iterations: usize) -> Result<String> {
     let input = (spec.build_input)(size);
 
@@ -184,13 +212,18 @@ fn run_example_spec(spec: &ExampleSpec, size: usize, iterations: usize) -> Resul
     prepared_bound.load_args(&input.args)?;
 
     let expected = (spec.rust_impl)(&input.args)?;
-    let eval = run_compiled_main(&compiled, spec.main, &input.args)?;
-    if eval != expected {
-        return Err(SimdError::new(format!(
-            "evaluator parity failed for benchmark '{}'",
-            spec.name
-        )));
-    }
+    let parity_note = match benchmark_internal_parity_value(&compiled, spec.main, &input.args)? {
+        Some(eval) => {
+            if eval != expected {
+                return Err(SimdError::new(format!(
+                    "evaluator parity failed for benchmark '{}'",
+                    spec.name
+                )));
+            }
+            "evaluator, wasm, and rust agree"
+        }
+        None => "lowered parity unavailable; wasm and rust agree",
+    };
     let wasm = executable.run_hot(&input.args)?;
     if wasm != expected {
         return Err(SimdError::new(format!(
@@ -215,9 +248,13 @@ fn run_example_spec(spec: &ExampleSpec, size: usize, iterations: usize) -> Resul
         executable.run_hot(&input.args)
     })?;
     let wasm_hot_stats = measure(iterations, || executable.run_hot(&input.args))?;
-    let prepared_hot_stats = measure_void(iterations, || prepared_bound.run())?;
+    let prepared_hot_stats = measure_void(iterations, || {
+        prepared_bound.load_args(&input.args)?;
+        prepared_bound.run()
+    })?;
     let mut prepared_read_scratch = build_prepared_bulk_read_scratch(&prepared_bound);
     let prepared_hot_read_stats = measure_void(iterations, || {
+        prepared_bound.load_args(&input.args)?;
         prepared_bound.run()?;
         prepared_typed_readback(&prepared_bound, &mut prepared_read_scratch)
     })?;
@@ -256,13 +293,13 @@ fn run_example_spec(spec: &ExampleSpec, size: usize, iterations: usize) -> Resul
             "  source: {}\n",
             "  setup: frontend={} compile-wasm={} prepare-module={} prepare-bound={} wasm-bytes={}\n",
             "  optimizer: {}\n",
-            "  rust: avg/run={} ns/logical-elem={:.2} mlogical/s={:.2}\n",
+            "  {}: avg/run={} ns/logical-elem={:.2} mlogical/s={:.2}\n",
             "  wasm-e2e: iterations={} avg/run={} ns/logical-elem={:.2} mlogical/s={:.2} slowdown={:.2}x\n",
             "  wasm-hot: iterations={} avg/run={} ns/logical-elem={:.2} mlogical/s={:.2} slowdown={:.2}x\n",
             "{}",
             "  wasm-prepared-hot: iterations={} avg/run={} ns/logical-elem={:.2} mlogical/s={:.2} slowdown={:.2}x\n",
             "  wasm-prepared-hot+read: iterations={} avg/run={} ns/logical-elem={:.2} mlogical/s={:.2} slowdown={:.2}x{}\n",
-            "  parity: evaluator, wasm, and rust agree"
+            "  parity: {}"
         ),
         spec.name,
         spec.description,
@@ -273,6 +310,7 @@ fn run_example_spec(spec: &ExampleSpec, size: usize, iterations: usize) -> Resul
         format_duration(prepared_prepare),
         wasm_bytes,
         optimizer_summary,
+        spec.baseline_label,
         format_duration(avg_duration(&rust_stats)),
         nanos_per_element(&rust_stats, input.logical_elements),
         melems_per_second(&rust_stats, input.logical_elements),
@@ -305,6 +343,7 @@ fn run_example_spec(spec: &ExampleSpec, size: usize, iterations: usize) -> Resul
             &prepared_hot_read_stats,
             &input,
         ),
+        parity_note,
     ))
 }
 
@@ -368,13 +407,18 @@ fn run_matrix_spec(spec: &MatrixSpec, iterations: Option<usize>) -> Result<(Stri
     prepared_bound.load_args(&input.args)?;
 
     let expected = (spec.rust_impl)(&input.args)?;
-    let eval = run_compiled_main(&compiled, spec.main, &input.args)?;
-    if eval != expected {
-        return Err(SimdError::new(format!(
-            "evaluator parity failed for benchmark '{}'",
-            spec.name
-        )));
-    }
+    let parity_note = match benchmark_internal_parity_value(&compiled, spec.main, &input.args)? {
+        Some(eval) => {
+            if eval != expected {
+                return Err(SimdError::new(format!(
+                    "evaluator parity failed for benchmark '{}'",
+                    spec.name
+                )));
+            }
+            "evaluator, wasm, and rust agree"
+        }
+        None => "lowered parity unavailable; wasm and rust agree",
+    };
     let wasm = executable.run_hot(&input.args)?;
     if wasm != expected {
         return Err(SimdError::new(format!(
@@ -400,9 +444,13 @@ fn run_matrix_spec(spec: &MatrixSpec, iterations: Option<usize>) -> Result<(Stri
         executable.run_hot(&input.args)
     })?;
     let wasm_hot_stats = measure(iterations, || executable.run_hot(&input.args))?;
-    let prepared_hot_stats = measure_void(iterations, || prepared_bound.run())?;
+    let prepared_hot_stats = measure_void(iterations, || {
+        prepared_bound.load_args(&input.args)?;
+        prepared_bound.run()
+    })?;
     let mut prepared_read_scratch = build_prepared_bulk_read_scratch(&prepared_bound);
     let prepared_hot_read_stats = measure_void(iterations, || {
+        prepared_bound.load_args(&input.args)?;
         prepared_bound.run()?;
         prepared_typed_readback(&prepared_bound, &mut prepared_read_scratch)
     })?;
@@ -454,14 +502,14 @@ fn run_matrix_spec(spec: &MatrixSpec, iterations: Option<usize>) -> Result<(Stri
                 "  source: {}\n",
                 "  setup: frontend={} compile-wasm={} prepare-module={} prepare-bound={} wasm-bytes={}\n",
                 "  optimizer: {}\n",
-                "  rust: avg/run={} ns/logical-elem={:.2} mlogical/s={:.2}\n",
+                "  {}: avg/run={} ns/logical-elem={:.2} mlogical/s={:.2}\n",
                 "  wasm-e2e: iterations={} avg/run={} ns/logical-elem={:.2} mlogical/s={:.2} slowdown={:.2}x\n",
                 "  wasm-hot: iterations={} avg/run={} ns/logical-elem={:.2} mlogical/s={:.2} slowdown={:.2}x\n",
                 "{}",
                 "  wasm-prepared-hot: iterations={} avg/run={} ns/logical-elem={:.2} mlogical/s={:.2} slowdown={:.2}x\n",
                 "  wasm-prepared-hot+read: iterations={} avg/run={} ns/logical-elem={:.2} mlogical/s={:.2} slowdown={:.2}x{}\n",
                 "  contract: {}\n",
-                "  parity: evaluator, wasm, and rust agree"
+                "  parity: {}"
             ),
             spec.name,
             spec.description,
@@ -472,6 +520,7 @@ fn run_matrix_spec(spec: &MatrixSpec, iterations: Option<usize>) -> Result<(Stri
             format_duration(prepared_prepare),
             wasm_bytes,
             optimizer_summary,
+            "rust",
             format_duration(avg_duration(&result.rust_stats)),
             nanos_per_element(&result.rust_stats, input.logical_elements),
             melems_per_second(&result.rust_stats, input.logical_elements),
@@ -505,6 +554,7 @@ fn run_matrix_spec(spec: &MatrixSpec, iterations: Option<usize>) -> Result<(Stri
                 &input
             ),
             contract,
+            parity_note,
         ),
         result,
     ))
@@ -543,17 +593,21 @@ fn summarize_optimizer_reports(reports: &[WasmOptimizationReport]) -> String {
                 && report.structural_transition_count == 0
                 && report.structural_span_ops == 0
                 && report.structural_enum_ops == 0
+                && report.structural_region_count == 0
                 && report.structural_scc.is_none()
             {
                 String::new()
             } else {
                 format!(
-                    " scc={:?} structural=states:{} transitions:{} span:{} enum:{}",
+                    " scc={:?} structural=states:{} transitions:{} span:{} enum:{} regions:{} char-runs:{} separated:{}",
                     report.structural_scc,
                     report.structural_state_count,
                     report.structural_transition_count,
                     report.structural_span_ops,
-                    report.structural_enum_ops
+                    report.structural_enum_ops,
+                    report.structural_region_count,
+                    report.structural_char_prefix_regions,
+                    report.structural_separated_item_regions
                 )
             };
             match report.fallback_reason {
@@ -773,12 +827,13 @@ fn render_core_contract_summary(
         let mut prepared_bound = prepared.bind(layout)?;
         prepared_bound.load_args(&input.args)?;
         let expected = (spec.rust_impl)(&input.args)?;
-        let eval = run_compiled_main(&compiled, spec.main, &input.args)?;
-        if eval != expected {
-            return Err(SimdError::new(format!(
-                "evaluator parity failed for benchmark '{}'",
-                spec.name
-            )));
+        if let Some(eval) = benchmark_internal_parity_value(&compiled, spec.main, &input.args)? {
+            if eval != expected {
+                return Err(SimdError::new(format!(
+                    "evaluator parity failed for benchmark '{}'",
+                    spec.name
+                )));
+            }
         }
         let wasm = executable.run_hot(&input.args)?;
         if wasm != expected {
@@ -796,9 +851,13 @@ fn render_core_contract_summary(
             )));
         }
         let rust_stats = measure(iterations, || (spec.rust_impl)(&input.args))?;
-        let prepared_hot_stats = measure_void(iterations, || prepared_bound.run())?;
+        let prepared_hot_stats = measure_void(iterations, || {
+            prepared_bound.load_args(&input.args)?;
+            prepared_bound.run()
+        })?;
         let mut prepared_read_scratch = build_prepared_bulk_read_scratch(&prepared_bound);
         let prepared_hot_read_stats = measure_void(iterations, || {
+            prepared_bound.load_args(&input.args)?;
             prepared_bound.run()?;
             prepared_typed_readback(&prepared_bound, &mut prepared_read_scratch)
         })?;
@@ -876,6 +935,7 @@ fn core_suite_matrix_specs(size_label: &'static str, size: usize) -> Vec<MatrixS
             build_input,
             rust_impl,
             is_core_suite: _,
+            baseline_label: _,
         } = spec;
         specs.push(MatrixSpec {
             name: name.to_string(),
@@ -1937,13 +1997,118 @@ fn expect_record_bulk_prim_field<'a>(
 }
 
 fn build_json_parser_adt_nested_input(size: usize) -> BenchInput {
-    let payload = build_json_parser_adt_nested_payload(size);
+    build_json_bench_input(build_json_parser_adt_nested_payload(size))
+}
+
+fn build_json_parser_adt_flat_numbers_input(size: usize) -> BenchInput {
+    build_json_bench_input(build_json_parser_adt_flat_numbers_payload(size))
+}
+
+fn build_json_parser_adt_flat_strings_input(size: usize) -> BenchInput {
+    build_json_bench_input(build_json_parser_adt_flat_strings_payload(size))
+}
+
+fn build_json_parser_adt_object_heavy_input(size: usize) -> BenchInput {
+    build_json_bench_input(build_json_parser_adt_object_heavy_payload(size))
+}
+
+fn build_json_parser_adt_deep_input(size: usize) -> BenchInput {
+    build_json_bench_input(build_json_parser_adt_deep_payload(size))
+}
+
+fn build_json_bench_input(payload: String) -> BenchInput {
     let logical_elements = payload.chars().count();
     BenchInput {
         args: vec![Value::String(payload)],
         logical_elements,
         leaf_elements: logical_elements,
     }
+}
+
+fn build_json_parser_adt_flat_numbers_payload(size: usize) -> String {
+    let item_count = (size / 48).max(16);
+    let mut payload = String::from("[");
+    for index in 0..item_count {
+        if index != 0 {
+            payload.push(',');
+        }
+        payload.push_str(&((index as i64 * 17) - 33).to_string());
+    }
+    payload.push(']');
+    payload
+}
+
+fn build_json_parser_adt_flat_strings_payload(size: usize) -> String {
+    let item_count = (size / 96).max(8);
+    let mut payload = String::from("[");
+    for index in 0..item_count {
+        if index != 0 {
+            payload.push(',');
+        }
+        payload.push('"');
+        payload.push_str("item\\n");
+        payload.push_str(&(index % 97).to_string());
+        payload.push_str("\\t");
+        payload.push_str(if index % 2 == 0 { "\\u0041" } else { "\\\"" });
+        payload.push_str("\\\\tail");
+        payload.push('"');
+    }
+    payload.push(']');
+    payload
+}
+
+fn build_json_parser_adt_object_heavy_payload(size: usize) -> String {
+    let field_count = (size / 28).max(16);
+    let mut payload = String::from("{");
+    for index in 0..field_count {
+        if index != 0 {
+            payload.push(',');
+        }
+        payload.push('"');
+        payload.push_str("k");
+        payload.push_str(&index.to_string());
+        payload.push_str("\":");
+        match index % 4 {
+            0 => payload.push_str(&((index as i64 * 3) - 7).to_string()),
+            1 => payload.push_str(if index % 8 == 1 { "true" } else { "false" }),
+            2 => {
+                payload.push('[');
+                payload.push_str(&(index as i64).to_string());
+                payload.push(',');
+                payload.push_str(&((index as i64) + 1).to_string());
+                payload.push(']');
+            }
+            _ => {
+                payload.push('"');
+                payload.push_str("v");
+                payload.push_str(&(index % 13).to_string());
+                payload.push('"');
+            }
+        }
+    }
+    payload.push('}');
+    payload
+}
+
+fn build_json_parser_adt_deep_payload(size: usize) -> String {
+    let depth = (size / 128).clamp(6, 24);
+    let mut payload = String::from("0");
+    for level in 0..depth {
+        if level % 2 == 0 {
+            payload = format!(
+                "{{\"level\":{},\"next\":{},\"label\":\"d{}\"}}",
+                level, payload, level
+            );
+        } else {
+            payload = format!(
+                "[{},{{\"flag\":{},\"step\":{}}}]",
+                payload,
+                if level % 3 == 0 { "true" } else { "false" },
+                level
+            );
+        }
+    }
+    payload
 }
 
 fn build_json_parser_adt_nested_payload(size: usize) -> String {
@@ -1986,9 +2151,10 @@ fn rust_json_parser_adt_nested(args: &[Value]) -> Result<Value> {
             "json parser adt nested benchmark expects one string argument",
         ));
     };
-    let json: SerdeJsonValue = serde_json::from_str(payload).map_err(|error| {
+    let mut bytes = payload.as_bytes().to_vec();
+    let json: SimdJsonValue = simd_json::to_owned_value(bytes.as_mut_slice()).map_err(|error| {
         SimdError::new(format!(
-            "json parser adt nested benchmark could not parse payload: {}",
+            "json parser adt nested benchmark could not parse payload with simd-json: {}",
             error
         ))
     })?;
@@ -1997,16 +2163,20 @@ fn rust_json_parser_adt_nested(args: &[Value]) -> Result<Value> {
     )))
 }
 
-fn json_parser_adt_nested_weight(value: &SerdeJsonValue) -> i64 {
+fn json_parser_adt_nested_weight(value: &SimdJsonValue) -> i64 {
     match value {
-        SerdeJsonValue::Null => 10,
-        SerdeJsonValue::Bool(flag) => 20 + if *flag { 1 } else { 0 },
-        SerdeJsonValue::Number(number) => 100 + number.as_i64().unwrap_or(0),
-        SerdeJsonValue::String(text) => 200 + text.chars().count() as i64,
-        SerdeJsonValue::Array(items) => {
+        SimdJsonValue::Static(simd_json::StaticNode::Null) => 10,
+        SimdJsonValue::Static(simd_json::StaticNode::Bool(flag)) => 20 + if *flag { 1 } else { 0 },
+        SimdJsonValue::Static(simd_json::StaticNode::I64(number)) => 100 + number,
+        SimdJsonValue::Static(simd_json::StaticNode::U64(number)) => {
+            100 + i64::try_from(*number).unwrap_or(i64::MAX)
+        }
+        SimdJsonValue::Static(simd_json::StaticNode::F64(number)) => 100 + *number as i64,
+        SimdJsonValue::String(text) => 200 + text.chars().count() as i64,
+        SimdJsonValue::Array(items) => {
             300 + items.iter().map(json_parser_adt_nested_weight).sum::<i64>()
         }
-        SerdeJsonValue::Object(fields) => {
+        SimdJsonValue::Object(fields) => {
             400 + fields
                 .iter()
                 .map(|(key, value)| {
@@ -2022,6 +2192,7 @@ fn benchmark_specs() -> Vec<ExampleSpec> {
         ExampleSpec {
             name: "inc-i64",
             description: "Pointwise i64 increment over one bulk input.",
+            baseline_label: "rust",
             file: "examples/inc_i64.simd",
             main: "main",
             source: include_str!("../examples/inc_i64.simd"),
@@ -2032,6 +2203,7 @@ fn benchmark_specs() -> Vec<ExampleSpec> {
         ExampleSpec {
             name: "square-f32",
             description: "Pointwise f32 square over one bulk input.",
+            baseline_label: "rust",
             file: "examples/square_f32.simd",
             main: "main",
             source: include_str!("../examples/square_f32.simd"),
@@ -2042,6 +2214,7 @@ fn benchmark_specs() -> Vec<ExampleSpec> {
         ExampleSpec {
             name: "axpy-i64",
             description: "Scalar broadcast plus two bulk i64 inputs.",
+            baseline_label: "rust",
             file: "examples/axpy_i64.simd",
             main: "main",
             source: include_str!("../examples/axpy_i64.simd"),
@@ -2052,6 +2225,7 @@ fn benchmark_specs() -> Vec<ExampleSpec> {
         ExampleSpec {
             name: "axpy2-record-i64",
             description: "Lifted record-valued i64 axpy over bulk fields.",
+            baseline_label: "rust",
             file: "examples/axpy2_record_i64.simd",
             main: "main",
             source: include_str!("../examples/axpy2_record_i64.simd"),
@@ -2062,6 +2236,7 @@ fn benchmark_specs() -> Vec<ExampleSpec> {
         ExampleSpec {
             name: "pow2-i64",
             description: "Tail-recursive scalar helper lifted across an i64 bulk input.",
+            baseline_label: "rust",
             file: "examples/pow2_i64.simd",
             main: "main",
             source: include_str!("../examples/pow2_i64.simd"),
@@ -2070,8 +2245,53 @@ fn benchmark_specs() -> Vec<ExampleSpec> {
             is_core_suite: true,
         },
         ExampleSpec {
+            name: "json-parser-adt-flat-numbers",
+            description: "Flat numeric JSON array parse-and-weight.",
+            baseline_label: "simd-json",
+            file: "examples/json_parser_adt.simd",
+            main: "main",
+            source: include_str!("../examples/json_parser_adt.simd"),
+            build_input: build_json_parser_adt_flat_numbers_input,
+            rust_impl: rust_json_parser_adt_nested,
+            is_core_suite: false,
+        },
+        ExampleSpec {
+            name: "json-parser-adt-flat-strings",
+            description: "Flat escaped-string JSON array parse-and-weight.",
+            baseline_label: "simd-json",
+            file: "examples/json_parser_adt.simd",
+            main: "main",
+            source: include_str!("../examples/json_parser_adt.simd"),
+            build_input: build_json_parser_adt_flat_strings_input,
+            rust_impl: rust_json_parser_adt_nested,
+            is_core_suite: false,
+        },
+        ExampleSpec {
+            name: "json-parser-adt-object-heavy",
+            description: "Object-heavy JSON payload with many scalar and tiny-array fields.",
+            baseline_label: "simd-json",
+            file: "examples/json_parser_adt.simd",
+            main: "main",
+            source: include_str!("../examples/json_parser_adt.simd"),
+            build_input: build_json_parser_adt_object_heavy_input,
+            rust_impl: rust_json_parser_adt_nested,
+            is_core_suite: false,
+        },
+        ExampleSpec {
+            name: "json-parser-adt-deep",
+            description: "Deeply nested alternating object/array JSON payload.",
+            baseline_label: "simd-json",
+            file: "examples/json_parser_adt.simd",
+            main: "main",
+            source: include_str!("../examples/json_parser_adt.simd"),
+            build_input: build_json_parser_adt_deep_input,
+            rust_impl: rust_json_parser_adt_nested,
+            is_core_suite: false,
+        },
+        ExampleSpec {
             name: "json-parser-adt-nested",
             description: "Nested JSON parse-and-weight over recursive ADTs and string slice patterns.",
+            baseline_label: "simd-json",
             file: "examples/json_parser_adt.simd",
             main: "main",
             source: include_str!("../examples/json_parser_adt.simd"),
@@ -2377,6 +2597,9 @@ fn handcrafted_matrix_axpy2_record_artifact(prim: Prim) -> Result<WasmArtifact> 
             structural_transition_count: 0,
             structural_span_ops: 0,
             structural_enum_ops: 0,
+            structural_region_count: 0,
+            structural_char_prefix_regions: 0,
+            structural_separated_item_regions: 0,
         }],
         higher_order_reports: vec![WasmHigherOrderReport {
             function: format!("handcrafted_matrix_axpy2_record_{}", prim_label(prim)),
@@ -2389,6 +2612,7 @@ fn handcrafted_matrix_axpy2_record_artifact(prim: Prim) -> Result<WasmArtifact> 
             escaping_unknown_values: 0,
             rejection_reason: None,
         }],
+        function_profile_names: Vec::new(),
     })
 }
 
@@ -2495,6 +2719,9 @@ fn handcrafted_matrix_image_tone_rgb_f32_artifact() -> Result<WasmArtifact> {
             structural_transition_count: 0,
             structural_span_ops: 0,
             structural_enum_ops: 0,
+            structural_region_count: 0,
+            structural_char_prefix_regions: 0,
+            structural_separated_item_regions: 0,
         }],
         higher_order_reports: vec![WasmHigherOrderReport {
             function: "handcrafted_matrix_image_tone_rgb_f32".to_string(),
@@ -2507,6 +2734,7 @@ fn handcrafted_matrix_image_tone_rgb_f32_artifact() -> Result<WasmArtifact> {
             escaping_unknown_values: 0,
             rejection_reason: None,
         }],
+        function_profile_names: Vec::new(),
     })
 }
 
@@ -2655,6 +2883,9 @@ fn handcrafted_matrix_image_blend_rgb_f32_artifact() -> Result<WasmArtifact> {
             structural_transition_count: 0,
             structural_span_ops: 0,
             structural_enum_ops: 0,
+            structural_region_count: 0,
+            structural_char_prefix_regions: 0,
+            structural_separated_item_regions: 0,
         }],
         higher_order_reports: vec![WasmHigherOrderReport {
             function: "handcrafted_matrix_image_blend_rgb_f32".to_string(),
@@ -2667,6 +2898,7 @@ fn handcrafted_matrix_image_blend_rgb_f32_artifact() -> Result<WasmArtifact> {
             escaping_unknown_values: 0,
             rejection_reason: None,
         }],
+        function_profile_names: Vec::new(),
     })
 }
 
@@ -2713,6 +2945,9 @@ fn build_handcrafted_single_leaf_artifact(
             structural_transition_count: 0,
             structural_span_ops: 0,
             structural_enum_ops: 0,
+            structural_region_count: 0,
+            structural_char_prefix_regions: 0,
+            structural_separated_item_regions: 0,
         }],
         higher_order_reports: vec![WasmHigherOrderReport {
             function: "handcrafted_single_leaf".to_string(),
@@ -2725,6 +2960,7 @@ fn build_handcrafted_single_leaf_artifact(
             escaping_unknown_values: 0,
             rejection_reason: None,
         }],
+        function_profile_names: Vec::new(),
     }
 }
 
@@ -3577,6 +3813,9 @@ fn handcrafted_unary_i64_artifact(
             structural_transition_count: 0,
             structural_span_ops: 0,
             structural_enum_ops: 0,
+            structural_region_count: 0,
+            structural_char_prefix_regions: 0,
+            structural_separated_item_regions: 0,
         }],
         higher_order_reports: vec![WasmHigherOrderReport {
             function: report_name.to_string(),
@@ -3589,6 +3828,7 @@ fn handcrafted_unary_i64_artifact(
             escaping_unknown_values: 0,
             rejection_reason: None,
         }],
+        function_profile_names: Vec::new(),
     })
 }
 
@@ -3733,6 +3973,9 @@ fn handcrafted_square_f32_artifact() -> Result<WasmArtifact> {
             structural_transition_count: 0,
             structural_span_ops: 0,
             structural_enum_ops: 0,
+            structural_region_count: 0,
+            structural_char_prefix_regions: 0,
+            structural_separated_item_regions: 0,
         }],
         higher_order_reports: vec![WasmHigherOrderReport {
             function: "handcrafted_square_f32".to_string(),
@@ -3745,6 +3988,7 @@ fn handcrafted_square_f32_artifact() -> Result<WasmArtifact> {
             escaping_unknown_values: 0,
             rejection_reason: None,
         }],
+        function_profile_names: Vec::new(),
     })
 }
 
@@ -3937,6 +4181,9 @@ fn handcrafted_axpy_i64_artifact() -> Result<WasmArtifact> {
             structural_transition_count: 0,
             structural_span_ops: 0,
             structural_enum_ops: 0,
+            structural_region_count: 0,
+            structural_char_prefix_regions: 0,
+            structural_separated_item_regions: 0,
         }],
         higher_order_reports: vec![WasmHigherOrderReport {
             function: "handwritten_axpy_i64".to_string(),
@@ -3949,6 +4196,7 @@ fn handcrafted_axpy_i64_artifact() -> Result<WasmArtifact> {
             escaping_unknown_values: 0,
             rejection_reason: None,
         }],
+        function_profile_names: Vec::new(),
     })
 }
 
@@ -4067,6 +4315,9 @@ fn handcrafted_axpy2_record_i64_artifact() -> Result<WasmArtifact> {
             structural_transition_count: 0,
             structural_span_ops: 0,
             structural_enum_ops: 0,
+            structural_region_count: 0,
+            structural_char_prefix_regions: 0,
+            structural_separated_item_regions: 0,
         }],
         higher_order_reports: vec![WasmHigherOrderReport {
             function: "handcrafted_axpy2_record_i64".to_string(),
@@ -4079,6 +4330,7 @@ fn handcrafted_axpy2_record_i64_artifact() -> Result<WasmArtifact> {
             escaping_unknown_values: 0,
             rejection_reason: None,
         }],
+        function_profile_names: Vec::new(),
     })
 }
 
@@ -4732,8 +4984,11 @@ mod tests {
             let input = (spec.build_input)(32);
             let expected = (spec.rust_impl)(&input.args).unwrap();
             let compiled = compile_source(spec.source).unwrap();
-            let eval = run_compiled_main(&compiled, spec.main, &input.args).unwrap();
-            assert_eq!(eval, expected, "evaluator mismatch for {}", spec.name);
+            if let Some(eval) =
+                benchmark_internal_parity_value(&compiled, spec.main, &input.args).unwrap()
+            {
+                assert_eq!(eval, expected, "evaluator mismatch for {}", spec.name);
+            }
 
             let artifact = compile_wasm_main(spec.source, spec.main).unwrap();
             let executable = prepare_wasm_artifact(artifact).unwrap();

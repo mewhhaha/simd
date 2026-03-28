@@ -205,6 +205,11 @@ fn format_type_atom(ty: &Type) -> String {
     match ty {
         Type::Scalar(prim) => format_prim(*prim).to_string(),
         Type::Bulk(prim, shape) => format!("{}{}", format_prim(*prim), format_shape(shape)),
+        Type::StarSeq(item) => format!("{}[*]", format_type_atom(item)),
+        Type::StarSeqWitnessed(item, witness) => {
+            format!("{}[*{}]", format_type_atom(item), witness)
+        }
+        Type::Index(witness) => format!("Index {}", witness),
         Type::TypeToken(inner) => format!("Type {}", format_type_atom(inner)),
         Type::Tuple(items) => format!(
             "({})",
@@ -289,6 +294,22 @@ fn format_expr(expr: &Expr, min_prec: u8) -> String {
         Expr::Bool(value) => value.to_string(),
         Expr::Char(value) => format_char_literal(*value),
         Expr::String(value) => format_string_literal(value),
+        Expr::Seq(items) => format!(
+            "[{}]",
+            items
+                .iter()
+                .map(|item| format_expr(item, PREC_LET))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        Expr::SeqSplice { prefix, tail } => {
+            let mut parts = prefix
+                .iter()
+                .map(|item| format_expr(item, PREC_LET))
+                .collect::<Vec<_>>();
+            parts.push(format!("...{}", format_expr(tail, PREC_LET)));
+            format!("[{}]", parts.join(", "))
+        }
         Expr::Lambda { param, body } => {
             format!("\\{} -> {}", param, format_expr(body, PREC_LET))
         }
@@ -307,6 +328,21 @@ fn format_expr(expr: &Expr, min_prec: u8) -> String {
         }
         Expr::TupleProject(base, index) => {
             format!("{}.{}", format_expr(base, PREC_POSTFIX), index)
+        }
+        Expr::Index {
+            base,
+            index,
+            checked,
+        } => {
+            let mut out = format!(
+                "{}[{}]",
+                format_expr(base, PREC_POSTFIX),
+                format_expr(index, PREC_LET)
+            );
+            if *checked {
+                out.push('?');
+            }
+            out
         }
         Expr::RecordUpdate { base, fields } => format!(
             "{} {}",
@@ -400,7 +436,10 @@ fn expr_precedence(expr: &Expr) -> u8 {
             PrimOp::Mul | PrimOp::Div | PrimOp::Mod => PREC_MUL,
         },
         Expr::App(_, _) => PREC_APP,
-        Expr::Project(_, _) | Expr::TupleProject(_, _) | Expr::RecordUpdate { .. } => PREC_POSTFIX,
+        Expr::Project(_, _)
+        | Expr::TupleProject(_, _)
+        | Expr::Index { .. }
+        | Expr::RecordUpdate { .. } => PREC_POSTFIX,
         Expr::Lambda { .. } => PREC_LET,
         Expr::Ref(_)
         | Expr::Int(_)
@@ -408,6 +447,8 @@ fn expr_precedence(expr: &Expr) -> u8 {
         | Expr::Bool(_)
         | Expr::Char(_)
         | Expr::String(_)
+        | Expr::Seq(_)
+        | Expr::SeqSplice { .. }
         | Expr::Tuple(_)
         | Expr::Record(_) => PREC_ATOM,
     }

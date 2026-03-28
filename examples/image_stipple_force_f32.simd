@@ -1,0 +1,42 @@
+type Particle = { x: f32, y: f32, vx: f32, vy: f32 }
+
+sq : f32 -> f32
+sq x = x * x
+
+inv : f32 -> f32
+inv x = 1.0 / x
+
+particle_step : f32 -> f32 -> f32 -> f32 -> f32 -> f32 -> f32 -> f32 -> f32 -> f32 -> f32 -> f32 -> f32 -> f32 -> f32 -> f32 -> f32 -> f32 -> Particle
+particle_step dt mx my mouse_on repel_radius repel_strength px py pulse_age pulse_on pulse_speed pulse_width home_x home_y x y vx vy = let
+  home_ax = (home_x - x) * 26.0;
+  home_ay = (home_y - y) * 26.0;
+  mdx = x - mx;
+  mdy = y - my;
+  mouse_radius_2 = sq repel_radius + 1.0;
+  mouse_d2 = sq mdx + sq mdy;
+  mouse_base = inv (1.0 + 1.35 * mouse_d2 * inv mouse_radius_2);
+  mouse_force = mouse_on * repel_strength * 4200.0 * inv mouse_radius_2 * mouse_base * mouse_base;
+  mouse_ax = mdx * mouse_force;
+  mouse_ay = mdy * mouse_force;
+  pdx = x - px;
+  pdy = y - py;
+  pulse_radius = pulse_age * pulse_speed;
+  pulse_radius_2 = sq pulse_radius;
+  pulse_d2 = sq pdx + sq pdy;
+  pulse_width_2 = sq pulse_width + 12.0;
+  ring_delta = pulse_d2 - pulse_radius_2;
+  ring_sharpness = 0.0000035 * inv pulse_width_2;
+  ring_band = pulse_on * inv (1.0 + ring_sharpness * sq ring_delta);
+  pulse_decay = inv (1.0 + 0.85 * pulse_age);
+  pulse_force = 135.0 * ring_band * pulse_decay * inv (1.0 + 0.002 * pulse_d2);
+  pulse_ax = pdx * pulse_force;
+  pulse_ay = pdy * pulse_force;
+  drag = inv (1.0 + 7.0 * dt);
+  next_vx = (vx + dt * (home_ax + mouse_ax + pulse_ax)) * drag;
+  next_vy = (vy + dt * (home_ay + mouse_ay + pulse_ay)) * drag;
+  next_x = x + next_vx * dt;
+  next_y = y + next_vy * dt
+in { x = next_x, y = next_y, vx = next_vx, vy = next_vy }
+
+main : f32 -> f32 -> f32 -> f32 -> f32 -> f32 -> f32 -> f32 -> f32 -> f32 -> f32 -> f32 -> f32[n] -> f32[n] -> f32[n] -> f32[n] -> f32[n] -> f32[n] -> { x: f32[n], y: f32[n], vx: f32[n], vy: f32[n] }
+main dt mx my mouse_on repel_radius repel_strength px py pulse_age pulse_on pulse_speed pulse_width home_xs home_ys xs ys vxs vys = particle_step dt mx my mouse_on repel_radius repel_strength px py pulse_age pulse_on pulse_speed pulse_width home_xs home_ys xs ys vxs vys

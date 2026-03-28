@@ -1,0 +1,5 @@
+sample : i64[*n] -> Index n -> i64
+sample xs idx = xs[idx]
+
+main : i64[*] -> i64[n] -> i64[n]
+main xs idx = gather xs idx

@@ -5,6 +5,7 @@
 - scalar and bulk numerics
 - records with internal SoA lowering
 - native n-ary tuples
+- owned runtime-sized sequences with `T[*]` in the evaluator/core runtime
 - `char`, `string`, and slice-view clause patterns
 - recursive fixed-arity enums/ADTs
 - evaluator, lowered execution, and Wasm execution paths
@@ -16,6 +17,12 @@ Current recursive enum status:
 - evaluator, lowered execution, and Wasm all use preorder interval-tape semantics for enum trees
 - Wasm enum values now use native tape-backed handles rather than the older pointer-node layout
 - host JSON enum input is still unsupported
+- `T[*]` is available in the surface language and evaluator/core runtime
+- Wasm now supports scalar-element `T[*]` consumers through the existing `(ptr,len)` bulk ABI
+- Wasm now supports direct scalar-element `T[*]` results and scalar-element enum payload fields
+- Wasm now supports the current recursive-ADT-safe `T[*]` subset, including recursive `Self[*]` enum payload fields
+- `reverse : T[*] -> T[*]` is now a first-class builtin across evaluator and Wasm for the current Wasm-storable `T[*]` subset
+- broader non-scalar top-level `T[*]` ABI shapes beyond that subset are still out of scope
 
 Useful commands:
 
@@ -24,7 +31,10 @@ cargo run -- run examples/json_parser_adt.simd --main main --args '["{\"a\":[1,2
 cargo run -- run-wasm examples/json_parser_adt.simd --main main --args '["{\"a\":[1,2,3]}"]'
 cargo run -- run-wasm-prepared examples/json_parser_adt.simd --main main --args '["{\"a\":[1,2,3]}"]' --iters 10
 cargo run -- run-profile examples/json_parser_adt.simd --main main --args '["{\"a\":[1,2,3]}"]'
+cargo run -- run-profile-fns examples/json_parser_adt.simd --main main --args '["{\"a\":[1,2,3]}"]'
 cargo run -- run-wasm-profile examples/json_parser_adt.simd --main main --args '["{\"a\":[1,2,3]}"]'
+cargo run -- run-wasm-profile-fns examples/json_parser_adt.simd --main main --args '["{\"a\":[1,2,3]}"]'
+cargo run -- run-profile-fns examples/star_seq_basics.simd --main sum_seq --args '[[1,2,3,4]]' --json
 ```
 
 Implementation notes:
@@ -32,12 +42,21 @@ Implementation notes:
 - repeated Wasm CLI runs use a local Wasmtime compilation cache under `.tmp/wasmtime-cache`
 - `run-wasm-profile` reports cold-vs-cached Wasm stage timings
 - `run-profile` reports evaluator frontend/arg-parse/execute timings
+- `run-profile-fns` and `run-wasm-profile-fns` report per-function inclusive time and call counts for named SIMd functions
+- both per-function profilers accept `--json` for machine-readable output
+- `examples/json_parser_adt.simd` now uses flat `T[*]` child regions for both arrays and objects:
+  - `JArray Json[*]`
+  - `JObject Json[*]`
+  - object entries are represented as `JField key_len value` elements inside the object sequence
+  - sequence reversal now uses the general `reverse` builtin instead of a handwritten accumulator helper
 
 Example programs:
 
 - [JSON parser ADT notes](./examples/README.md)
 - [JSON parser ADT source](./examples/json_parser_adt.simd)
 - [Tuple basics source](./examples/tuple_basics.simd)
+- [Star sequence basics source](./examples/star_seq_basics.simd)
+- [Star sequence tree source](./examples/star_seq_tree.simd)
 
 ## Benchmark Tracking
 
@@ -50,6 +69,7 @@ All numbers are machine-dependent and should be compared on the same host.
 - [WAT Inspector](./docs/inspector.html)
 - [Mouse Shader Demo](./docs/canvas_mouse_demo.html)
 - [Image Upload Shader Lab](./docs/image_upload_shader_demo.html)
+- [Stipple Pulse Shader Demo](./docs/image_stipple_pulse_shader_demo.html)
 - [3D Matrix Canvas Demo](./docs/canvas_3d_matrix_demo.html)
 - [Shadertoy Logo Shader Demo](./docs/canvas_string_sdf_demo.html)
 

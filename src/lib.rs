@@ -16,10 +16,11 @@ pub use formatter::{fmt_command, format_program, format_source_text};
 pub use lsp::lsp_command;
 pub use wasm_backend::{
     BoundPreparedRun, PreparedLayout, PreparedSlotKind, PreparedSlotMetadata, PreparedSlotRole,
-    PreparedWasmMain, WasmArtifact, WasmExecutable, WasmHigherOrderReport, WasmParamAbi,
-    WasmResultAbi, WasmRunProfile, compile_wasm_main, prepare_wasm_artifact, prepare_wasm_main,
-    run_wasm_artifact, run_wasm_command, run_wasm_main, run_wasm_prepared_command,
-    run_wasm_prepared_main, run_wasm_profile_command, run_wasm_profile_main, wasm_command,
+    PreparedWasmMain, WasmArtifact, WasmExecutable, WasmFunctionProfile, WasmHigherOrderReport,
+    WasmParamAbi, WasmResultAbi, WasmRunProfile, compile_wasm_main, prepare_wasm_artifact,
+    prepare_wasm_main, run_wasm_artifact, run_wasm_command, run_wasm_main,
+    run_wasm_prepared_command, run_wasm_prepared_main, run_wasm_profile_command,
+    run_wasm_profile_fns_command, run_wasm_profile_fns_main, run_wasm_profile_main, wasm_command,
     wat_command, wat_main,
 };
 
@@ -58,6 +59,153 @@ impl EvalRunProfile {
         ]
         .join("\n")
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FunctionProfileRow {
+    pub name: String,
+    pub calls: u64,
+    pub total_us: u128,
+    pub avg_us: u128,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvalFunctionProfile {
+    pub result_json: String,
+    pub total_us: u128,
+    pub functions: Vec<FunctionProfileRow>,
+}
+
+impl EvalFunctionProfile {
+    pub fn to_table_string(&self) -> String {
+        render_function_profile_table(&self.result_json, self.total_us, &self.functions)
+    }
+
+    pub fn to_json_string(&self) -> String {
+        let functions = self
+            .functions
+            .iter()
+            .map(|row| {
+                serde_json::json!({
+                    "name": row.name,
+                    "calls": row.calls,
+                    "total_us": row.total_us.to_string(),
+                    "avg_us": row.avg_us.to_string(),
+                })
+            })
+            .collect::<Vec<_>>();
+        serde_json::json!({
+            "result_json": self.result_json,
+            "total_us": self.total_us.to_string(),
+            "function_count": self.functions.len(),
+            "functions": functions,
+        })
+        .to_string()
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+struct FunctionProfileAccumulator {
+    rows: BTreeMap<String, FunctionProfileStats>,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct FunctionProfileStats {
+    calls: u64,
+    total_us: u128,
+}
+
+impl FunctionProfileAccumulator {
+    fn record_call(&mut self, name: &str, elapsed_us: u128) {
+        let entry = self.rows.entry(name.to_string()).or_default();
+        entry.calls += 1;
+        entry.total_us += elapsed_us;
+    }
+
+    fn finish(&self) -> Vec<FunctionProfileRow> {
+        let mut rows = self
+            .rows
+            .iter()
+            .map(|(name, stats)| FunctionProfileRow {
+                name: name.clone(),
+                calls: stats.calls,
+                total_us: stats.total_us,
+                avg_us: if stats.calls == 0 {
+                    0
+                } else {
+                    stats.total_us / u128::from(stats.calls)
+                },
+            })
+            .collect::<Vec<_>>();
+        rows.sort_by(|left, right| {
+            right
+                .total_us
+                .cmp(&left.total_us)
+                .then_with(|| left.name.cmp(&right.name))
+        });
+        rows
+    }
+}
+
+fn render_function_profile_table(
+    result_json: &str,
+    total_us: u128,
+    rows: &[FunctionProfileRow],
+) -> String {
+    let name_width = rows
+        .iter()
+        .map(|row| row.name.len())
+        .max()
+        .unwrap_or("function".len())
+        .max("function".len());
+    let calls_width = rows
+        .iter()
+        .map(|row| row.calls.to_string().len())
+        .max()
+        .unwrap_or("calls".len())
+        .max("calls".len());
+    let total_width = rows
+        .iter()
+        .map(|row| row.total_us.to_string().len())
+        .max()
+        .unwrap_or("total_us".len())
+        .max("total_us".len());
+    let avg_width = rows
+        .iter()
+        .map(|row| row.avg_us.to_string().len())
+        .max()
+        .unwrap_or("avg_us".len())
+        .max("avg_us".len());
+    let mut lines = vec![
+        format!("result_json={}", result_json),
+        format!("total_us={}", total_us),
+        format!("function_count={}", rows.len()),
+        format!(
+            "{:<name_width$} {:>calls_width$} {:>total_width$} {:>avg_width$}",
+            "function",
+            "calls",
+            "total_us",
+            "avg_us",
+            name_width = name_width,
+            calls_width = calls_width,
+            total_width = total_width,
+            avg_width = avg_width,
+        ),
+    ];
+    for row in rows {
+        lines.push(format!(
+            "{:<name_width$} {:>calls_width$} {:>total_width$} {:>avg_width$}",
+            row.name,
+            row.calls,
+            row.total_us,
+            row.avg_us,
+            name_width = name_width,
+            calls_width = calls_width,
+            total_width = total_width,
+            avg_width = avg_width,
+        ));
+    }
+    lines.join("\n")
 }
 
 impl SimdError {
@@ -206,6 +354,11 @@ pub enum Expr {
     Bool(bool),
     Char(char),
     String(String),
+    Seq(Vec<Expr>),
+    SeqSplice {
+        prefix: Vec<Expr>,
+        tail: Box<Expr>,
+    },
     Tuple(Vec<Expr>),
     App(Box<Expr>, Box<Expr>),
     Lambda {
@@ -219,6 +372,11 @@ pub enum Expr {
     Record(Vec<(String, Expr)>),
     Project(Box<Expr>, String),
     TupleProject(Box<Expr>, usize),
+    Index {
+        base: Box<Expr>,
+        index: Box<Expr>,
+        checked: bool,
+    },
     RecordUpdate {
         base: Box<Expr>,
         fields: Vec<(String, Expr)>,
@@ -270,6 +428,9 @@ impl PrimOp {
 pub enum Type {
     Scalar(Prim),
     Bulk(Prim, Shape),
+    StarSeq(Box<Type>),
+    StarSeqWitnessed(Box<Type>, String),
+    Index(String),
     TypeToken(Box<Type>),
     Tuple(Vec<Type>),
     Record(BTreeMap<String, Type>),
@@ -418,6 +579,11 @@ pub enum TypedExprKind {
     Bool(bool),
     Char(char),
     String(String),
+    Seq(Vec<TypedExpr>),
+    SeqSplice {
+        prefix: Vec<TypedExpr>,
+        tail: Box<TypedExpr>,
+    },
     TypeToken(Prim),
     Lambda {
         param: String,
@@ -436,6 +602,11 @@ pub enum TypedExprKind {
     TupleProject {
         base: Box<TypedExpr>,
         index: usize,
+    },
+    Index {
+        base: Box<TypedExpr>,
+        index: Box<TypedExpr>,
+        checked: bool,
     },
     RecordUpdate {
         base: Box<TypedExpr>,
@@ -475,6 +646,13 @@ pub enum BuiltinFamilyCallee {
     OrBool,
     EqString,
     EqBool,
+    ReverseSeq(Type),
+    GatherSeq(Prim),
+    ScatterSeq(Prim),
+    ScatterAddSeq(Prim),
+    CheckedGatherSeq(Prim),
+    CheckIndexSeq(String),
+    IndicesSeq(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -589,6 +767,7 @@ pub struct LoweredFunction {
 pub struct StructuralProgram {
     pub entry_state: u32,
     pub states: Vec<StructuralState>,
+    pub sequence_regions: Vec<StructuralSequenceRegion>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -602,6 +781,21 @@ pub struct StructuralState {
 pub enum StructuralAction {
     Transition { state: u32, args: Vec<IrExpr> },
     Return { expr: IrExpr },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructuralSequenceRegion {
+    pub state_ids: Vec<u32>,
+    pub span_param_index: usize,
+    pub entry_state: u32,
+    pub exit_states: Vec<u32>,
+    pub mode: StructuralSequenceMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum StructuralSequenceMode {
+    CharPrefixRun,
+    SeparatedItems,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -661,6 +855,11 @@ pub enum IrExprKind {
     Local(String),
     Int(i64, Prim),
     Float(f64, Prim),
+    Seq(Vec<IrExpr>),
+    SeqSplice {
+        prefix: Vec<IrExpr>,
+        tail: Box<IrExpr>,
+    },
     Record(BTreeMap<String, IrExpr>),
     EnumCtor {
         ctor: String,
@@ -707,6 +906,7 @@ pub enum Value {
     Bulk(BulkValue),
     Bool(bool),
     String(String),
+    StarSeq(StarSeqValue),
     TypeToken(Prim),
     Tuple(Vec<Value>),
     Record(BTreeMap<String, Value>),
@@ -775,6 +975,12 @@ pub struct BulkValue {
     pub elements: Vec<ScalarValue>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct StarSeqValue {
+    pub elem_ty: Type,
+    pub items: Vec<Value>,
+}
+
 impl Type {
     pub fn arity(&self) -> usize {
         match self {
@@ -793,7 +999,10 @@ impl Type {
     fn prim(&self) -> Option<Prim> {
         match self {
             Self::Scalar(prim) | Self::Bulk(prim, _) => Some(*prim),
-            Self::TypeToken(_)
+            Self::Index(_) => Some(Prim::I64),
+            Self::StarSeq(_)
+            | Self::StarSeqWitnessed(_, _)
+            | Self::TypeToken(_)
             | Self::Tuple(_)
             | Self::Record(_)
             | Self::Named(_, _)
@@ -861,6 +1070,18 @@ fn builtin_bool_type() -> Type {
     Type::Named("bool".to_string(), Vec::new())
 }
 
+fn builtin_maybe_type(inner: Type) -> Type {
+    Type::Named("Maybe".to_string(), vec![inner])
+}
+
+fn star_seq_parts(ty: &Type) -> Option<(&Type, Option<&str>)> {
+    match ty {
+        Type::StarSeq(item) => Some((item.as_ref(), None)),
+        Type::StarSeqWitnessed(item, witness) => Some((item.as_ref(), Some(witness.as_str()))),
+        _ => None,
+    }
+}
+
 impl BulkValue {
     fn scalar_at(&self, index: usize) -> ScalarValue {
         self.elements[index].clone()
@@ -918,6 +1139,7 @@ impl Value {
             ),
             Self::Bool(_) => builtin_bool_type(),
             Self::String(_) => builtin_string_type(),
+            Self::StarSeq(value) => Type::StarSeq(Box::new(value.elem_ty.clone())),
             Self::TypeToken(prim) => Type::TypeToken(Box::new(Type::Scalar(*prim))),
             Self::Tuple(items) => Type::Tuple(items.iter().map(Value::ty).collect()),
             Self::Record(fields) => Type::Record(
@@ -936,6 +1158,7 @@ impl Value {
             Self::Bulk(value) => render_bulk_json(&value.elements, &value.shape, 0),
             Self::Bool(value) => value.to_string(),
             Self::String(value) => json_string(value),
+            Self::StarSeq(value) => render_star_seq_json(value),
             Self::TypeToken(prim) => format!("\"{}\"", format_prim(*prim)),
             Self::Tuple(items) => render_tuple_json(items),
             Self::Record(fields) => render_record_json(fields),
@@ -948,6 +1171,18 @@ fn render_tuple_json(items: &[Value]) -> String {
     format!(
         "[{}]",
         items
+            .iter()
+            .map(Value::to_json_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
+fn render_star_seq_json(value: &StarSeqValue) -> String {
+    format!(
+        "[{}]",
+        value
+            .items
             .iter()
             .map(Value::to_json_string)
             .collect::<Vec<_>>()
@@ -1095,7 +1330,11 @@ fn render_lifted_value_json(value: &Value, shape: &[usize], offset: usize) -> St
 
 fn value_lift_shape(value: &Value) -> Option<Vec<usize>> {
     match value {
-        Value::Scalar(_) | Value::Bool(_) | Value::String(_) | Value::TypeToken(_) => None,
+        Value::Scalar(_)
+        | Value::Bool(_)
+        | Value::String(_)
+        | Value::StarSeq(_)
+        | Value::TypeToken(_) => None,
         Value::Bulk(bulk) => Some(bulk.shape.clone()),
         Value::Tuple(items) => {
             let mut shape = None::<Vec<usize>>;
@@ -1133,7 +1372,7 @@ fn value_leaf_prim(value: &Value) -> Option<Prim> {
     match value {
         Value::Scalar(value) => Some(value.prim()),
         Value::Bulk(value) => Some(value.prim),
-        Value::Bool(_) | Value::String(_) | Value::TypeToken(_) => None,
+        Value::Bool(_) | Value::String(_) | Value::StarSeq(_) | Value::TypeToken(_) => None,
         Value::Tuple(items) => items.iter().find_map(value_leaf_prim),
         Value::Record(fields) => fields.values().find_map(value_leaf_prim),
         Value::Enum(_) => None,
@@ -1158,9 +1397,9 @@ fn extract_lifted_lane(value: &Value, index: usize) -> Result<Value> {
         Value::TypeToken(_) => Err(SimdError::new(
             "cannot extract a lifted lane from a type witness value",
         )),
-        Value::Scalar(_) | Value::Bool(_) | Value::String(_) => Err(SimdError::new(
-            "cannot extract a lifted lane from a scalar value",
-        )),
+        Value::Scalar(_) | Value::Bool(_) | Value::String(_) | Value::StarSeq(_) => Err(
+            SimdError::new("cannot extract a lifted lane from a scalar value"),
+        ),
         Value::Enum(_) => Err(SimdError::new(
             "cannot extract a lifted lane from an enum value",
         )),
@@ -1201,6 +1440,23 @@ fn collect_lifted_value(values: &[Value], scalar_ty: &Type, shape: &[usize]) -> 
             }
             Ok(Value::Tuple(tuple_items))
         }
+        Type::StarSeq(_) | Type::StarSeqWitnessed(_, _) => Err(SimdError::new(
+            "lifted result type unexpectedly contained an owned sequence",
+        )),
+        Type::Index(_) => Ok(Value::Bulk(BulkValue {
+            prim: Prim::I64,
+            shape: shape.to_vec(),
+            elements: values
+                .iter()
+                .map(|value| match value {
+                    Value::Scalar(ScalarValue::I64(value)) => Ok(ScalarValue::I64(*value)),
+                    other => Err(SimdError::new(format!(
+                        "lifted lane result expected Index/i64, found {:?}",
+                        other
+                    ))),
+                })
+                .collect::<Result<Vec<_>>>()?,
+        })),
         Type::Record(fields) => {
             let mut lifted_fields = BTreeMap::new();
             for (name, field_ty) in fields {
@@ -1248,7 +1504,11 @@ pub fn flatten_type_leaves(ty: &Type) -> Vec<TypeLeaf> {
 
 fn collect_type_leaves(ty: &Type, prefix: &LeafPath, leaves: &mut Vec<TypeLeaf>) {
     match ty {
-        Type::Scalar(_) | Type::Bulk(_, _) => leaves.push(TypeLeaf {
+        Type::Scalar(_) | Type::Bulk(_, _) | Type::Index(_) => leaves.push(TypeLeaf {
+            path: prefix.clone(),
+            ty: ty.clone(),
+        }),
+        Type::StarSeq(_) | Type::StarSeqWitnessed(_, _) => leaves.push(TypeLeaf {
             path: prefix.clone(),
             ty: ty.clone(),
         }),
@@ -1273,7 +1533,10 @@ fn collect_type_leaves(ty: &Type, prefix: &LeafPath, leaves: &mut Vec<TypeLeaf>)
 
 pub fn flatten_value_leaves(value: &Value, ty: &Type) -> Result<Vec<(LeafPath, Value)>> {
     match (value, ty) {
-        (Value::Scalar(_), Type::Scalar(_)) | (Value::Bulk(_), Type::Bulk(_, _)) => {
+        (Value::Scalar(_), Type::Scalar(_))
+        | (Value::Scalar(_), Type::Index(_))
+        | (Value::Bulk(_), Type::Bulk(_, _)) => Ok(vec![(LeafPath::root(), value.clone())]),
+        (Value::StarSeq(_), Type::StarSeq(_) | Type::StarSeqWitnessed(_, _)) => {
             Ok(vec![(LeafPath::root(), value.clone())])
         }
         (Value::String(_), Type::Named(name, args)) if name == "string" && args.is_empty() => {
@@ -1324,7 +1587,11 @@ pub fn flatten_value_leaves(value: &Value, ty: &Type) -> Result<Vec<(LeafPath, V
 
 pub fn rebuild_value_from_leaves(ty: &Type, leaves: &BTreeMap<LeafPath, Value>) -> Result<Value> {
     match ty {
-        Type::Scalar(_) | Type::Bulk(_, _) => leaves
+        Type::Scalar(_)
+        | Type::Bulk(_, _)
+        | Type::StarSeq(_)
+        | Type::StarSeqWitnessed(_, _)
+        | Type::Index(_) => leaves
             .get(&LeafPath::root())
             .cloned()
             .ok_or_else(|| SimdError::new(format!("missing root leaf for type {:?}", ty))),
@@ -1433,6 +1700,7 @@ enum TokenKind {
     Star,
     Slash,
     Percent,
+    Amp,
     AmpAmp,
     Pipe,
     PipePipe,
@@ -1444,6 +1712,7 @@ enum TokenKind {
     Backslash,
     Ellipsis,
     Dot,
+    Question,
     LParen,
     RParen,
     LBracket,
@@ -1668,7 +1937,7 @@ fn lex(source: &str) -> Result<Vec<Token>> {
                 if chars.get(index + 1) == Some(&'&') {
                     (TokenKind::AmpAmp, 2)
                 } else {
-                    return Err(SimdError::new("unexpected character '&' in input"));
+                    (TokenKind::Amp, 1)
                 }
             }
             '|' => {
@@ -1698,6 +1967,7 @@ fn lex(source: &str) -> Result<Vec<Token>> {
             ']' => (TokenKind::RBracket, 1),
             '{' => (TokenKind::LBrace, 1),
             '}' => (TokenKind::RBrace, 1),
+            '?' => (TokenKind::Question, 1),
             '.' => {
                 if chars.get(index + 1) == Some(&'.') && chars.get(index + 2) == Some(&'.') {
                     (TokenKind::Ellipsis, 3)
@@ -2260,6 +2530,34 @@ impl Parser {
         };
 
         while self.eat(TokenKind::LBracket) {
+            if self.eat(TokenKind::Star) {
+                let witness = if self.peek_is(TokenKind::Ident) {
+                    Some(self.expect_ident()?)
+                } else if self.peek_is(TokenKind::Int) {
+                    let token = self
+                        .peek()
+                        .cloned()
+                        .ok_or_else(|| SimdError::new("unexpected end of input after '*'"))?;
+                    return Err(SimdError::new(format!(
+                        "T[*{}] is not supported in v1; use T[*name] or T[*]",
+                        token.text
+                    )));
+                } else {
+                    None
+                };
+                self.expect(TokenKind::RBracket)?;
+                head = match witness {
+                    Some(witness) => Type::StarSeqWitnessed(Box::new(head), witness),
+                    None => Type::StarSeq(Box::new(head)),
+                };
+                continue;
+            }
+            if self.eat(TokenKind::Amp) {
+                self.expect(TokenKind::RBracket)?;
+                return Err(SimdError::new(
+                    "T[&] is reserved for future borrowed/view sequences and is not implemented yet",
+                ));
+            }
             let mut dims = Vec::new();
             loop {
                 dims.push(self.parse_dim()?);
@@ -2305,7 +2603,10 @@ impl Parser {
     fn parse_expr(&mut self, min_bp: u8) -> Result<Expr> {
         let mut lhs = self.parse_atom()?;
         loop {
-            while self.peek_is(TokenKind::Dot) || self.peek_is(TokenKind::LBrace) {
+            while self.peek_is(TokenKind::Dot)
+                || self.peek_is(TokenKind::LBrace)
+                || self.peek_is_unspaced(TokenKind::LBracket)
+            {
                 lhs = self.parse_postfix(lhs)?;
             }
             if matches!(
@@ -2402,6 +2703,7 @@ impl Parser {
                 self.pos += 1;
                 Ok(Expr::String(parse_string_literal(&token.text)?))
             }
+            TokenKind::LBracket => self.parse_seq_literal_expr(),
             TokenKind::LParen => {
                 self.pos += 1;
                 let first = self.parse_expr(0)?;
@@ -2443,6 +2745,17 @@ impl Parser {
                 return Ok(Expr::TupleProject(Box::new(lhs), parse_nat(&token.text)?));
             }
             return Ok(Expr::Project(Box::new(lhs), self.expect_ident()?));
+        }
+        if self.peek_is_unspaced(TokenKind::LBracket) {
+            self.expect(TokenKind::LBracket)?;
+            let index = self.parse_expr(0)?;
+            self.expect(TokenKind::RBracket)?;
+            let checked = self.eat(TokenKind::Question);
+            return Ok(Expr::Index {
+                base: Box::new(lhs),
+                index: Box::new(index),
+                checked,
+            });
         }
         if self.eat(TokenKind::LBrace) {
             let fields = self.parse_record_expr_fields()?;
@@ -2494,9 +2807,46 @@ impl Parser {
                     | TokenKind::Float
                     | TokenKind::CharLit
                     | TokenKind::StringLit
+                    | TokenKind::LBracket
                     | TokenKind::LParen
             )
         )
+    }
+
+    fn peek_is_unspaced(&self, kind: TokenKind) -> bool {
+        self.peek()
+            .is_some_and(|token| token.kind == kind && !token.leading_space)
+    }
+
+    fn parse_seq_literal_expr(&mut self) -> Result<Expr> {
+        self.expect(TokenKind::LBracket)?;
+        self.skip_newlines();
+        let mut items = Vec::new();
+        if self.eat(TokenKind::RBracket) {
+            return Ok(Expr::Seq(items));
+        }
+        loop {
+            self.skip_newlines();
+            if self.eat(TokenKind::Ellipsis) {
+                self.skip_newlines();
+                let tail = self.parse_expr(0)?;
+                self.skip_newlines();
+                self.expect(TokenKind::RBracket)?;
+                return Ok(Expr::SeqSplice {
+                    prefix: items,
+                    tail: Box::new(tail),
+                });
+            }
+            items.push(self.parse_expr(0)?);
+            self.skip_newlines();
+            if self.eat(TokenKind::Comma) {
+                self.skip_newlines();
+                continue;
+            }
+            self.expect(TokenKind::RBracket)?;
+            break;
+        }
+        Ok(Expr::Seq(items))
     }
 
     fn parse_lambda_expr(&mut self) -> Result<Expr> {
@@ -2857,6 +3207,10 @@ fn recursive_slot_paths_in_type(
         return Ok(());
     }
     match ty {
+        Type::StarSeq(item_ty) | Type::StarSeqWitnessed(item_ty, _) => {
+            validate_star_seq_element_type(item_ty, enum_decl, enum_names)?;
+            Ok(())
+        }
         Type::Record(fields) => {
             for (name, field_ty) in fields {
                 let mut next = prefix.to_vec();
@@ -2909,7 +3263,67 @@ fn recursive_slot_paths_in_type(
             }
             recursive_slot_paths_in_type(ret, enum_decl, enum_names, prefix, out)
         }
-        Type::Scalar(_) | Type::Bulk(_, _) | Type::Var(_) | Type::Infer(_) => Ok(()),
+        Type::Scalar(_) | Type::Bulk(_, _) | Type::Var(_) | Type::Infer(_) | Type::Index(_) => {
+            Ok(())
+        }
+    }
+}
+
+fn validate_star_seq_element_type(
+    ty: &Type,
+    enum_decl: &EnumDecl,
+    enum_names: &BTreeSet<String>,
+) -> Result<()> {
+    match ty {
+        Type::StarSeq(_) | Type::StarSeqWitnessed(_, _) => Err(SimdError::new(format!(
+            "nested T[*] is not supported in v1 for enum '{}'",
+            enum_decl.name
+        ))),
+        Type::Tuple(items) => {
+            for item in items {
+                validate_star_seq_element_type(item, enum_decl, enum_names)?;
+            }
+            Ok(())
+        }
+        Type::Record(fields) => {
+            for item in fields.values() {
+                validate_star_seq_element_type(item, enum_decl, enum_names)?;
+            }
+            Ok(())
+        }
+        Type::Named(name, args) => {
+            if enum_names.contains(name) {
+                if name != &enum_decl.name {
+                    return Err(SimdError::new(format!(
+                        "mutual recursion is not supported in v1: enum '{}' references enum '{}' through T[*]",
+                        enum_decl.name, name
+                    )));
+                }
+                if args.len() != enum_decl.params.len()
+                    || !args
+                        .iter()
+                        .zip(&enum_decl.params)
+                        .all(|(arg, param)| matches!(arg, Type::Var(name) if name == param))
+                {
+                    return Err(SimdError::new(format!(
+                        "T[*] element type '{:?}' of enum '{}' must use direct self recursion '{} {}'",
+                        ty,
+                        enum_decl.name,
+                        enum_decl.name,
+                        enum_decl.params.join(" ")
+                    )));
+                }
+            }
+            Ok(())
+        }
+        Type::TypeToken(inner) => validate_star_seq_element_type(inner, enum_decl, enum_names),
+        Type::Fun(_, _) => Err(SimdError::new(format!(
+            "function-typed T[*] elements are not supported in enum '{}'",
+            enum_decl.name
+        ))),
+        Type::Scalar(_) | Type::Bulk(_, _) | Type::Var(_) | Type::Infer(_) | Type::Index(_) => {
+            Ok(())
+        }
     }
 }
 
@@ -2920,6 +3334,9 @@ fn type_contains_named_enum(ty: &Type, enum_names: &BTreeSet<String>) -> bool {
                 || args
                     .iter()
                     .any(|arg| type_contains_named_enum(arg, enum_names))
+        }
+        Type::StarSeq(item) | Type::StarSeqWitnessed(item, _) => {
+            type_contains_named_enum(item, enum_names)
         }
         Type::TypeToken(inner) => type_contains_named_enum(inner, enum_names),
         Type::Tuple(items) => items
@@ -2933,7 +3350,9 @@ fn type_contains_named_enum(ty: &Type, enum_names: &BTreeSet<String>) -> bool {
                 .any(|arg| type_contains_named_enum(arg, enum_names))
                 || type_contains_named_enum(ret, enum_names)
         }
-        Type::Scalar(_) | Type::Bulk(_, _) | Type::Var(_) | Type::Infer(_) => false,
+        Type::Scalar(_) | Type::Bulk(_, _) | Type::Var(_) | Type::Infer(_) | Type::Index(_) => {
+            false
+        }
     }
 }
 
@@ -3278,7 +3697,122 @@ fn builtin_family_declarations() -> Vec<FamilyDecl> {
             ),
             op: None,
         },
+        FamilyDecl {
+            name: "gather".to_string(),
+            params: vec!["t".to_string()],
+            ty: Type::Fun(
+                vec![
+                    Type::StarSeq(Box::new(Type::Var("t".to_string()))),
+                    Type::Scalar(Prim::I64),
+                ],
+                Box::new(Type::Var("t".to_string())),
+            ),
+            op: None,
+        },
+        FamilyDecl {
+            name: "reverse".to_string(),
+            params: vec!["t".to_string()],
+            ty: Type::Fun(
+                vec![Type::StarSeq(Box::new(Type::Var("t".to_string())))],
+                Box::new(Type::StarSeq(Box::new(Type::Var("t".to_string())))),
+            ),
+            op: None,
+        },
+        FamilyDecl {
+            name: "scatter".to_string(),
+            params: vec!["t".to_string()],
+            ty: Type::Fun(
+                vec![
+                    Type::Var("t".to_string()),
+                    Type::Var("t".to_string()),
+                    Type::Var("t".to_string()),
+                ],
+                Box::new(Type::Var("t".to_string())),
+            ),
+            op: None,
+        },
+        FamilyDecl {
+            name: "scatter_add".to_string(),
+            params: vec!["t".to_string()],
+            ty: Type::Fun(
+                vec![
+                    Type::Var("t".to_string()),
+                    Type::Var("t".to_string()),
+                    Type::Var("t".to_string()),
+                ],
+                Box::new(Type::Var("t".to_string())),
+            ),
+            op: None,
+        },
+        FamilyDecl {
+            name: "get".to_string(),
+            params: vec!["t".to_string()],
+            ty: Type::Fun(
+                vec![
+                    Type::StarSeqWitnessed(Box::new(Type::Var("t".to_string())), "n".to_string()),
+                    Type::Index("n".to_string()),
+                ],
+                Box::new(Type::Var("t".to_string())),
+            ),
+            op: None,
+        },
+        FamilyDecl {
+            name: "try_get".to_string(),
+            params: vec!["t".to_string()],
+            ty: Type::Fun(
+                vec![
+                    Type::StarSeqWitnessed(Box::new(Type::Var("t".to_string())), "n".to_string()),
+                    Type::Scalar(Prim::I64),
+                ],
+                Box::new(builtin_maybe_type(Type::Var("t".to_string()))),
+            ),
+            op: None,
+        },
+        FamilyDecl {
+            name: "check_index".to_string(),
+            params: vec!["t".to_string()],
+            ty: Type::Fun(
+                vec![
+                    Type::StarSeqWitnessed(Box::new(Type::Var("t".to_string())), "n".to_string()),
+                    Type::Scalar(Prim::I64),
+                ],
+                Box::new(builtin_maybe_type(Type::Index("n".to_string()))),
+            ),
+            op: None,
+        },
+        FamilyDecl {
+            name: "indices".to_string(),
+            params: vec!["t".to_string()],
+            ty: Type::Fun(
+                vec![Type::StarSeqWitnessed(
+                    Box::new(Type::Var("t".to_string())),
+                    "n".to_string(),
+                )],
+                Box::new(Type::StarSeqWitnessed(
+                    Box::new(Type::Index("n".to_string())),
+                    "n".to_string(),
+                )),
+            ),
+            op: None,
+        },
     ]
+}
+
+fn builtin_enum_declarations() -> Vec<EnumDecl> {
+    vec![EnumDecl {
+        name: "Maybe".to_string(),
+        params: vec!["t".to_string()],
+        ctors: vec![
+            EnumCtorDecl {
+                name: "None".to_string(),
+                fields: Vec::new(),
+            },
+            EnumCtorDecl {
+                name: "Some".to_string(),
+                fields: vec![Type::Var("t".to_string())],
+            },
+        ],
+    }]
 }
 
 fn group_program(surface: &SurfaceProgram) -> Result<Module> {
@@ -3289,9 +3823,14 @@ fn group_program(surface: &SurfaceProgram) -> Result<Module> {
     let mut type_alias_order = Vec::<String>::new();
     let mut enum_order = Vec::<String>::new();
     let builtin_families = builtin_family_declarations();
+    let builtin_enums = builtin_enum_declarations();
     let builtin_family_names = builtin_families
         .iter()
         .map(|family| family.name.clone())
+        .collect::<BTreeSet<_>>();
+    let builtin_enum_names = builtin_enums
+        .iter()
+        .map(|enum_decl| enum_decl.name.clone())
         .collect::<BTreeSet<_>>();
     let mut families = builtin_families
         .iter()
@@ -3300,7 +3839,12 @@ fn group_program(surface: &SurfaceProgram) -> Result<Module> {
         .map(|family| (family.name.clone(), family))
         .collect::<BTreeMap<_, _>>();
     let mut type_aliases = BTreeMap::<String, TypeAliasDecl>::new();
-    let mut enum_decls = BTreeMap::<String, EnumDecl>::new();
+    let mut enum_decls = builtin_enums
+        .iter()
+        .cloned()
+        .map(|enum_decl| (enum_decl.name.clone(), enum_decl))
+        .collect::<BTreeMap<_, _>>();
+    enum_order.extend(builtin_enums.iter().map(|enum_decl| enum_decl.name.clone()));
     let mut signatures = BTreeMap::<String, Signature>::new();
     let mut clauses = BTreeMap::<String, Vec<Clause>>::new();
 
@@ -3385,6 +3929,9 @@ fn group_program(surface: &SurfaceProgram) -> Result<Module> {
                 }
             }
             Decl::Enum(enum_decl) => {
+                if builtin_enum_names.contains(&enum_decl.name) {
+                    continue;
+                }
                 if !enum_order.contains(&enum_decl.name) {
                     enum_order.push(enum_decl.name.clone());
                 }
@@ -3921,7 +4468,18 @@ fn resolve_type_aliases_in_type(
     stack: &mut Vec<String>,
 ) -> Result<Type> {
     match ty {
-        Type::Scalar(_) | Type::Bulk(_, _) | Type::Infer(_) | Type::Var(_) => Ok(ty.clone()),
+        Type::Scalar(_) | Type::Bulk(_, _) | Type::Infer(_) | Type::Var(_) | Type::Index(_) => {
+            Ok(ty.clone())
+        }
+        Type::StarSeq(inner) => Ok(Type::StarSeq(Box::new(resolve_type_aliases_in_type(
+            inner, aliases, enum_names, bound_vars, stack,
+        )?))),
+        Type::StarSeqWitnessed(inner, witness) => Ok(Type::StarSeqWitnessed(
+            Box::new(resolve_type_aliases_in_type(
+                inner, aliases, enum_names, bound_vars, stack,
+            )?),
+            witness.clone(),
+        )),
         Type::TypeToken(inner) => Ok(Type::TypeToken(Box::new(resolve_type_aliases_in_type(
             inner, aliases, enum_names, bound_vars, stack,
         )?))),
@@ -3963,6 +4521,25 @@ fn resolve_type_aliases_in_type(
                     resolve_type_aliases_in_type(arg, aliases, enum_names, bound_vars, stack)
                 })
                 .collect::<Result<Vec<_>>>()?;
+            if name == "Index" {
+                return match resolved_args.as_slice() {
+                    [Type::Var(witness)] => Ok(Type::Index(witness.clone())),
+                    [Type::StarSeqWitnessed(inner, witness)] if matches!(inner.as_ref(), Type::Var(name) if name == witness) => {
+                        Ok(Type::StarSeqWitnessed(
+                            Box::new(Type::Index(witness.clone())),
+                            witness.clone(),
+                        ))
+                    }
+                    [other] => Err(SimdError::new(format!(
+                        "Index expects a witness variable name, found {:?}",
+                        other
+                    ))),
+                    _ => Err(SimdError::new(format!(
+                        "Index expects exactly one witness argument, found {}",
+                        resolved_args.len()
+                    ))),
+                };
+            }
             if bound_vars.contains(name) {
                 if !resolved_args.is_empty() {
                     return Err(SimdError::new(format!(
@@ -4039,7 +4616,10 @@ fn validate_signature_shape_contract(signature: &Signature) -> Result<()> {
 fn type_contains_type_witness(ty: &Type) -> bool {
     match ty {
         Type::TypeToken(_) => true,
-        Type::Scalar(_) | Type::Bulk(_, _) | Type::Var(_) | Type::Infer(_) => false,
+        Type::Scalar(_) | Type::Bulk(_, _) | Type::Var(_) | Type::Infer(_) | Type::Index(_) => {
+            false
+        }
+        Type::StarSeq(item) | Type::StarSeqWitnessed(item, _) => type_contains_type_witness(item),
         Type::Named(_, args) => args.iter().any(type_contains_type_witness),
         Type::Tuple(items) => items.iter().any(type_contains_type_witness),
         Type::Record(fields) => fields.values().any(type_contains_type_witness),
@@ -4077,6 +4657,18 @@ fn validate_pointwise_expr(expr: &Expr, known: &BTreeMap<String, usize>) -> Resu
         | Expr::Bool(_)
         | Expr::Char(_)
         | Expr::String(_) => Ok(()),
+        Expr::Seq(items) => {
+            for item in items {
+                validate_pointwise_expr(item, known)?;
+            }
+            Ok(())
+        }
+        Expr::SeqSplice { prefix, tail } => {
+            for item in prefix {
+                validate_pointwise_expr(item, known)?;
+            }
+            validate_pointwise_expr(tail, known)
+        }
         Expr::Lambda { body, .. } => validate_pointwise_expr(body, known),
         Expr::Tuple(items) => {
             for item in items {
@@ -4121,6 +4713,10 @@ fn validate_pointwise_expr(expr: &Expr, known: &BTreeMap<String, usize>) -> Resu
         }
         Expr::Project(base, _) | Expr::TupleProject(base, _) => {
             validate_pointwise_expr(base, known)
+        }
+        Expr::Index { base, index, .. } => {
+            validate_pointwise_expr(base, known)?;
+            validate_pointwise_expr(index, known)
         }
         Expr::RecordUpdate { base, fields } => {
             validate_pointwise_expr(base, known)?;
@@ -4368,10 +4964,16 @@ fn apply_infer_bindings_expr(expr: &mut TypedExpr, infer_bindings: &BTreeMap<u32
             }
             apply_infer_bindings_expr(body, infer_bindings);
         }
-        TypedExprKind::Tuple(items) => {
+        TypedExprKind::Seq(items) | TypedExprKind::Tuple(items) => {
             for expr in items {
                 apply_infer_bindings_expr(expr, infer_bindings);
             }
+        }
+        TypedExprKind::SeqSplice { prefix, tail } => {
+            for expr in prefix {
+                apply_infer_bindings_expr(expr, infer_bindings);
+            }
+            apply_infer_bindings_expr(tail, infer_bindings);
         }
         TypedExprKind::Record(fields) => {
             for expr in fields.values_mut() {
@@ -4380,6 +4982,10 @@ fn apply_infer_bindings_expr(expr: &mut TypedExpr, infer_bindings: &BTreeMap<u32
         }
         TypedExprKind::Project { base, .. } | TypedExprKind::TupleProject { base, .. } => {
             apply_infer_bindings_expr(base, infer_bindings)
+        }
+        TypedExprKind::Index { base, index, .. } => {
+            apply_infer_bindings_expr(base, infer_bindings);
+            apply_infer_bindings_expr(index, infer_bindings);
         }
         TypedExprKind::RecordUpdate { base, fields } => {
             apply_infer_bindings_expr(base, infer_bindings);
@@ -4429,10 +5035,16 @@ fn collect_local_usage_types<'a>(expr: &'a TypedExpr, name: &str, out: &mut Vec<
             }
             collect_local_usage_types(body, name, out);
         }
-        TypedExprKind::Tuple(items) => {
+        TypedExprKind::Seq(items) | TypedExprKind::Tuple(items) => {
             for item in items {
                 collect_local_usage_types(item, name, out);
             }
+        }
+        TypedExprKind::SeqSplice { prefix, tail } => {
+            for item in prefix {
+                collect_local_usage_types(item, name, out);
+            }
+            collect_local_usage_types(tail, name, out);
         }
         TypedExprKind::Record(fields) => {
             for field in fields.values() {
@@ -4441,6 +5053,10 @@ fn collect_local_usage_types<'a>(expr: &'a TypedExpr, name: &str, out: &mut Vec<
         }
         TypedExprKind::Project { base, .. } | TypedExprKind::TupleProject { base, .. } => {
             collect_local_usage_types(base, name, out)
+        }
+        TypedExprKind::Index { base, index, .. } => {
+            collect_local_usage_types(base, name, out);
+            collect_local_usage_types(index, name, out);
         }
         TypedExprKind::RecordUpdate { base, fields } => {
             collect_local_usage_types(base, name, out);
@@ -4487,7 +5103,12 @@ fn apply_infer_bindings(ty: &Type, infer_bindings: &BTreeMap<u32, Type>) -> Type
             .get(id)
             .cloned()
             .unwrap_or_else(|| Type::Scalar(Prim::I64)),
-        Type::Scalar(_) | Type::Bulk(_, _) | Type::Var(_) => ty.clone(),
+        Type::Scalar(_) | Type::Bulk(_, _) | Type::Var(_) | Type::Index(_) => ty.clone(),
+        Type::StarSeq(item) => Type::StarSeq(Box::new(apply_infer_bindings(item, infer_bindings))),
+        Type::StarSeqWitnessed(item, witness) => Type::StarSeqWitnessed(
+            Box::new(apply_infer_bindings(item, infer_bindings)),
+            witness.clone(),
+        ),
         Type::Tuple(items) => Type::Tuple(
             items
                 .iter()
@@ -4642,9 +5263,10 @@ fn check_pattern(
                     (Type::Scalar(Prim::Char), builtin_string_type())
                 }
                 Type::Bulk(prim, shape) if shape.0.len() == 1 => (Type::Scalar(*prim), ty.clone()),
+                Type::StarSeq(elem_ty) => (elem_ty.as_ref().clone(), ty.clone()),
                 _ => {
                     return Err(SimdError::new(format!(
-                        "slice pattern is only valid against rank-1 bulk or string types, found {:?}",
+                        "slice pattern is only valid against rank-1 bulk, string, or T[*] types, found {:?}",
                         ty
                     )));
                 }
@@ -4878,16 +5500,138 @@ fn infer_expr(
                 kind: TypedExprKind::String(value.clone()),
             })
         }
+        Expr::Seq(items) => infer_seq_expr(items, None, context, expected),
+        Expr::SeqSplice { prefix, tail } => infer_seq_expr(prefix, Some(tail), context, expected),
         Expr::Lambda { param, body } => infer_lambda_expr(param, body, context, expected),
         Expr::Let { bindings, body } => infer_let_expr(bindings, body, context, expected),
         Expr::Tuple(items) => infer_tuple_expr(items, context, expected),
         Expr::Record(fields) => infer_record_expr(fields, context, expected),
         Expr::Project(base, field) => infer_projection_expr(base, field, context),
         Expr::TupleProject(base, index) => infer_tuple_projection_expr(base, *index, context),
+        Expr::Index {
+            base,
+            index,
+            checked,
+        } => infer_index_expr(base, index, *checked, context, expected),
         Expr::RecordUpdate { base, fields } => infer_record_update_expr(base, fields, context),
         Expr::Infix { op, lhs, rhs } => infer_primitive_call(*op, lhs, rhs, context, expected),
         Expr::App(_, _) => infer_apply_expr(expr, context, expected),
     }
+}
+
+fn infer_seq_expr(
+    items: &[Expr],
+    tail: Option<&Expr>,
+    context: &TypeContext<'_>,
+    expected: Option<&Type>,
+) -> Result<TypedExpr> {
+    let expected_elem_ty = match expected {
+        Some(Type::StarSeq(elem_ty)) | Some(Type::StarSeqWitnessed(elem_ty, _)) => {
+            Some(elem_ty.as_ref())
+        }
+        Some(Type::Var(_) | Type::Infer(_)) | None => None,
+        Some(other) => {
+            return Err(SimdError::new(format!(
+                "sequence literal used where {:?} was expected",
+                other
+            )));
+        }
+    };
+    if items.is_empty() {
+        if let Some(tail_expr) = tail {
+            let typed_tail = infer_expr(tail_expr, context, expected)?;
+            let Some((elem_ty, witness)) = star_seq_parts(&typed_tail.ty) else {
+                return Err(SimdError::new(format!(
+                    "sequence splice tail must have T[*] type, found {:?}",
+                    typed_tail.ty
+                )));
+            };
+            let ty = match witness {
+                Some(witness) => {
+                    Type::StarSeqWitnessed(Box::new(elem_ty.clone()), witness.to_string())
+                }
+                None => Type::StarSeq(Box::new(elem_ty.clone())),
+            };
+            return Ok(TypedExpr {
+                ty,
+                kind: TypedExprKind::SeqSplice {
+                    prefix: Vec::new(),
+                    tail: Box::new(typed_tail),
+                },
+            });
+        }
+        let Some(elem_ty) = expected_elem_ty else {
+            return Err(SimdError::new(
+                "empty sequence literal requires an expected T[*] type",
+            ));
+        };
+        return Ok(TypedExpr {
+            ty: expected
+                .cloned()
+                .unwrap_or_else(|| Type::StarSeq(Box::new(elem_ty.clone()))),
+            kind: TypedExprKind::Seq(Vec::new()),
+        });
+    }
+    let mut typed_items = Vec::with_capacity(items.len());
+    let mut elem_ty = None::<Type>;
+    for item in items {
+        let typed = infer_expr(item, context, expected_elem_ty.or(elem_ty.as_ref()))?;
+        if let Some(existing) = &elem_ty {
+            if *existing != typed.ty {
+                return Err(SimdError::new(format!(
+                    "sequence literal element type mismatch: expected {:?}, found {:?}",
+                    existing, typed.ty
+                )));
+            }
+        } else {
+            elem_ty = Some(typed.ty.clone());
+        }
+        typed_items.push(typed);
+    }
+    let elem_ty = expected_elem_ty
+        .cloned()
+        .or(elem_ty)
+        .ok_or_else(|| SimdError::new("sequence literal element type could not be inferred"))?;
+    for typed in &typed_items {
+        if elem_ty != typed.ty {
+            return Err(SimdError::new(format!(
+                "sequence literal element type mismatch: expected {:?}, found {:?}",
+                elem_ty, typed.ty
+            )));
+        }
+    }
+    if let Some(tail_expr) = tail {
+        let tail_expected = match expected {
+            Some(Type::StarSeqWitnessed(_, witness)) => {
+                Type::StarSeqWitnessed(Box::new(elem_ty.clone()), witness.clone())
+            }
+            _ => Type::StarSeq(Box::new(elem_ty.clone())),
+        };
+        let typed_tail = infer_expr(tail_expr, context, Some(&tail_expected))?;
+        if typed_tail.ty != tail_expected {
+            return Err(SimdError::new(format!(
+                "sequence splice tail must have type {:?}, found {:?}",
+                tail_expected, typed_tail.ty
+            )));
+        }
+        return Ok(TypedExpr {
+            ty: tail_expected,
+            kind: TypedExprKind::SeqSplice {
+                prefix: typed_items,
+                tail: Box::new(typed_tail),
+            },
+        });
+    }
+    let seq_ty = match expected {
+        Some(Type::StarSeqWitnessed(_, witness)) => {
+            Type::StarSeqWitnessed(Box::new(elem_ty.clone()), witness.clone())
+        }
+        _ => Type::StarSeq(Box::new(elem_ty.clone())),
+    };
+    Ok(TypedExpr {
+        ty: seq_ty,
+        kind: TypedExprKind::Seq(typed_items),
+    })
 }
 
 fn infer_ref_expr(
@@ -5274,6 +6018,17 @@ fn collect_expr_local_names_into(expr: &Expr, names: &mut BTreeSet<String>) {
             }
         }
         Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::Char(_) | Expr::String(_) => {}
+        Expr::Seq(items) => {
+            for item in items {
+                collect_expr_local_names_into(item, names);
+            }
+        }
+        Expr::SeqSplice { prefix, tail } => {
+            for item in prefix {
+                collect_expr_local_names_into(item, names);
+            }
+            collect_expr_local_names_into(tail, names);
+        }
         Expr::Tuple(items) => {
             for item in items {
                 collect_expr_local_names_into(item, names);
@@ -5299,6 +6054,10 @@ fn collect_expr_local_names_into(expr: &Expr, names: &mut BTreeSet<String>) {
         }
         Expr::Project(base, _) | Expr::TupleProject(base, _) => {
             collect_expr_local_names_into(base, names)
+        }
+        Expr::Index { base, index, .. } => {
+            collect_expr_local_names_into(base, names);
+            collect_expr_local_names_into(index, names);
         }
         Expr::RecordUpdate { base, fields } => {
             collect_expr_local_names_into(base, names);
@@ -5327,7 +6086,8 @@ fn combined_locals(
 fn type_contains_var(ty: &Type) -> bool {
     match ty {
         Type::Var(_) | Type::Infer(_) => true,
-        Type::Scalar(_) | Type::Bulk(_, _) => false,
+        Type::Scalar(_) | Type::Bulk(_, _) | Type::Index(_) => false,
+        Type::StarSeq(item) | Type::StarSeqWitnessed(item, _) => type_contains_var(item),
         Type::Named(_, args) => args.iter().any(type_contains_var),
         Type::Tuple(items) => items.iter().any(type_contains_var),
         Type::TypeToken(inner) => type_contains_var(inner),
@@ -5339,7 +6099,8 @@ fn type_contains_var(ty: &Type) -> bool {
 fn type_contains_infer(ty: &Type) -> bool {
     match ty {
         Type::Infer(_) => true,
-        Type::Scalar(_) | Type::Bulk(_, _) | Type::Var(_) => false,
+        Type::Scalar(_) | Type::Bulk(_, _) | Type::Var(_) | Type::Index(_) => false,
+        Type::StarSeq(item) | Type::StarSeqWitnessed(item, _) => type_contains_infer(item),
         Type::Named(_, args) => args.iter().any(type_contains_infer),
         Type::Tuple(items) => items.iter().any(type_contains_infer),
         Type::TypeToken(inner) => type_contains_infer(inner),
@@ -5362,7 +6123,10 @@ fn collect_type_vars_in_order_into(ty: &Type, seen: &mut BTreeSet<String>, vars:
                 vars.push(name.clone());
             }
         }
-        Type::Scalar(_) | Type::Bulk(_, _) | Type::Infer(_) => {}
+        Type::Scalar(_) | Type::Bulk(_, _) | Type::Infer(_) | Type::Index(_) => {}
+        Type::StarSeq(item) | Type::StarSeqWitnessed(item, _) => {
+            collect_type_vars_in_order_into(item, seen, vars)
+        }
         Type::Named(_, args) => {
             for arg in args {
                 collect_type_vars_in_order_into(arg, seen, vars);
@@ -5409,7 +6173,10 @@ fn collect_legacy_family_params_into(
         Type::TypeToken(inner) => {
             collect_legacy_family_params_into(inner, seen, vars);
         }
-        Type::Scalar(_) | Type::Bulk(_, _) | Type::Infer(_) => {}
+        Type::Scalar(_) | Type::Bulk(_, _) | Type::Infer(_) | Type::Index(_) => {}
+        Type::StarSeq(item) | Type::StarSeqWitnessed(item, _) => {
+            collect_legacy_family_params_into(item, seen, vars)
+        }
         Type::Named(name, args) => {
             if args.is_empty()
                 && is_implicit_type_var_name(name)
@@ -5446,7 +6213,11 @@ fn collect_legacy_family_params_into(
 fn apply_type_subst(ty: &Type, subst: &BTreeMap<String, Type>) -> Type {
     match ty {
         Type::Var(name) => subst.get(name).cloned().unwrap_or_else(|| ty.clone()),
-        Type::Scalar(_) | Type::Bulk(_, _) | Type::Infer(_) => ty.clone(),
+        Type::Scalar(_) | Type::Bulk(_, _) | Type::Infer(_) | Type::Index(_) => ty.clone(),
+        Type::StarSeq(item) => Type::StarSeq(Box::new(apply_type_subst(item, subst))),
+        Type::StarSeqWitnessed(item, witness) => {
+            Type::StarSeqWitnessed(Box::new(apply_type_subst(item, subst)), witness.clone())
+        }
         Type::Named(name, args) => Type::Named(
             name.clone(),
             args.iter()
@@ -5527,6 +6298,31 @@ fn unify_type_template(
             _ => Err(SimdError::new(format!(
                 "expected bulk {:?}, found {:?}",
                 template, actual
+            ))),
+        },
+        Type::Index(left_witness) => match actual {
+            Type::Index(right_witness) if left_witness == right_witness => Ok(()),
+            _ => Err(SimdError::new(format!(
+                "expected Index {}, found {:?}",
+                left_witness, actual
+            ))),
+        },
+        Type::StarSeq(left_item) => match actual {
+            Type::StarSeq(right_item) | Type::StarSeqWitnessed(right_item, _) => {
+                unify_type_template(left_item, right_item, subst)
+            }
+            _ => Err(SimdError::new(format!(
+                "expected owned sequence {:?}, found {:?}",
+                template, actual
+            ))),
+        },
+        Type::StarSeqWitnessed(left_item, left_witness) => match actual {
+            Type::StarSeqWitnessed(right_item, right_witness) if left_witness == right_witness => {
+                unify_type_template(left_item, right_item, subst)
+            }
+            _ => Err(SimdError::new(format!(
+                "expected owned sequence witness '{}', found {:?}",
+                left_witness, actual
             ))),
         },
         Type::Named(left_name, left_args) => match actual {
@@ -5670,6 +6466,79 @@ fn infer_projection_expr(base: &Expr, field: &str, context: &TypeContext<'_>) ->
         kind: TypedExprKind::Project {
             base: Box::new(base),
             field: field.to_string(),
+        },
+    })
+}
+
+fn infer_index_expr(
+    base: &Expr,
+    index: &Expr,
+    checked: bool,
+    context: &TypeContext<'_>,
+    expected: Option<&Type>,
+) -> Result<TypedExpr> {
+    let base = infer_expr(base, context, None)?;
+    let Some((elem_ty, witness)) = star_seq_parts(&base.ty) else {
+        return Err(SimdError::new(format!(
+            "indexing requires a T[*] value, found {:?}",
+            base.ty
+        )));
+    };
+    let elem_ty = elem_ty.clone();
+    if checked {
+        let index = infer_expr(index, context, Some(&Type::Scalar(Prim::I64)))?;
+        if index.ty != Type::Scalar(Prim::I64) && !matches!(index.ty, Type::Index(_)) {
+            return Err(SimdError::new(format!(
+                "checked indexing expects an integer index, found {:?}",
+                index.ty
+            )));
+        }
+        let ty = builtin_maybe_type(elem_ty);
+        if let Some(expected_ty) = expected
+            && expected_ty != &ty
+            && !matches!(expected_ty, Type::Var(_) | Type::Infer(_))
+        {
+            return Err(SimdError::new(format!(
+                "checked index expression has type {:?}, expected {:?}",
+                ty, expected_ty
+            )));
+        }
+        return Ok(TypedExpr {
+            ty,
+            kind: TypedExprKind::Index {
+                base: Box::new(base),
+                index: Box::new(index),
+                checked: true,
+            },
+        });
+    }
+
+    let witness = witness.ok_or_else(|| {
+        SimdError::new("safe indexing 'xs[i]' requires a witnessed owned sequence type like T[*n]")
+    })?;
+    let index_ty = Type::Index(witness.to_string());
+    let index = infer_expr(index, context, Some(&index_ty))?;
+    if index.ty != index_ty {
+        return Err(SimdError::new(format!(
+            "safe index expression expected {:?}, found {:?}",
+            index_ty, index.ty
+        )));
+    }
+    if let Some(expected_ty) = expected
+        && expected_ty != &elem_ty
+        && !matches!(expected_ty, Type::Var(_) | Type::Infer(_))
+    {
+        return Err(SimdError::new(format!(
+            "index expression has type {:?}, expected {:?}",
+            elem_ty, expected_ty
+        )));
+    }
+    Ok(TypedExpr {
+        ty: elem_ty,
+        kind: TypedExprKind::Index {
+            base: Box::new(base),
+            index: Box::new(index),
+            checked: false,
         },
     })
 }
@@ -6032,6 +6901,30 @@ fn infer_builtin_named_family_call(
             explicit_type_args.len()
         )));
     }
+    if family == "gather" {
+        return infer_builtin_gather_call(args_exprs, context, expected);
+    }
+    if family == "reverse" {
+        return infer_builtin_reverse_call(args_exprs, context, expected);
+    }
+    if family == "scatter" {
+        return infer_builtin_scatter_call(args_exprs, context, expected, false);
+    }
+    if family == "scatter_add" {
+        return infer_builtin_scatter_call(args_exprs, context, expected, true);
+    }
+    if family == "get" {
+        return infer_builtin_get_call(args_exprs, context, expected);
+    }
+    if family == "try_get" {
+        return infer_builtin_try_get_call(args_exprs, context, expected);
+    }
+    if family == "check_index" {
+        return infer_builtin_check_index_call(args_exprs, context, expected);
+    }
+    if family == "indices" {
+        return infer_builtin_indices_call(args_exprs, context, expected);
+    }
     let Some((callee, signature_ty)) =
         infer_named_family_builtin_signature(family, args_exprs.len())
     else {
@@ -6060,6 +6953,356 @@ fn infer_builtin_named_family_call(
             callee: Callee::Builtin(callee),
             args,
             lifted_shape,
+        },
+    }))
+}
+
+fn infer_builtin_reverse_call(
+    args_exprs: &[&Expr],
+    context: &TypeContext<'_>,
+    expected: Option<&Type>,
+) -> Result<Option<TypedExpr>> {
+    if args_exprs.len() != 1 {
+        return Err(SimdError::new(format!(
+            "reverse expects 1 argument, found {}",
+            args_exprs.len()
+        )));
+    }
+    let seq = infer_expr(args_exprs[0], context, None)?;
+    let Some((elem_ty, witness)) = star_seq_parts(&seq.ty) else {
+        return Err(SimdError::new(format!(
+            "reverse expects a T[*] argument, found {:?}",
+            seq.ty
+        )));
+    };
+    let ty = match witness {
+        Some(witness) => Type::StarSeqWitnessed(Box::new(elem_ty.clone()), witness.to_string()),
+        None => Type::StarSeq(Box::new(elem_ty.clone())),
+    };
+    if let Some(expected_ty) = expected
+        && &ty != expected_ty
+    {
+        return Err(SimdError::new(format!(
+            "call to 'reverse' has type {:?}, expected {:?}",
+            ty, expected_ty
+        )));
+    }
+    Ok(Some(TypedExpr {
+        ty: ty.clone(),
+        kind: TypedExprKind::Call {
+            callee: Callee::Builtin(BuiltinFamilyCallee::ReverseSeq(ty)),
+            args: vec![TypedArg {
+                mode: AccessKind::Same,
+                expr: Box::new(seq),
+            }],
+            lifted_shape: None,
+        },
+    }))
+}
+
+fn infer_builtin_gather_call(
+    args_exprs: &[&Expr],
+    context: &TypeContext<'_>,
+    expected: Option<&Type>,
+) -> Result<Option<TypedExpr>> {
+    if args_exprs.len() != 2 {
+        return Err(SimdError::new(format!(
+            "gather expects 2 arguments, found {}",
+            args_exprs.len()
+        )));
+    }
+    let seq = infer_expr(args_exprs[0], context, None)?;
+    let prim = match star_seq_parts(&seq.ty) {
+        Some((Type::Scalar(prim), _)) => *prim,
+        Some((other, _)) => {
+            return Err(SimdError::new(format!(
+                "gather expects scalar-element T[*], found {:?}",
+                other
+            )));
+        }
+        _ => {
+            return Err(SimdError::new(format!(
+                "gather expects a T[*] source buffer, found {:?}",
+                seq.ty
+            )));
+        }
+    };
+    let index = infer_expr(args_exprs[1], context, Some(&Type::Scalar(Prim::I64)))?;
+    let mut lifted_shape = None;
+    let index_mode = if index.ty == Type::Scalar(Prim::I64) {
+        AccessKind::Same
+    } else {
+        unify_lifted_type(&mut lifted_shape, &Type::Scalar(Prim::I64), &index.ty)?;
+        AccessKind::Lane
+    };
+    let scalar_result_ty = Type::Scalar(prim);
+    let ty = if let Some(shape) = &lifted_shape {
+        lift_type_over_shape(&scalar_result_ty, shape)?
+    } else {
+        scalar_result_ty.clone()
+    };
+    if let Some(expected_ty) = expected
+        && &ty != expected_ty
+        && !matches!(expected_ty, Type::Var(_) | Type::Infer(_))
+    {
+        return Err(SimdError::new(format!(
+            "call to 'gather' has type {:?}, expected {:?}",
+            ty, expected_ty
+        )));
+    }
+    Ok(Some(TypedExpr {
+        ty,
+        kind: TypedExprKind::Call {
+            callee: Callee::Builtin(BuiltinFamilyCallee::GatherSeq(prim)),
+            args: vec![
+                TypedArg {
+                    mode: AccessKind::Same,
+                    expr: Box::new(seq),
+                },
+                TypedArg {
+                    mode: index_mode,
+                    expr: Box::new(index),
+                },
+            ],
+            lifted_shape,
+        },
+    }))
+}
+
+fn infer_builtin_scatter_call(
+    args_exprs: &[&Expr],
+    context: &TypeContext<'_>,
+    expected: Option<&Type>,
+    additive: bool,
+) -> Result<Option<TypedExpr>> {
+    let family = if additive { "scatter_add" } else { "scatter" };
+    if args_exprs.len() != 3 {
+        return Err(SimdError::new(format!(
+            "{} expects 3 arguments, found {}",
+            family,
+            args_exprs.len()
+        )));
+    }
+    let dest = infer_expr(args_exprs[0], context, None)?;
+    let Some((elem_ty, witness)) = star_seq_parts(&dest.ty) else {
+        return Err(SimdError::new(format!(
+            "{} expects a scalar-element T[*] destination, found {:?}",
+            family, dest.ty
+        )));
+    };
+    let Type::Scalar(prim) = elem_ty else {
+        return Err(SimdError::new(format!(
+            "{} expects a scalar-element T[*] destination, found {:?}",
+            family, elem_ty
+        )));
+    };
+    if additive && matches!(prim, Prim::Char) {
+        return Err(SimdError::new("scatter_add does not support char buffers"));
+    }
+    let indices = infer_expr(args_exprs[1], context, None)?;
+    let Some((index_elem_ty, _)) = star_seq_parts(&indices.ty) else {
+        return Err(SimdError::new(format!(
+            "{} expects an i64[*] index buffer, found {:?}",
+            family, indices.ty
+        )));
+    };
+    if index_elem_ty != &Type::Scalar(Prim::I64) {
+        return Err(SimdError::new(format!(
+            "{} expects an i64[*] index buffer, found {:?}",
+            family, indices.ty
+        )));
+    }
+    let values_expected = match star_seq_parts(&indices.ty).and_then(|(_, witness)| witness) {
+        Some(witness) => Type::StarSeqWitnessed(Box::new(Type::Scalar(*prim)), witness.to_string()),
+        None => Type::StarSeq(Box::new(Type::Scalar(*prim))),
+    };
+    let values = infer_expr(args_exprs[2], context, Some(&values_expected))?;
+    if values.ty != values_expected {
+        return Err(SimdError::new(format!(
+            "{} value buffer has type {:?}, expected {:?}",
+            family, values.ty, values_expected
+        )));
+    }
+    let ty = match witness {
+        Some(witness) => Type::StarSeqWitnessed(Box::new(Type::Scalar(*prim)), witness.to_string()),
+        None => Type::StarSeq(Box::new(Type::Scalar(*prim))),
+    };
+    if let Some(expected_ty) = expected
+        && &ty != expected_ty
+        && !matches!(expected_ty, Type::Var(_) | Type::Infer(_))
+    {
+        return Err(SimdError::new(format!(
+            "call to '{}' has type {:?}, expected {:?}",
+            family, ty, expected_ty
+        )));
+    }
+    Ok(Some(TypedExpr {
+        ty,
+        kind: TypedExprKind::Call {
+            callee: Callee::Builtin(if additive {
+                BuiltinFamilyCallee::ScatterAddSeq(*prim)
+            } else {
+                BuiltinFamilyCallee::ScatterSeq(*prim)
+            }),
+            args: vec![
+                TypedArg {
+                    mode: AccessKind::Same,
+                    expr: Box::new(dest),
+                },
+                TypedArg {
+                    mode: AccessKind::Same,
+                    expr: Box::new(indices),
+                },
+                TypedArg {
+                    mode: AccessKind::Same,
+                    expr: Box::new(values),
+                },
+            ],
+            lifted_shape: None,
+        },
+    }))
+}
+
+fn infer_builtin_get_call(
+    args_exprs: &[&Expr],
+    context: &TypeContext<'_>,
+    expected: Option<&Type>,
+) -> Result<Option<TypedExpr>> {
+    if args_exprs.len() != 2 {
+        return Err(SimdError::new(format!(
+            "get expects 2 arguments, found {}",
+            args_exprs.len()
+        )));
+    }
+    Ok(Some(infer_index_expr(
+        args_exprs[0],
+        args_exprs[1],
+        false,
+        context,
+        expected,
+    )?))
+}
+
+fn infer_builtin_try_get_call(
+    args_exprs: &[&Expr],
+    context: &TypeContext<'_>,
+    expected: Option<&Type>,
+) -> Result<Option<TypedExpr>> {
+    if args_exprs.len() != 2 {
+        return Err(SimdError::new(format!(
+            "try_get expects 2 arguments, found {}",
+            args_exprs.len()
+        )));
+    }
+    Ok(Some(infer_index_expr(
+        args_exprs[0],
+        args_exprs[1],
+        true,
+        context,
+        expected,
+    )?))
+}
+
+fn infer_builtin_check_index_call(
+    args_exprs: &[&Expr],
+    context: &TypeContext<'_>,
+    expected: Option<&Type>,
+) -> Result<Option<TypedExpr>> {
+    if args_exprs.len() != 2 {
+        return Err(SimdError::new(format!(
+            "check_index expects 2 arguments, found {}",
+            args_exprs.len()
+        )));
+    }
+    let seq = infer_expr(args_exprs[0], context, None)?;
+    let Some((_, witness)) = star_seq_parts(&seq.ty) else {
+        return Err(SimdError::new(format!(
+            "check_index expects a T[*n] source buffer, found {:?}",
+            seq.ty
+        )));
+    };
+    let witness = witness.ok_or_else(|| {
+        SimdError::new("check_index requires a witnessed owned sequence type like T[*n]")
+    })?;
+    let index = infer_expr(args_exprs[1], context, Some(&Type::Scalar(Prim::I64)))?;
+    if index.ty != Type::Scalar(Prim::I64) {
+        return Err(SimdError::new(format!(
+            "check_index expects an integer index, found {:?}",
+            index.ty
+        )));
+    }
+    let ty = builtin_maybe_type(Type::Index(witness.to_string()));
+    if let Some(expected_ty) = expected
+        && expected_ty != &ty
+        && !matches!(expected_ty, Type::Var(_) | Type::Infer(_))
+    {
+        return Err(SimdError::new(format!(
+            "call to 'check_index' has type {:?}, expected {:?}",
+            ty, expected_ty
+        )));
+    }
+    Ok(Some(TypedExpr {
+        ty,
+        kind: TypedExprKind::Call {
+            callee: Callee::Builtin(BuiltinFamilyCallee::CheckIndexSeq(witness.to_string())),
+            args: vec![
+                TypedArg {
+                    mode: AccessKind::Same,
+                    expr: Box::new(seq),
+                },
+                TypedArg {
+                    mode: AccessKind::Same,
+                    expr: Box::new(index),
+                },
+            ],
+            lifted_shape: None,
+        },
+    }))
+}
+
+fn infer_builtin_indices_call(
+    args_exprs: &[&Expr],
+    context: &TypeContext<'_>,
+    expected: Option<&Type>,
+) -> Result<Option<TypedExpr>> {
+    if args_exprs.len() != 1 {
+        return Err(SimdError::new(format!(
+            "indices expects 1 argument, found {}",
+            args_exprs.len()
+        )));
+    }
+    let seq = infer_expr(args_exprs[0], context, None)?;
+    let Some((_, witness)) = star_seq_parts(&seq.ty) else {
+        return Err(SimdError::new(format!(
+            "indices expects a T[*n] argument, found {:?}",
+            seq.ty
+        )));
+    };
+    let witness = witness.ok_or_else(|| {
+        SimdError::new("indices requires a witnessed owned sequence type like T[*n]")
+    })?;
+    let ty = Type::StarSeqWitnessed(
+        Box::new(Type::Index(witness.to_string())),
+        witness.to_string(),
+    );
+    if let Some(expected_ty) = expected
+        && expected_ty != &ty
+        && !matches!(expected_ty, Type::Var(_) | Type::Infer(_))
+    {
+        return Err(SimdError::new(format!(
+            "call to 'indices' has type {:?}, expected {:?}",
+            ty, expected_ty
+        )));
+    }
+    Ok(Some(TypedExpr {
+        ty,
+        kind: TypedExprKind::Call {
+            callee: Callee::Builtin(BuiltinFamilyCallee::IndicesSeq(witness.to_string())),
+            args: vec![TypedArg {
+                mode: AccessKind::Same,
+                expr: Box::new(seq),
+            }],
+            lifted_shape: None,
         },
     }))
 }
@@ -6760,6 +8003,10 @@ fn unify_lifted_shape(slot: &mut Option<Shape>, shape: &Shape) -> Result<()> {
 fn lift_type_over_shape(ty: &Type, shape: &Shape) -> Result<Type> {
     match ty {
         Type::Scalar(prim) => Ok(Type::Bulk(*prim, shape.clone())),
+        Type::Index(_) => Ok(Type::Bulk(Prim::I64, shape.clone())),
+        Type::StarSeq(_) | Type::StarSeqWitnessed(_, _) => Err(SimdError::new(
+            "bulk postfix cannot be applied to owned sequence types",
+        )),
         Type::Var(name) => Ok(Type::Var(name.clone())),
         Type::Infer(index) => Ok(Type::Infer(*index)),
         Type::Named(_, _) => Err(SimdError::new(
@@ -6795,6 +8042,7 @@ fn unify_lifted_type(slot: &mut Option<Shape>, param: &Type, actual: &Type) -> R
         (Type::TypeToken(_), _) => Err(SimdError::new(
             "type witness parameters cannot be lifted over bulk values",
         )),
+        (Type::Index(_), Type::Bulk(Prim::I64, shape)) => unify_lifted_shape(slot, shape),
         (Type::Scalar(left), Type::Bulk(right, shape)) if left == right => {
             unify_lifted_shape(slot, shape)
         }
@@ -6803,6 +8051,12 @@ fn unify_lifted_type(slot: &mut Option<Shape>, param: &Type, actual: &Type) -> R
                 unify_lifted_type(slot, left_ty, right_ty)?;
             }
             Ok(())
+        }
+        (Type::StarSeq(left), Type::StarSeq(right))
+        | (Type::StarSeq(left), Type::StarSeqWitnessed(right, _))
+        | (Type::StarSeqWitnessed(left, _), Type::StarSeq(right))
+        | (Type::StarSeqWitnessed(left, _), Type::StarSeqWitnessed(right, _)) => {
+            unify_lifted_type(slot, left, right)
         }
         (Type::Record(left), Type::Record(right)) if left.len() == right.len() => {
             for (name, left_ty) in left {
@@ -6831,6 +8085,8 @@ fn unify_param_type(
     match (param, actual) {
         (Type::Var(_), _) => Ok(()),
         (Type::Infer(_), _) => Ok(()),
+        (Type::Index(left), Type::Index(right)) if left == right => Ok(()),
+        (Type::Index(_), Type::Scalar(Prim::I64)) => Ok(()),
         (Type::TypeToken(left), Type::TypeToken(right)) => unify_param_type(left, right, dim_subst),
         (Type::Named(left_name, left_args), Type::Named(right_name, right_args))
             if left_name == right_name && left_args.len() == right_args.len() =>
@@ -6845,6 +8101,12 @@ fn unify_param_type(
                 unify_param_type(left_ty, right_ty, dim_subst)?;
             }
             Ok(())
+        }
+        (Type::StarSeq(left), Type::StarSeq(right))
+        | (Type::StarSeq(left), Type::StarSeqWitnessed(right, _))
+        | (Type::StarSeqWitnessed(left, _), Type::StarSeq(right))
+        | (Type::StarSeqWitnessed(left, _), Type::StarSeqWitnessed(right, _)) => {
+            unify_param_type(left, right, dim_subst)
         }
         (Type::Scalar(left), Type::Scalar(right)) if left == right => Ok(()),
         (Type::Bulk(left_prim, left_shape), Type::Bulk(right_prim, right_shape))
@@ -6902,7 +8164,11 @@ fn unify_param_type(
 
 fn apply_dim_subst(ty: &Type, subst: &BTreeMap<String, Dim>) -> Type {
     match ty {
-        Type::Scalar(_) | Type::Var(_) | Type::Infer(_) => ty.clone(),
+        Type::Scalar(_) | Type::Var(_) | Type::Infer(_) | Type::Index(_) => ty.clone(),
+        Type::StarSeq(item) => Type::StarSeq(Box::new(apply_dim_subst(item, subst))),
+        Type::StarSeqWitnessed(item, witness) => {
+            Type::StarSeqWitnessed(Box::new(apply_dim_subst(item, subst)), witness.clone())
+        }
         Type::Named(name, args) => Type::Named(
             name.clone(),
             args.iter().map(|arg| apply_dim_subst(arg, subst)).collect(),
@@ -6983,6 +8249,17 @@ fn visit_tail_calls(
         | TypedExprKind::Char(_)
         | TypedExprKind::String(_)
         | TypedExprKind::TypeToken(_) => {}
+        TypedExprKind::Seq(items) => {
+            for item in items {
+                visit_tail_calls(item, self_name, false, recursive, valid);
+            }
+        }
+        TypedExprKind::SeqSplice { prefix, tail } => {
+            for item in prefix {
+                visit_tail_calls(item, self_name, false, recursive, valid);
+            }
+            visit_tail_calls(tail, self_name, false, recursive, valid);
+        }
         TypedExprKind::Lambda { body, .. } => {
             visit_tail_calls(body, self_name, false, recursive, valid);
         }
@@ -7004,6 +8281,10 @@ fn visit_tail_calls(
         }
         TypedExprKind::Project { base, .. } | TypedExprKind::TupleProject { base, .. } => {
             visit_tail_calls(base, self_name, false, recursive, valid);
+        }
+        TypedExprKind::Index { base, index, .. } => {
+            visit_tail_calls(base, self_name, false, recursive, valid);
+            visit_tail_calls(index, self_name, false, recursive, valid);
         }
         TypedExprKind::RecordUpdate { base, fields } => {
             visit_tail_calls(base, self_name, false, recursive, valid);
@@ -7117,6 +8398,10 @@ fn typed_expr_uses_type_witness(expr: &TypedExpr) -> bool {
         | TypedExprKind::Bool(_)
         | TypedExprKind::Char(_)
         | TypedExprKind::String(_) => false,
+        TypedExprKind::Seq(items) => items.iter().any(typed_expr_uses_type_witness),
+        TypedExprKind::SeqSplice { prefix, tail } => {
+            prefix.iter().any(typed_expr_uses_type_witness) || typed_expr_uses_type_witness(tail)
+        }
         TypedExprKind::Lambda { body, .. } => typed_expr_uses_type_witness(body),
         TypedExprKind::Let { bindings, body } => {
             bindings
@@ -7128,6 +8413,9 @@ fn typed_expr_uses_type_witness(expr: &TypedExpr) -> bool {
         TypedExprKind::Record(fields) => fields.values().any(typed_expr_uses_type_witness),
         TypedExprKind::Project { base, .. } | TypedExprKind::TupleProject { base, .. } => {
             typed_expr_uses_type_witness(base)
+        }
+        TypedExprKind::Index { base, index, .. } => {
+            typed_expr_uses_type_witness(base) || typed_expr_uses_type_witness(index)
         }
         TypedExprKind::RecordUpdate { base, fields } => {
             typed_expr_uses_type_witness(base) || fields.values().any(typed_expr_uses_type_witness)
@@ -7450,9 +8738,10 @@ fn collect_pattern_local_leaf_bindings(
                     Type::Scalar(Prim::Char)
                 }
                 Type::Bulk(prim, shape) if shape.0.len() == 1 => Type::Scalar(*prim),
+                Type::StarSeq(elem_ty) => elem_ty.as_ref().clone(),
                 other => {
                     return Err(SimdError::new(format!(
-                        "slice pattern expects rank-1 bulk/string type, found {:?}",
+                        "slice pattern expects rank-1 bulk/string/T[*] type, found {:?}",
                         other
                     )));
                 }
@@ -7571,6 +8860,40 @@ fn normalize_expr_to_leaf(
             Ok(TypedExpr {
                 ty: leaf_ty,
                 kind: TypedExprKind::String(value.clone()),
+            })
+        }
+        TypedExprKind::Seq(items) => {
+            if !requested.is_root() {
+                return Err(SimdError::new(
+                    "sequence literal cannot be projected into a record leaf",
+                ));
+            }
+            let normalized_items = items
+                .iter()
+                .map(|item| normalize_expr_to_leaf(item, &LeafPath::root(), locals, entries))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(TypedExpr {
+                ty: leaf_ty,
+                kind: TypedExprKind::Seq(normalized_items),
+            })
+        }
+        TypedExprKind::SeqSplice { prefix, tail } => {
+            if !requested.is_root() {
+                return Err(SimdError::new(
+                    "sequence splice cannot be projected into a record leaf",
+                ));
+            }
+            let normalized_prefix = prefix
+                .iter()
+                .map(|item| normalize_expr_to_leaf(item, &LeafPath::root(), locals, entries))
+                .collect::<Result<Vec<_>>>()?;
+            let normalized_tail = normalize_expr_to_leaf(tail, &LeafPath::root(), locals, entries)?;
+            Ok(TypedExpr {
+                ty: leaf_ty,
+                kind: TypedExprKind::SeqSplice {
+                    prefix: normalized_prefix,
+                    tail: Box::new(normalized_tail),
+                },
             })
         }
         TypedExprKind::TypeToken(_) => Err(SimdError::new(
@@ -7720,6 +9043,35 @@ fn normalize_expr_to_leaf(
             locals,
             entries,
         ),
+        TypedExprKind::Index {
+            base,
+            index,
+            checked,
+        } => {
+            if !requested.is_root() {
+                return Err(SimdError::new(
+                    "index expression cannot normalize to a nested record leaf",
+                ));
+            }
+            Ok(TypedExpr {
+                ty: leaf_ty,
+                kind: TypedExprKind::Index {
+                    base: Box::new(normalize_expr_to_leaf(
+                        base,
+                        &LeafPath::root(),
+                        locals,
+                        entries,
+                    )?),
+                    index: Box::new(normalize_expr_to_leaf(
+                        index,
+                        &LeafPath::root(),
+                        locals,
+                        entries,
+                    )?),
+                    checked: *checked,
+                },
+            })
+        }
         TypedExprKind::RecordUpdate { base, fields } => {
             let (field, rest) = requested.split_first().ok_or_else(|| {
                 SimdError::new("record update must normalize to a concrete leaf path")
@@ -7842,7 +9194,11 @@ fn normalize_expr_to_leaf(
 fn lookup_leaf_type(ty: &Type, path: &LeafPath) -> Result<Type> {
     if path.is_root() {
         return match ty {
-            Type::Scalar(_) | Type::Bulk(_, _) => Ok(ty.clone()),
+            Type::Scalar(_)
+            | Type::Bulk(_, _)
+            | Type::StarSeq(_)
+            | Type::StarSeqWitnessed(_, _)
+            | Type::Index(_) => Ok(ty.clone()),
             Type::Named(name, args) if (name == "string" || name == "bool") && args.is_empty() => {
                 Ok(ty.clone())
             }
@@ -7906,6 +9262,17 @@ fn collect_typed_local_names(expr: &TypedExpr, names: &mut BTreeSet<String>) {
         | TypedExprKind::Char(_)
         | TypedExprKind::String(_)
         | TypedExprKind::TypeToken(_) => {}
+        TypedExprKind::Seq(items) => {
+            for expr in items {
+                collect_typed_local_names(expr, names);
+            }
+        }
+        TypedExprKind::SeqSplice { prefix, tail } => {
+            for expr in prefix {
+                collect_typed_local_names(expr, names);
+            }
+            collect_typed_local_names(tail, names);
+        }
         TypedExprKind::Lambda { body, .. } => collect_typed_local_names(body, names),
         TypedExprKind::Let { bindings, body } => {
             for binding in bindings {
@@ -7925,6 +9292,10 @@ fn collect_typed_local_names(expr: &TypedExpr, names: &mut BTreeSet<String>) {
         }
         TypedExprKind::Project { base, .. } | TypedExprKind::TupleProject { base, .. } => {
             collect_typed_local_names(base, names)
+        }
+        TypedExprKind::Index { base, index, .. } => {
+            collect_typed_local_names(base, names);
+            collect_typed_local_names(index, names);
         }
         TypedExprKind::RecordUpdate { base, fields } => {
             collect_typed_local_names(base, names);
@@ -8019,32 +9390,25 @@ fn build_structural_program(
     clauses: &[LoweredClause],
     tail_loop: Option<&TailLoop>,
 ) -> StructuralProgram {
-    if let Some(tail_loop) = tail_loop {
-        return StructuralProgram {
-            entry_state: 0,
-            states: tail_loop
-                .clauses
-                .iter()
-                .enumerate()
-                .map(|(index, clause)| StructuralState {
-                    patterns: clause.patterns.clone(),
-                    on_match: match &clause.action {
-                        TailAction::Continue { args } => StructuralAction::Transition {
-                            state: 0,
-                            args: args.clone(),
-                        },
-                        TailAction::Return { expr } => StructuralAction::Return {
-                            expr: expr.clone(),
-                        },
+    let states: Vec<StructuralState> = if let Some(tail_loop) = tail_loop {
+        tail_loop
+            .clauses
+            .iter()
+            .enumerate()
+            .map(|(index, clause)| StructuralState {
+                patterns: clause.patterns.clone(),
+                on_match: match &clause.action {
+                    TailAction::Continue { args } => StructuralAction::Transition {
+                        state: 0,
+                        args: args.clone(),
                     },
-                    on_miss: (index + 1 < tail_loop.clauses.len()).then_some((index + 1) as u32),
-                })
-                .collect(),
-        };
-    }
-    StructuralProgram {
-        entry_state: 0,
-        states: clauses
+                    TailAction::Return { expr } => StructuralAction::Return { expr: expr.clone() },
+                },
+                on_miss: (index + 1 < tail_loop.clauses.len()).then_some((index + 1) as u32),
+            })
+            .collect::<Vec<_>>()
+    } else {
+        clauses
             .iter()
             .enumerate()
             .map(|(index, clause)| StructuralState {
@@ -8054,8 +9418,238 @@ fn build_structural_program(
                 },
                 on_miss: (index + 1 < clauses.len()).then_some((index + 1) as u32),
             })
-            .collect(),
+            .collect::<Vec<_>>()
+    };
+    StructuralProgram {
+        entry_state: 0,
+        sequence_regions: infer_structural_sequence_regions(&states),
+        states,
     }
+}
+
+fn infer_structural_sequence_regions(states: &[StructuralState]) -> Vec<StructuralSequenceRegion> {
+    let mut regions = Vec::new();
+    for scc in structural_state_sccs(states) {
+        if scc.len() <= 1 {
+            continue;
+        }
+        if let Some(region) = detect_separated_items_region(states, &scc) {
+            regions.push(region);
+        }
+    }
+    let mut claimed = regions
+        .iter()
+        .flat_map(|region| region.state_ids.iter().copied())
+        .collect::<BTreeSet<_>>();
+    for region in detect_char_prefix_sequence_regions(states) {
+        if region.state_ids.iter().any(|state| claimed.contains(state)) {
+            continue;
+        }
+        claimed.extend(region.state_ids.iter().copied());
+        regions.push(region);
+    }
+    regions.sort_by_key(|region| region.entry_state);
+    regions
+}
+
+fn detect_char_prefix_sequence_regions(
+    states: &[StructuralState],
+) -> Vec<StructuralSequenceRegion> {
+    let mut regions = Vec::new();
+    let mut index = 0usize;
+    while index < states.len() {
+        let start = index;
+        let mut state_ids = Vec::<u32>::new();
+        let mut span_param_index = None::<usize>;
+        let mut exit_states = BTreeSet::<u32>::new();
+        while index < states.len() {
+            let state = &states[index];
+            if state.on_miss != Some((index + 1) as u32) {
+                break;
+            }
+            let mut matched = None::<(usize, String, u32)>;
+            for (param_index, pattern) in state.patterns.iter().enumerate() {
+                if let Pattern::Slice {
+                    prefix,
+                    suffix,
+                    rest: Some(SliceRest::Bind(rest_name)),
+                } = &pattern.pattern
+                {
+                    if prefix.len() != 1 || !suffix.is_empty() {
+                        matched = None;
+                        break;
+                    }
+                    let StructuralAction::Transition { state, args } = &state.on_match else {
+                        matched = None;
+                        break;
+                    };
+                    if !matches!(
+                        args.get(param_index).map(|arg| &arg.kind),
+                        Some(IrExprKind::Local(name)) if name == rest_name
+                    ) {
+                        matched = None;
+                        break;
+                    }
+                    matched = Some((param_index, rest_name.clone(), *state));
+                    break;
+                }
+            }
+            let Some((param_index, _, next_state)) = matched else {
+                break;
+            };
+            if let Some(expected) = span_param_index {
+                if expected != param_index {
+                    break;
+                }
+            } else {
+                span_param_index = Some(param_index);
+            }
+            if next_state < start as u32 || next_state >= states.len() as u32 {
+                exit_states.insert(next_state);
+            }
+            state_ids.push(index as u32);
+            index += 1;
+        }
+        if state_ids.len() > 1 {
+            if let Some(on_miss) = states[*state_ids.last().unwrap() as usize].on_miss {
+                if !state_ids.contains(&on_miss) {
+                    exit_states.insert(on_miss);
+                }
+            }
+            regions.push(StructuralSequenceRegion {
+                state_ids,
+                span_param_index: span_param_index.unwrap_or(0),
+                entry_state: start as u32,
+                exit_states: exit_states.into_iter().collect(),
+                mode: StructuralSequenceMode::CharPrefixRun,
+            });
+        } else {
+            index = start + 1;
+        }
+    }
+    regions
+}
+
+fn structural_state_sccs(states: &[StructuralState]) -> Vec<Vec<usize>> {
+    fn dfs(node: usize, edges: &[Vec<usize>], visited: &mut [bool], order: &mut Vec<usize>) {
+        if visited[node] {
+            return;
+        }
+        visited[node] = true;
+        for &next in &edges[node] {
+            dfs(next, edges, visited, order);
+        }
+        order.push(node);
+    }
+
+    let mut edges = vec![Vec::<usize>::new(); states.len()];
+    let mut reverse = vec![Vec::<usize>::new(); states.len()];
+    for (index, state) in states.iter().enumerate() {
+        if let Some(next) = state.on_miss.filter(|next| (*next as usize) < states.len()) {
+            edges[index].push(next as usize);
+            reverse[next as usize].push(index);
+        }
+        if let StructuralAction::Transition { state: next, .. } = &state.on_match {
+            if (*next as usize) < states.len() {
+                edges[index].push(*next as usize);
+                reverse[*next as usize].push(index);
+            }
+        }
+    }
+    let mut visited = vec![false; states.len()];
+    let mut order = Vec::new();
+    for node in 0..states.len() {
+        dfs(node, &edges, &mut visited, &mut order);
+    }
+    let mut assigned = vec![false; states.len()];
+    let mut sccs = Vec::new();
+    while let Some(node) = order.pop() {
+        if assigned[node] {
+            continue;
+        }
+        let mut stack = vec![node];
+        let mut scc = Vec::new();
+        assigned[node] = true;
+        while let Some(current) = stack.pop() {
+            scc.push(current);
+            for &next in &reverse[current] {
+                if !assigned[next] {
+                    assigned[next] = true;
+                    stack.push(next);
+                }
+            }
+        }
+        scc.sort_unstable();
+        sccs.push(scc);
+    }
+    sccs
+}
+
+fn detect_separated_items_region(
+    states: &[StructuralState],
+    scc: &[usize],
+) -> Option<StructuralSequenceRegion> {
+    let scc_set = scc.iter().copied().collect::<BTreeSet<_>>();
+    let arity = states.first()?.patterns.len();
+    for span_param_index in 0..arity {
+        let mut consumes = false;
+        let mut exit_states = BTreeSet::<u32>::new();
+        let mut valid = true;
+        for &state_id in scc {
+            let state = &states[state_id];
+            match &state.patterns[span_param_index].pattern {
+                Pattern::Slice {
+                    rest: Some(SliceRest::Bind(rest_name)),
+                    ..
+                } => {
+                    consumes = true;
+                    if let StructuralAction::Transition { state: next, args } = &state.on_match {
+                        if scc_set.contains(&(*next as usize)) {
+                            if !matches!(
+                                args.get(span_param_index).map(|arg| &arg.kind),
+                                Some(IrExprKind::Local(name)) if name == rest_name
+                            ) {
+                                valid = false;
+                                break;
+                            }
+                        } else if (*next as usize) >= states.len()
+                            || !scc_set.contains(&(*next as usize))
+                        {
+                            exit_states.insert(*next);
+                        }
+                    }
+                }
+                Pattern::Name(_) | Pattern::Wildcard => {
+                    if let StructuralAction::Transition { state: next, .. } = &state.on_match {
+                        if !scc_set.contains(&(*next as usize)) {
+                            exit_states.insert(*next);
+                        }
+                    }
+                }
+                _ => {
+                    valid = false;
+                    break;
+                }
+            }
+            if let Some(next) = state.on_miss {
+                if !scc_set.contains(&(next as usize)) {
+                    exit_states.insert(next);
+                }
+            }
+        }
+        if valid && consumes {
+            let mut state_ids = scc.iter().map(|state| *state as u32).collect::<Vec<_>>();
+            state_ids.sort_unstable();
+            return Some(StructuralSequenceRegion {
+                entry_state: *state_ids.first().unwrap_or(&0),
+                state_ids,
+                span_param_index,
+                exit_states: exit_states.into_iter().collect(),
+                mode: StructuralSequenceMode::SeparatedItems,
+            });
+        }
+    }
+    None
 }
 
 fn group_lowered_program(
@@ -8262,7 +9856,9 @@ fn collect_trivial_wrapper_calls(program: &LoweredProgram) -> BTreeMap<String, T
                 return None;
             }
             let clauses = match &function.kind {
-                LoweredKind::Scalar { clauses } | LoweredKind::Structural { clauses, .. } => clauses,
+                LoweredKind::Scalar { clauses } | LoweredKind::Structural { clauses, .. } => {
+                    clauses
+                }
                 LoweredKind::Kernel { .. } => return None,
             };
             let [clause] = clauses.as_slice() else {
@@ -8293,6 +9889,10 @@ fn collect_trivial_wrapper_calls(program: &LoweredProgram) -> BTreeMap<String, T
 fn ir_expr_contains_let(expr: &IrExpr) -> bool {
     match &expr.kind {
         IrExprKind::Let { .. } => true,
+        IrExprKind::Seq(items) => items.iter().any(ir_expr_contains_let),
+        IrExprKind::SeqSplice { prefix, tail } => {
+            prefix.iter().any(ir_expr_contains_let) || ir_expr_contains_let(tail)
+        }
         IrExprKind::Record(fields) => fields.values().any(ir_expr_contains_let),
         IrExprKind::EnumCtor { args, .. } => args.iter().any(ir_expr_contains_let),
         IrExprKind::EnumTag { value }
@@ -8425,6 +10025,19 @@ fn optimize_ir_expr(
             ctor: ctor.clone(),
             field: *field,
         },
+        IrExprKind::Seq(items) => IrExprKind::Seq(
+            items
+                .iter()
+                .map(|item| optimize_ir_expr(item, trivial_wrappers, depth))
+                .collect(),
+        ),
+        IrExprKind::SeqSplice { prefix, tail } => IrExprKind::SeqSplice {
+            prefix: prefix
+                .iter()
+                .map(|item| optimize_ir_expr(item, trivial_wrappers, depth))
+                .collect(),
+            tail: Box::new(optimize_ir_expr(tail, trivial_wrappers, depth)),
+        },
         IrExprKind::Call { callee, args } => {
             let args = args
                 .iter()
@@ -8522,6 +10135,17 @@ fn substitute_ir_locals(expr: &mut IrExpr, subst: &BTreeMap<String, IrExpr>) {
         IrExprKind::EnumTag { value }
         | IrExprKind::EnumChildBySlot { value, .. }
         | IrExprKind::EnumNonRecField { value, .. } => substitute_ir_locals(value, subst),
+        IrExprKind::Seq(items) => {
+            for item in items {
+                substitute_ir_locals(item, subst);
+            }
+        }
+        IrExprKind::SeqSplice { prefix, tail } => {
+            for item in prefix {
+                substitute_ir_locals(item, subst);
+            }
+            substitute_ir_locals(tail, subst);
+        }
         IrExprKind::Call { args, .. } => {
             for arg in args {
                 substitute_ir_locals(arg, subst);
@@ -8628,6 +10252,17 @@ fn rewrite_locals(expr: &mut IrExpr, alias: &BTreeMap<String, String>) {
         IrExprKind::EnumTag { value }
         | IrExprKind::EnumChildBySlot { value, .. }
         | IrExprKind::EnumNonRecField { value, .. } => rewrite_locals(value, alias),
+        IrExprKind::Seq(items) => {
+            for item in items {
+                rewrite_locals(item, alias);
+            }
+        }
+        IrExprKind::SeqSplice { prefix, tail } => {
+            for item in prefix {
+                rewrite_locals(item, alias);
+            }
+            rewrite_locals(tail, alias);
+        }
         IrExprKind::Int(_, _) | IrExprKind::Float(_, _) => {}
     }
 }
@@ -8666,6 +10301,17 @@ fn collect_ir_local_names_into(expr: &IrExpr, names: &mut BTreeSet<String>) {
             for arg in args {
                 collect_ir_local_names_into(arg, names);
             }
+        }
+        IrExprKind::Seq(items) => {
+            for item in items {
+                collect_ir_local_names_into(item, names);
+            }
+        }
+        IrExprKind::SeqSplice { prefix, tail } => {
+            for item in prefix {
+                collect_ir_local_names_into(item, names);
+            }
+            collect_ir_local_names_into(tail, names);
         }
         IrExprKind::Record(fields) => {
             for field in fields.values() {
@@ -8805,6 +10451,17 @@ fn collect_ir_called_functions(
                 collect_ir_called_functions(arg, names, candidate_set);
             }
         }
+        IrExprKind::Seq(items) => {
+            for item in items {
+                collect_ir_called_functions(item, names, candidate_set);
+            }
+        }
+        IrExprKind::SeqSplice { prefix, tail } => {
+            for item in prefix {
+                collect_ir_called_functions(item, names, candidate_set);
+            }
+            collect_ir_called_functions(tail, names, candidate_set);
+        }
         IrExprKind::Record(fields) => {
             for field in fields.values() {
                 collect_ir_called_functions(field, names, candidate_set);
@@ -8846,6 +10503,17 @@ fn count_ir_function_calls(expr: &IrExpr, candidate_set: &BTreeSet<String>) -> u
             .iter()
             .map(|arg| count_ir_function_calls(arg, candidate_set))
             .sum(),
+        IrExprKind::Seq(items) => items
+            .iter()
+            .map(|item| count_ir_function_calls(item, candidate_set))
+            .sum(),
+        IrExprKind::SeqSplice { prefix, tail } => {
+            prefix
+                .iter()
+                .map(|item| count_ir_function_calls(item, candidate_set))
+                .sum::<usize>()
+                + count_ir_function_calls(tail, candidate_set)
+        }
         IrExprKind::Record(fields) => fields
             .values()
             .map(|field| count_ir_function_calls(field, candidate_set))
@@ -8898,8 +10566,7 @@ fn tarjan_scc(nodes: &[String], edges: &BTreeMap<String, BTreeSet<String>>) -> V
                             *node_low = (*node_low).min(target_low);
                         }
                     } else if self.on_stack.contains(target) {
-                        let target_index =
-                            self.indices.get(target).copied().unwrap_or(usize::MAX);
+                        let target_index = self.indices.get(target).copied().unwrap_or(usize::MAX);
                         if let Some(node_low) = self.lowlinks.get_mut(node) {
                             *node_low = (*node_low).min(target_index);
                         }
@@ -9026,6 +10693,10 @@ fn count_primitive_ops(expr: &IrExpr) -> usize {
             callee: Callee::Function(_) | Callee::Builtin(_),
             args,
         } => args.iter().map(count_primitive_ops).sum(),
+        IrExprKind::Seq(items) => items.iter().map(count_primitive_ops).sum(),
+        IrExprKind::SeqSplice { prefix, tail } => {
+            prefix.iter().map(count_primitive_ops).sum::<usize>() + count_primitive_ops(tail)
+        }
         IrExprKind::Record(fields) => fields.values().map(count_primitive_ops).sum(),
         IrExprKind::Let { bindings, body } => {
             bindings
@@ -9056,10 +10727,11 @@ fn lower_function(function: &NormalizedFunction) -> Result<LoweredFunction> {
         .iter()
         .enumerate()
         .map(|(index, ty)| match ty {
-            Type::Scalar(_) => AccessKind::Same,
+            Type::Scalar(_) | Type::Index(_) => AccessKind::Same,
             Type::Named(name, args) if args.is_empty() && (name == "string" || name == "bool") => {
                 AccessKind::Same
             }
+            Type::StarSeq(_) | Type::StarSeqWitnessed(_, _) => AccessKind::Same,
             Type::Bulk(_, _) if slice_pattern_params.contains(&index) => AccessKind::Same,
             Type::Bulk(_, _) => AccessKind::Lane,
             Type::TypeToken(_) => AccessKind::Same,
@@ -9069,11 +10741,12 @@ fn lower_function(function: &NormalizedFunction) -> Result<LoweredFunction> {
         })
         .collect();
 
-    let tail_loop = if function.tailrec.loop_lowerable && function_supports_tail_loop_lowering(function) {
-        Some(lower_tail_loop(function)?)
-    } else {
-        None
-    };
+    let tail_loop =
+        if function.tailrec.loop_lowerable && function_supports_tail_loop_lowering(function) {
+            Some(lower_tail_loop(function)?)
+        } else {
+            None
+        };
 
     let kind = match &ret {
         Type::Bulk(prim, shape) => {
@@ -9089,7 +10762,11 @@ fn lower_function(function: &NormalizedFunction) -> Result<LoweredFunction> {
                 clauses,
             }
         }
-        Type::Scalar(_) | Type::Named(_, _) => {
+        Type::Scalar(_)
+        | Type::Named(_, _)
+        | Type::StarSeq(_)
+        | Type::StarSeqWitnessed(_, _)
+        | Type::Index(_) => {
             let clauses = function
                 .clauses
                 .iter()
@@ -9097,10 +10774,7 @@ fn lower_function(function: &NormalizedFunction) -> Result<LoweredFunction> {
                 .collect::<Result<Vec<_>>>()?;
             if uses_structural_lowering(function, &clauses) {
                 let program = build_structural_program(&clauses, tail_loop.as_ref());
-                LoweredKind::Structural {
-                    clauses,
-                    program,
-                }
+                LoweredKind::Structural { clauses, program }
             } else {
                 LoweredKind::Scalar { clauses }
             }
@@ -9155,7 +10829,10 @@ fn typed_expr_supports_loop_lowering(expr: &TypedExpr) -> bool {
         | TypedExprKind::Char(_) => true,
         TypedExprKind::Bool(_)
         | TypedExprKind::String(_)
+        | TypedExprKind::Seq(_)
+        | TypedExprKind::SeqSplice { .. }
         | TypedExprKind::TypeToken(_)
+        | TypedExprKind::Index { .. }
         | TypedExprKind::Tuple(_)
         | TypedExprKind::TupleProject { .. }
         | TypedExprKind::Lambda { .. } => false,
@@ -9165,9 +10842,7 @@ fn typed_expr_supports_loop_lowering(expr: &TypedExpr) -> bool {
                 .all(|binding| typed_expr_supports_loop_lowering(&binding.expr))
                 && typed_expr_supports_loop_lowering(body)
         }
-        TypedExprKind::Record(fields) => fields
-            .values()
-            .all(typed_expr_supports_loop_lowering),
+        TypedExprKind::Record(fields) => fields.values().all(typed_expr_supports_loop_lowering),
         TypedExprKind::Project { base, .. } => typed_expr_supports_loop_lowering(base),
         TypedExprKind::RecordUpdate { base, fields } => {
             typed_expr_supports_loop_lowering(base)
@@ -9177,8 +10852,7 @@ fn typed_expr_supports_loop_lowering(expr: &TypedExpr) -> bool {
             .iter()
             .all(|arg| typed_expr_supports_loop_lowering(&arg.expr)),
         TypedExprKind::Apply { callee, arg } => {
-            typed_expr_supports_loop_lowering(callee)
-                && typed_expr_supports_loop_lowering(arg)
+            typed_expr_supports_loop_lowering(callee) && typed_expr_supports_loop_lowering(arg)
         }
     }
 }
@@ -9197,6 +10871,7 @@ fn uses_structural_lowering(function: &NormalizedFunction, clauses: &[LoweredCla
 
 fn type_is_structural(ty: &Type) -> bool {
     match ty {
+        Type::StarSeq(_) | Type::StarSeqWitnessed(_, _) => true,
         Type::Named(name, args) if name == "string" && args.is_empty() => true,
         Type::Named(name, args) if name == "bool" && args.is_empty() => false,
         Type::Named(_, _) => true,
@@ -9239,6 +10914,10 @@ fn ir_expr_is_structural(expr: &IrExpr) -> bool {
                 || ir_expr_is_structural(body)
         }
         IrExprKind::Call { args, .. } => args.iter().any(ir_expr_is_structural),
+        IrExprKind::Seq(items) => items.iter().any(ir_expr_is_structural),
+        IrExprKind::SeqSplice { prefix, tail } => {
+            prefix.iter().any(ir_expr_is_structural) || ir_expr_is_structural(tail)
+        }
         IrExprKind::Record(fields) => fields.values().any(ir_expr_is_structural),
         IrExprKind::Local(_) | IrExprKind::Int(_, _) | IrExprKind::Float(_, _) => false,
     }
@@ -9336,6 +11015,7 @@ fn lower_expr_to_ir(
                 (Type::Bulk(prim, shape), Some(kernel_shape)) if shape == kernel_shape => {
                     Type::Scalar(*prim)
                 }
+                (Type::Index(_), _) => Type::Scalar(Prim::I64),
                 _ => expr.ty.clone(),
             };
             Ok(IrExpr {
@@ -9355,6 +11035,38 @@ fn lower_expr_to_ir(
             ty: Type::Scalar(Prim::Char),
             kind: IrExprKind::Int(*value as i64, Prim::Char),
         }),
+        TypedExprKind::Index {
+            base,
+            index,
+            checked,
+        } => {
+            let Some((elem_ty, _)) = star_seq_parts(&base.ty) else {
+                return Err(SimdError::new(format!(
+                    "index lowering expected T[*] base, found {:?}",
+                    base.ty
+                )));
+            };
+            let Type::Scalar(prim) = elem_ty else {
+                return Err(SimdError::new(format!(
+                    "index lowering currently supports only scalar-element T[*], found {:?}",
+                    elem_ty
+                )));
+            };
+            Ok(IrExpr {
+                ty: expr.ty.clone(),
+                kind: IrExprKind::Call {
+                    callee: Callee::Builtin(if *checked {
+                        BuiltinFamilyCallee::CheckedGatherSeq(*prim)
+                    } else {
+                        BuiltinFamilyCallee::GatherSeq(*prim)
+                    }),
+                    args: vec![
+                        lower_expr_to_ir(base, kernel_shape, _locals)?,
+                        lower_expr_to_ir(index, kernel_shape, _locals)?,
+                    ],
+                },
+            })
+        }
         TypedExprKind::Record(fields) => Ok(IrExpr {
             ty: expr.ty.clone(),
             kind: IrExprKind::Record(
@@ -9368,6 +11080,25 @@ fn lower_expr_to_ir(
                     })
                     .collect::<Result<BTreeMap<_, _>>>()?,
             ),
+        }),
+        TypedExprKind::Seq(items) => Ok(IrExpr {
+            ty: expr.ty.clone(),
+            kind: IrExprKind::Seq(
+                items
+                    .iter()
+                    .map(|item| lower_expr_to_ir(item, kernel_shape, _locals))
+                    .collect::<Result<Vec<_>>>()?,
+            ),
+        }),
+        TypedExprKind::SeqSplice { prefix, tail } => Ok(IrExpr {
+            ty: expr.ty.clone(),
+            kind: IrExprKind::SeqSplice {
+                prefix: prefix
+                    .iter()
+                    .map(|item| lower_expr_to_ir(item, kernel_shape, _locals))
+                    .collect::<Result<Vec<_>>>()?,
+                tail: Box::new(lower_expr_to_ir(tail, kernel_shape, _locals)?),
+            },
         }),
         TypedExprKind::Tuple(_) | TypedExprKind::TupleProject { .. } => Err(SimdError::new(
             "tuple expressions should have been eliminated by normalization before loop lowering",
@@ -9588,6 +11319,24 @@ pub fn run_profile_main(source: &str, main: &str, args_json: &str) -> Result<Eva
     })
 }
 
+pub fn run_profile_fns_main(
+    source: &str,
+    main: &str,
+    args_json: &str,
+) -> Result<EvalFunctionProfile> {
+    let (_surface, _module, checked) = compile_frontend(source)?;
+    let args = parse_host_args(args_json, &checked, main)?;
+    let profiler = Rc::new(RefCell::new(FunctionProfileAccumulator::default()));
+    let start = Instant::now();
+    let value = Evaluator::with_profiler(&checked, profiler.clone()).run_function(main, args)?;
+    let total_us = start.elapsed().as_micros();
+    Ok(EvalFunctionProfile {
+        result_json: value.to_json_string(),
+        total_us,
+        functions: profiler.borrow().finish(),
+    })
+}
+
 pub fn run_compiled_main(compiled: &CompiledProgram, main: &str, args: &[Value]) -> Result<Value> {
     Evaluator::new(&compiled.checked).run_function(main, args.to_vec())
 }
@@ -9652,6 +11401,7 @@ fn parse_json_type_witness_prim(json: &JsonValue) -> Result<Prim> {
 struct Evaluator<'a> {
     functions: BTreeMap<String, &'a CheckedFunction>,
     enum_ctors: BTreeMap<String, EnumCtorInfo>,
+    profiler: Option<Rc<RefCell<FunctionProfileAccumulator>>>,
 }
 
 impl<'a> Evaluator<'a> {
@@ -9665,6 +11415,24 @@ impl<'a> Evaluator<'a> {
         Self {
             functions,
             enum_ctors,
+            profiler: None,
+        }
+    }
+
+    fn with_profiler(
+        program: &'a CheckedProgram,
+        profiler: Rc<RefCell<FunctionProfileAccumulator>>,
+    ) -> Self {
+        let functions = program
+            .functions
+            .iter()
+            .map(|function| (function.name.clone(), function))
+            .collect();
+        let enum_ctors = program.enum_ctors.clone();
+        Self {
+            functions,
+            enum_ctors,
+            profiler: Some(profiler),
         }
     }
 
@@ -9694,16 +11462,25 @@ impl<'a> Evaluator<'a> {
         function: &'a CheckedFunction,
         args: Vec<Binding<'a>>,
     ) -> Result<EvalValue<'a>> {
-        for clause in &function.clauses {
-            if let Some(env) = self.match_clause(clause, &args)? {
-                let env = Rc::new(env);
-                return self.eval_expr(&clause.body, &env);
+        let start = Instant::now();
+        let result = (|| {
+            for clause in &function.clauses {
+                if let Some(env) = self.match_clause(clause, &args)? {
+                    let env = Rc::new(env);
+                    return self.eval_expr(&clause.body, &env);
+                }
             }
+            Err(SimdError::new(format!(
+                "no clause of '{}' matched the provided arguments",
+                function.name
+            )))
+        })();
+        if let Some(profiler) = &self.profiler {
+            profiler
+                .borrow_mut()
+                .record_call(&function.name, start.elapsed().as_micros());
         }
-        Err(SimdError::new(format!(
-            "no clause of '{}' matched the provided arguments",
-            function.name
-        )))
+        result
     }
 
     fn match_clause(
@@ -9848,9 +11625,10 @@ impl<'a> Evaluator<'a> {
                 Type::Scalar(Prim::Char)
             }
             Type::Bulk(prim, shape) if shape.0.len() == 1 => Type::Scalar(*prim),
+            Type::StarSeq(elem_ty) => elem_ty.as_ref().clone(),
             other => {
                 return Err(SimdError::new(format!(
-                    "slice pattern expects rank-1 bulk/string type, found {:?}",
+                    "slice pattern expects rank-1 bulk/string/T[*] type, found {:?}",
                     other
                 )));
             }
@@ -10020,6 +11798,55 @@ impl<'a> Evaluator<'a> {
                 }
                 Ok(true)
             }
+            Value::StarSeq(seq) => {
+                let len = seq.items.len();
+                let fixed = prefix.len() + suffix.len();
+                if len < fixed {
+                    return Ok(false);
+                }
+                if rest.is_none() && len != fixed {
+                    return Ok(false);
+                }
+                for (index, subpattern) in prefix.iter().enumerate() {
+                    let typed = TypedPattern {
+                        pattern: subpattern.clone(),
+                        ty: elem_ty.clone(),
+                    };
+                    if !self.match_pattern(
+                        &typed,
+                        &Binding::Ready(EvalValue::Host(seq.items[index].clone())),
+                        env,
+                    )? {
+                        return Ok(false);
+                    }
+                }
+                for (offset, subpattern) in suffix.iter().enumerate() {
+                    let idx = len - suffix.len() + offset;
+                    let typed = TypedPattern {
+                        pattern: subpattern.clone(),
+                        ty: elem_ty.clone(),
+                    };
+                    if !self.match_pattern(
+                        &typed,
+                        &Binding::Ready(EvalValue::Host(seq.items[idx].clone())),
+                        env,
+                    )? {
+                        return Ok(false);
+                    }
+                }
+                if let Some(SliceRest::Bind(name)) = rest {
+                    let start = prefix.len();
+                    let end = len - suffix.len();
+                    env.insert(
+                        name.clone(),
+                        Binding::Ready(EvalValue::Host(Value::StarSeq(StarSeqValue {
+                            elem_ty: seq.elem_ty.clone(),
+                            items: seq.items[start..end].to_vec(),
+                        }))),
+                    );
+                }
+                Ok(true)
+            }
             _ => Ok(false),
         }
     }
@@ -10162,6 +11989,67 @@ impl<'a> Evaluator<'a> {
                 Ok(EvalValue::Host(Value::Scalar(ScalarValue::Char(*value))))
             }
             TypedExprKind::String(value) => Ok(EvalValue::Host(Value::String(value.clone()))),
+            TypedExprKind::Index {
+                base,
+                index,
+                checked,
+            } => {
+                let base = self.expect_host_value(self.eval_expr(base, env)?)?;
+                let index = self.expect_host_value(self.eval_expr(index, env)?)?;
+                let Value::StarSeq(seq) = base else {
+                    return Err(SimdError::new("indexing requires a T[*] runtime value"));
+                };
+                let index_value = expect_i64_scalar_value(&index, "index expression")?;
+                let item = usize::try_from(index_value)
+                    .ok()
+                    .and_then(|index| seq.items.get(index).cloned());
+                if *checked {
+                    return Ok(EvalValue::Host(match item {
+                        Some(value) => build_enum_value(&self.enum_ctors, "Some", vec![value])?,
+                        None => build_enum_value(&self.enum_ctors, "None", Vec::new())?,
+                    }));
+                }
+                Ok(EvalValue::Host(item.ok_or_else(|| {
+                    SimdError::new("index expression is out of bounds")
+                })?))
+            }
+            TypedExprKind::Seq(items) => {
+                let Type::StarSeq(elem_ty) = &expr.ty else {
+                    return Err(SimdError::new(
+                        "sequence expression evaluated with non-sequence type",
+                    ));
+                };
+                let mut values = Vec::with_capacity(items.len());
+                for item in items {
+                    values.push(self.expect_host_value(self.eval_expr(item, env)?)?);
+                }
+                Ok(EvalValue::Host(Value::StarSeq(StarSeqValue {
+                    elem_ty: elem_ty.as_ref().clone(),
+                    items: values,
+                })))
+            }
+            TypedExprKind::SeqSplice { prefix, tail } => {
+                let Type::StarSeq(elem_ty) = &expr.ty else {
+                    return Err(SimdError::new(
+                        "sequence splice evaluated with non-sequence type",
+                    ));
+                };
+                let mut values = Vec::with_capacity(prefix.len());
+                for item in prefix {
+                    values.push(self.expect_host_value(self.eval_expr(item, env)?)?);
+                }
+                let tail_value = self.expect_host_value(self.eval_expr(tail, env)?)?;
+                let Value::StarSeq(tail_seq) = tail_value else {
+                    return Err(SimdError::new(
+                        "sequence splice tail did not evaluate to T[*]",
+                    ));
+                };
+                values.extend(tail_seq.items);
+                Ok(EvalValue::Host(Value::StarSeq(StarSeqValue {
+                    elem_ty: elem_ty.as_ref().clone(),
+                    items: values,
+                })))
+            }
             TypedExprKind::TypeToken(prim) => Ok(EvalValue::Host(Value::TypeToken(*prim))),
             TypedExprKind::Lambda { param, body } => Ok(EvalValue::Closure(Closure::Lambda {
                 param: param.clone(),
@@ -10354,7 +12242,11 @@ impl<'a> Evaluator<'a> {
                 for arg in args {
                     values.push(self.expect_host_value(self.eval_expr(&arg.expr, env)?)?);
                 }
-                Ok(EvalValue::Host(eval_builtin_family_scalar(kind, &values)?))
+                Ok(EvalValue::Host(eval_builtin_family_scalar(
+                    kind,
+                    &values,
+                    &self.enum_ctors,
+                )?))
             }
             Callee::Function(name) => {
                 let function = self
@@ -10483,7 +12375,7 @@ impl<'a> Evaluator<'a> {
                             )),
                         })
                         .collect::<Result<Vec<_>>>()?;
-                    eval_builtin_family_scalar(kind, &values)?
+                    eval_builtin_family_scalar(kind, &values, &self.enum_ctors)?
                 }
             };
             lane_results.push(value);
@@ -10832,10 +12724,36 @@ fn builtin_family_result_type(kind: &BuiltinFamilyCallee) -> Type {
         BuiltinFamilyCallee::ContainsString
         | BuiltinFamilyCallee::EqString
         | BuiltinFamilyCallee::EqBool => builtin_bool_type(),
+        BuiltinFamilyCallee::ReverseSeq(ty) => ty.clone(),
+        BuiltinFamilyCallee::GatherSeq(prim) => Type::Scalar(*prim),
+        BuiltinFamilyCallee::ScatterSeq(prim) | BuiltinFamilyCallee::ScatterAddSeq(prim) => {
+            Type::StarSeq(Box::new(Type::Scalar(*prim)))
+        }
+        BuiltinFamilyCallee::CheckedGatherSeq(prim) => builtin_maybe_type(Type::Scalar(*prim)),
+        BuiltinFamilyCallee::CheckIndexSeq(witness) => {
+            builtin_maybe_type(Type::Index(witness.clone()))
+        }
+        BuiltinFamilyCallee::IndicesSeq(witness) => {
+            Type::StarSeqWitnessed(Box::new(Type::Index(witness.clone())), witness.clone())
+        }
     }
 }
 
-fn eval_builtin_family_scalar(kind: &BuiltinFamilyCallee, args: &[Value]) -> Result<Value> {
+fn build_builtin_maybe_value(
+    ctor_env: &BTreeMap<String, EnumCtorInfo>,
+    value: Option<Value>,
+) -> Result<Value> {
+    match value {
+        Some(value) => build_enum_value(ctor_env, "Some", vec![value]),
+        None => build_enum_value(ctor_env, "None", Vec::new()),
+    }
+}
+
+fn eval_builtin_family_scalar(
+    kind: &BuiltinFamilyCallee,
+    args: &[Value],
+    ctor_env: &BTreeMap<String, EnumCtorInfo>,
+) -> Result<Value> {
     match kind {
         BuiltinFamilyCallee::ConcatString => {
             if args.len() != 2 {
@@ -10914,6 +12832,175 @@ fn eval_builtin_family_scalar(kind: &BuiltinFamilyCallee, args: &[Value]) -> Res
             let b = expect_bool_value(&args[1], "(==)\\bool argument 2")?;
             Ok(Value::Bool(a == b))
         }
+        BuiltinFamilyCallee::ReverseSeq(_) => {
+            if args.len() != 1 {
+                return Err(SimdError::new("reverse expects 1 argument"));
+            }
+            let Value::StarSeq(seq) = &args[0] else {
+                return Err(SimdError::new("reverse expects a T[*] argument"));
+            };
+            let mut items = seq.items.clone();
+            items.reverse();
+            Ok(Value::StarSeq(StarSeqValue {
+                elem_ty: seq.elem_ty.clone(),
+                items,
+            }))
+        }
+        BuiltinFamilyCallee::GatherSeq(prim) => {
+            if args.len() != 2 {
+                return Err(SimdError::new("gather expects 2 arguments"));
+            }
+            let seq = expect_star_seq_scalar_items(&args[0], *prim, "gather argument 1")?;
+            let index = expect_i64_scalar_value(&args[1], "gather argument 2")?;
+            let index = usize::try_from(index)
+                .map_err(|_| SimdError::new("gather index must be non-negative"))?;
+            seq.get(index)
+                .cloned()
+                .ok_or_else(|| SimdError::new("gather index is out of bounds"))
+        }
+        BuiltinFamilyCallee::ScatterSeq(prim) | BuiltinFamilyCallee::ScatterAddSeq(prim) => {
+            let family = if matches!(kind, BuiltinFamilyCallee::ScatterAddSeq(_)) {
+                "scatter_add"
+            } else {
+                "scatter"
+            };
+            if args.len() != 3 {
+                return Err(SimdError::new(format!("{family} expects 3 arguments")));
+            }
+            let Value::StarSeq(dest) = &args[0] else {
+                return Err(SimdError::new(format!(
+                    "{family} argument 1 must be a T[*]"
+                )));
+            };
+            if dest.elem_ty != Type::Scalar(*prim) {
+                return Err(SimdError::new(format!(
+                    "{family} argument 1 must be a {:?}[*], found {:?}",
+                    prim, dest.elem_ty
+                )));
+            }
+            let Value::StarSeq(indices) = &args[1] else {
+                return Err(SimdError::new(format!(
+                    "{family} argument 2 must be an i64[*] buffer"
+                )));
+            };
+            if indices.elem_ty != Type::Scalar(Prim::I64) {
+                return Err(SimdError::new(format!(
+                    "{family} argument 2 must be an i64[*] buffer, found {:?}",
+                    indices.elem_ty
+                )));
+            }
+            let Value::StarSeq(values) = &args[2] else {
+                return Err(SimdError::new(format!(
+                    "{family} argument 3 must be a {:?}[*] buffer",
+                    prim
+                )));
+            };
+            if values.elem_ty != Type::Scalar(*prim) {
+                return Err(SimdError::new(format!(
+                    "{family} argument 3 must be a {:?}[*] buffer, found {:?}",
+                    prim, values.elem_ty
+                )));
+            }
+            if indices.items.len() != values.items.len() {
+                return Err(SimdError::new(format!(
+                    "{family} index/value buffers must have the same flattened length"
+                )));
+            }
+            let mut items = dest.items.clone();
+            for (index_value, update_value) in indices.items.iter().zip(values.items.iter()) {
+                let Value::Scalar(ScalarValue::I64(index)) = index_value else {
+                    return Err(SimdError::new(
+                        "scatter index buffer contained non-i64 lane",
+                    ));
+                };
+                let index = usize::try_from(*index)
+                    .map_err(|_| SimdError::new(format!("{family} index must be non-negative")))?;
+                let Some(slot) = items.get_mut(index) else {
+                    return Err(SimdError::new(format!("{family} index is out of bounds")));
+                };
+                let Value::Scalar(current) = slot else {
+                    return Err(SimdError::new(
+                        "scatter destination contained non-scalar item",
+                    ));
+                };
+                let Value::Scalar(update_value) = update_value else {
+                    return Err(SimdError::new(
+                        "scatter value buffer contained non-scalar item",
+                    ));
+                };
+                let next = if matches!(kind, BuiltinFamilyCallee::ScatterAddSeq(_)) {
+                    apply_primitive(PrimOp::Add, current, update_value)?
+                } else {
+                    update_value.clone()
+                };
+                *slot = Value::Scalar(next);
+            }
+            Ok(Value::StarSeq(StarSeqValue {
+                elem_ty: dest.elem_ty.clone(),
+                items,
+            }))
+        }
+        BuiltinFamilyCallee::CheckedGatherSeq(prim) => {
+            if args.len() != 2 {
+                return Err(SimdError::new("try_get expects 2 arguments"));
+            }
+            let seq = expect_star_seq_scalar_items(&args[0], *prim, "try_get argument 1")?;
+            let index = expect_i64_scalar_value(&args[1], "try_get argument 2")?;
+            let value = usize::try_from(index)
+                .ok()
+                .and_then(|index| seq.get(index).cloned());
+            build_builtin_maybe_value(ctor_env, value)
+        }
+        BuiltinFamilyCallee::CheckIndexSeq(witness) => {
+            if args.len() != 2 {
+                return Err(SimdError::new("check_index expects 2 arguments"));
+            }
+            let Value::StarSeq(seq) = &args[0] else {
+                return Err(SimdError::new("check_index argument 1 must be a T[*]"));
+            };
+            let index = expect_i64_scalar_value(&args[1], "check_index argument 2")?;
+            let value = usize::try_from(index)
+                .ok()
+                .filter(|index| *index < seq.items.len())
+                .map(|_| Value::Scalar(ScalarValue::I64(index)));
+            let _ = witness;
+            build_builtin_maybe_value(ctor_env, value)
+        }
+        BuiltinFamilyCallee::IndicesSeq(witness) => {
+            if args.len() != 1 {
+                return Err(SimdError::new("indices expects 1 argument"));
+            }
+            let Value::StarSeq(seq) = &args[0] else {
+                return Err(SimdError::new("indices argument 1 must be a T[*]"));
+            };
+            let items = (0..seq.items.len())
+                .map(|index| Value::Scalar(ScalarValue::I64(index as i64)))
+                .collect::<Vec<_>>();
+            Ok(Value::StarSeq(StarSeqValue {
+                elem_ty: Type::Index(witness.clone()),
+                items,
+            }))
+        }
+    }
+}
+
+fn expect_star_seq_scalar_items<'a>(
+    value: &'a Value,
+    prim: Prim,
+    label: &str,
+) -> Result<&'a [Value]> {
+    match value {
+        Value::StarSeq(seq) if matches!(seq.elem_ty, Type::Scalar(item_prim) if item_prim == prim) => {
+            Ok(seq.items.as_slice())
+        }
+        Value::StarSeq(seq) => Err(SimdError::new(format!(
+            "{} must be a {:?}[*], found {:?}",
+            label, prim, seq.elem_ty
+        ))),
+        other => Err(SimdError::new(format!(
+            "{} must be a T[*], found {:?}",
+            label, other
+        ))),
     }
 }
 
@@ -11264,6 +13351,11 @@ impl<'a> LoweredEvaluator<'a> {
                     (Value::String(_), _) => {
                         return Err(SimdError::new(
                             "kernel lowering does not support string runtime values",
+                        ));
+                    }
+                    (Value::StarSeq(_), _) => {
+                        return Err(SimdError::new(
+                            "kernel lowering does not support T[*] runtime values",
                         ));
                     }
                     (Value::Scalar(_), AccessKind::Lane) => {
@@ -11695,6 +13787,39 @@ impl<'a> LoweredEvaluator<'a> {
                 }
                 Ok(true)
             }
+            Value::StarSeq(seq) => {
+                let len = seq.items.len();
+                let fixed = prefix.len() + suffix.len();
+                if len < fixed {
+                    return Ok(false);
+                }
+                if rest.is_none() && len != fixed {
+                    return Ok(false);
+                }
+                for (index, subpattern) in prefix.iter().enumerate() {
+                    if !self.match_lowered_pattern(subpattern, &seq.items[index], env)? {
+                        return Ok(false);
+                    }
+                }
+                for (offset, subpattern) in suffix.iter().enumerate() {
+                    let idx = len - suffix.len() + offset;
+                    if !self.match_lowered_pattern(subpattern, &seq.items[idx], env)? {
+                        return Ok(false);
+                    }
+                }
+                if let Some(SliceRest::Bind(name)) = rest {
+                    let start = prefix.len();
+                    let end = len - suffix.len();
+                    env.insert(
+                        name.clone(),
+                        Value::StarSeq(StarSeqValue {
+                            elem_ty: seq.elem_ty.clone(),
+                            items: seq.items[start..end].to_vec(),
+                        }),
+                    );
+                }
+                Ok(true)
+            }
             _ => Ok(false),
         }
     }
@@ -11707,6 +13832,41 @@ impl<'a> LoweredEvaluator<'a> {
                 .ok_or_else(|| SimdError::new(format!("unknown lowered local '{}'", name))),
             IrExprKind::Int(value, prim) => Ok(Value::Scalar(make_int_value(*value, *prim)?)),
             IrExprKind::Float(value, prim) => Ok(Value::Scalar(make_float_value(*value, *prim))),
+            IrExprKind::Seq(items) => {
+                let Type::StarSeq(elem_ty) = &expr.ty else {
+                    return Err(SimdError::new(
+                        "lowered sequence IR requires T[*] result type",
+                    ));
+                };
+                let values = items
+                    .iter()
+                    .map(|item| self.eval_ir_expr(item, env))
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(Value::StarSeq(StarSeqValue {
+                    elem_ty: elem_ty.as_ref().clone(),
+                    items: values,
+                }))
+            }
+            IrExprKind::SeqSplice { prefix, tail } => {
+                let Type::StarSeq(elem_ty) = &expr.ty else {
+                    return Err(SimdError::new(
+                        "lowered sequence splice IR requires T[*] result type",
+                    ));
+                };
+                let mut values = prefix
+                    .iter()
+                    .map(|item| self.eval_ir_expr(item, env))
+                    .collect::<Result<Vec<_>>>()?;
+                let tail_value = self.eval_ir_expr(tail, env)?;
+                let Value::StarSeq(tail_seq) = tail_value else {
+                    return Err(SimdError::new("lowered sequence splice tail must be T[*]"));
+                };
+                values.extend(tail_seq.items);
+                Ok(Value::StarSeq(StarSeqValue {
+                    elem_ty: elem_ty.as_ref().clone(),
+                    items: values,
+                }))
+            }
             IrExprKind::Record(fields) => Ok(Value::Record(
                 fields
                     .iter()
@@ -11802,9 +13962,9 @@ impl<'a> LoweredEvaluator<'a> {
                         Ok(Value::Scalar(apply_primitive(*op, lhs, rhs)?))
                     }
                     Callee::Function(name) => self.run_function(name, values),
-                    Callee::Builtin(_) => Err(SimdError::new(
-                        "lowered evaluator does not support builtin family calls",
-                    )),
+                    Callee::Builtin(kind) => {
+                        eval_builtin_family_scalar(kind, &values, &self.enum_ctors)
+                    }
                 }
             }
         }
@@ -11825,6 +13985,7 @@ impl ValueExt for Value {
             Value::Tuple(_) => Err(SimdError::new("expected scalar value, found tuple")),
             Value::Bool(_) => Err(SimdError::new("expected scalar value, found bool")),
             Value::String(_) => Err(SimdError::new("expected scalar value, found string")),
+            Value::StarSeq(_) => Err(SimdError::new("expected scalar value, found T[*]")),
             Value::Enum(_) => Err(SimdError::new("expected scalar value, found enum")),
         }
     }
@@ -12050,6 +14211,7 @@ fn value_from_json(
             Ok(Value::Scalar(ScalarValue::Char(ch)))
         }
         Type::Scalar(prim) => Ok(Value::Scalar(scalar_from_json_number(json, *prim)?)),
+        Type::Index(_) => Ok(Value::Scalar(scalar_from_json_number(json, Prim::I64)?)),
         Type::Bulk(prim, expected_shape) => {
             let (shape, elements) = collect_bulk_values(json, *prim)?;
             if shape.len() != expected_shape.0.len() {
@@ -12085,6 +14247,19 @@ fn value_from_json(
                 prim: *prim,
                 shape,
                 elements,
+            }))
+        }
+        Type::StarSeq(item_ty) | Type::StarSeqWitnessed(item_ty, _) => {
+            let JsonValue::Array(values) = json else {
+                return Err(SimdError::new("T[*] runtime argument must be a JSON array"));
+            };
+            let items = values
+                .iter()
+                .map(|value| value_from_json(value, item_ty, shape_env, enum_names))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Value::StarSeq(StarSeqValue {
+                elem_ty: item_ty.as_ref().clone(),
+                items,
             }))
         }
         Type::TypeToken(inner) => {
@@ -12315,6 +14490,21 @@ pub fn run_profile_command(path: &str, main: &str, args_json: &str) -> Result<St
     Ok(run_profile_main(&source, main, args_json)?.to_kv_string())
 }
 
+pub fn run_profile_fns_command(
+    path: &str,
+    main: &str,
+    args_json: &str,
+    json_output: bool,
+) -> Result<String> {
+    let source = read_source_file(path)?;
+    let profile = run_profile_fns_main(&source, main, args_json)?;
+    Ok(if json_output {
+        profile.to_json_string()
+    } else {
+        profile.to_table_string()
+    })
+}
+
 pub fn inspect_html_command(out: Option<&str>) -> Result<String> {
     let html = bundled_examples_inspector_html()?;
     let out_path = out.unwrap_or("docs/inspector.html");
@@ -12426,6 +14616,20 @@ fn bundled_examples_inspector_html() -> Result<String> {
             "examples/tuple_basics.simd",
             "main",
             include_str!("../examples/tuple_basics.simd"),
+        ),
+        (
+            "star-seq-basics",
+            "star-seq-basics",
+            "examples/star_seq_basics.simd",
+            "main",
+            include_str!("../examples/star_seq_basics.simd"),
+        ),
+        (
+            "star-seq-tree",
+            "star-seq-tree",
+            "examples/star_seq_tree.simd",
+            "main",
+            include_str!("../examples/star_seq_tree.simd"),
         ),
     ];
 
@@ -13652,8 +15856,18 @@ mod tests {
             .iter()
             .find(|cluster| cluster.functions.iter().any(|name| name == "parse_value"))
             .expect("expected structural cluster containing parse_value");
-        assert!(parse_cluster.functions.iter().any(|name| name == "parse_array_after_open"));
-        assert!(parse_cluster.functions.iter().any(|name| name == "parse_object_after_open"));
+        assert!(
+            parse_cluster
+                .functions
+                .iter()
+                .any(|name| name == "parse_array_after_open")
+        );
+        assert!(
+            parse_cluster
+                .functions
+                .iter()
+                .any(|name| name == "parse_object_after_open")
+        );
         assert!(parse_cluster.recursive);
         assert!(parse_cluster.state_count >= parse_cluster.functions.len());
         assert!(parse_cluster.transition_count >= parse_cluster.functions.len());
@@ -13939,7 +16153,8 @@ mod tests {
         .to_json_string();
         assert!(debug_ok.contains("\"$enum\""));
         assert!(debug_ok.contains("JArray"));
-        assert!(debug_ok.contains("JArrCons"));
+        assert!(debug_ok.contains("JNum"));
+        assert!(debug_ok.contains("JNull"));
 
         let debug_err =
             run_compiled_main(&compiled, "main_json", &[Value::String("1.".to_string())])
@@ -13984,5 +16199,428 @@ mod tests {
             .to_json_string(),
             "{\"dot\":32,\"hadamard\":{\"x\":4,\"y\":10,\"z\":18},\"sum\":{\"x\":5,\"y\":7,\"z\":9}}"
         );
+    }
+
+    #[test]
+    fn parser_accepts_star_seq_types_and_literals() {
+        let source = r#"
+main : i64[*] -> i64[*]
+main xs = [1, 2]
+"#;
+        let surface = parse_source(source).expect("star seq source should parse");
+        let signature = surface
+            .decls
+            .iter()
+            .find_map(|decl| match decl {
+                Decl::Signature(signature) if signature.name == "main" => Some(signature),
+                _ => None,
+            })
+            .expect("main signature should exist");
+        let clause = surface
+            .decls
+            .iter()
+            .find_map(|decl| match decl {
+                Decl::Clause(clause) if clause.name == "main" => Some(clause),
+                _ => None,
+            })
+            .expect("main clause should exist");
+        let Type::Fun(args, ret) = &signature.ty else {
+            panic!("main should have a function type");
+        };
+        assert!(
+            matches!(args.first(), Some(Type::StarSeq(inner)) if matches!(inner.as_ref(), Type::Scalar(Prim::I64)))
+        );
+        assert!(
+            matches!(ret.as_ref(), Type::StarSeq(inner) if matches!(inner.as_ref(), Type::Scalar(Prim::I64)))
+        );
+        assert!(matches!(clause.body, Expr::Seq(ref items) if items.len() == 2));
+    }
+
+    #[test]
+    fn parser_accepts_witnessed_star_seq_and_index_types() {
+        let source = r#"
+main : i64[*n] -> Index n -> i64
+main xs i = xs[i]
+"#;
+        let surface = parse_source(source).expect("witnessed star seq source should parse");
+        let signature = surface
+            .decls
+            .iter()
+            .find_map(|decl| match decl {
+                Decl::Signature(signature) if signature.name == "main" => Some(signature),
+                _ => None,
+            })
+            .expect("main signature should exist");
+        let Type::Fun(args, ret) = &signature.ty else {
+            panic!("main should have a function type");
+        };
+        assert!(matches!(
+            args.first(),
+            Some(Type::StarSeqWitnessed(inner, witness))
+                if matches!(inner.as_ref(), Type::Scalar(Prim::I64)) && witness == "n"
+        ));
+        assert!(matches!(
+            args.get(1),
+            Some(Type::Named(name, vars))
+                if name == "Index" && vars == &vec![Type::Named("n".to_string(), Vec::new())]
+        ));
+        assert!(matches!(ret.as_ref(), Type::Scalar(Prim::I64)));
+    }
+
+    #[test]
+    fn parser_rejects_invalid_star_seq_witness_syntax() {
+        let source = r#"
+main : i64[*3] -> i64
+main _ = 0
+"#;
+        let error = parse_source(source).expect_err("literal witnesses should be rejected");
+        assert!(error.to_string().contains("not supported in v1"));
+    }
+
+    #[test]
+    fn parser_rejects_reserved_borrow_seq_syntax() {
+        let source = r#"
+main : i64[&] -> i64
+main _ = 0
+"#;
+        let error = parse_source(source).expect_err("T[&] should be reserved");
+        assert!(error.to_string().contains("reserved"));
+    }
+
+    #[test]
+    fn star_seq_example_runs() {
+        let source = include_str!("../examples/star_seq_basics.simd");
+        assert_eq!(
+            run_main(source, "main", "[[4,5,6]]")
+                .expect("star seq example should run")
+                .to_json_string(),
+            "[15,4,5,6]"
+        );
+        assert_eq!(
+            run_main(source, "main_boxed", "[[4,5,6]]")
+                .expect("star seq boxed example should run")
+                .to_json_string(),
+            "15"
+        );
+    }
+
+    #[test]
+    fn star_seq_gather_runs() {
+        let source = include_str!("../examples/star_seq_gather_i64.simd");
+        assert_eq!(
+            run_main(source, "main", "[[10,20,30,40],[3,1,0,2]]")
+                .expect("star seq gather should run")
+                .to_json_string(),
+            "[40,20,10,30]"
+        );
+    }
+
+    #[test]
+    fn gather_builtin_runs_through_surface_family() {
+        let source = r#"
+main : i64[*] -> i64[n] -> i64[n]
+main xs i = gather xs i
+"#;
+        assert_eq!(
+            run_main(source, "main", "[[10,20,30],[2,0]]")
+                .expect("surface gather should run")
+                .to_json_string(),
+            "[30,10]"
+        );
+    }
+
+    #[test]
+    fn scatter_builtins_run_in_evaluator() {
+        let scatter_src = r#"
+main : f32[*] -> i64[*] -> f32[*] -> f32[*]
+main dest idx values = scatter dest idx values
+"#;
+        assert_eq!(
+            run_main(scatter_src, "main", "[[0,0,0,0],[1,1,3],[0.5,0.25,1.0]]")
+                .expect("scatter should run in evaluator")
+                .to_json_string(),
+            "[0.0,0.25,0.0,1.0]"
+        );
+
+        let scatter_add_src = r#"
+main : f32[*] -> i64[*] -> f32[*] -> f32[*]
+main dest idx values = scatter_add dest idx values
+"#;
+        assert_eq!(
+            run_main(
+                scatter_add_src,
+                "main",
+                "[[0,0,0,0],[1,1,3],[0.5,0.25,1.0]]"
+            )
+            .expect("scatter_add should run in evaluator")
+            .to_json_string(),
+            "[0.0,0.75,0.0,1.0]"
+        );
+    }
+
+    #[test]
+    fn star_seq_reverse_runs() {
+        let source = r#"
+main : i64[*] -> i64[*]
+main xs = reverse xs
+"#;
+        assert_eq!(
+            run_main(source, "main", "[[10,20,30,40]]")
+                .expect("star seq reverse should run")
+                .to_json_string(),
+            "[40,30,20,10]"
+        );
+    }
+
+    #[test]
+    fn star_seq_runtime_boundary_uses_json_arrays() {
+        let source = r#"
+main : i64[*] -> i64[*]
+main xs = xs
+"#;
+        let value = run_main(source, "main", "[[1,2,3]]")
+            .expect("star seq identity should run")
+            .to_json_string();
+        assert_eq!(value, "[1,2,3]");
+    }
+
+    #[test]
+    fn star_seq_wasm_scalar_result_runs() {
+        let source = include_str!("../examples/star_seq_basics.simd");
+        let value = run_wasm_main(source, "main", "[[4,5,6]]")
+            .expect("Wasm should support scalar-element T[*] results")
+            .to_json_string();
+        assert_eq!(value, "[15,4,5,6]");
+    }
+
+    #[test]
+    fn star_seq_wasm_scalar_consumer_runs() {
+        let source = include_str!("../examples/star_seq_basics.simd");
+        let value = run_wasm_main(source, "sum_seq", "[[1,2,3,4]]")
+            .expect("Wasm should support scalar-element T[*] consumers")
+            .to_json_string();
+        assert_eq!(value, "10");
+    }
+
+    #[test]
+    fn star_seq_wasm_scalar_enum_field_runs() {
+        let source = include_str!("../examples/star_seq_basics.simd");
+        let value = run_wasm_main(source, "main_boxed", "[[4,5,6]]")
+            .expect("Wasm should support scalar-element T[*] enum payload fields")
+            .to_json_string();
+        assert_eq!(value, "15");
+    }
+
+    #[test]
+    fn star_seq_recursive_enum_example_runs() {
+        let source = include_str!("../examples/star_seq_tree.simd");
+        assert_eq!(
+            run_main(source, "main", "[]")
+                .expect("recursive star seq enum example should run")
+                .to_json_string(),
+            "10"
+        );
+        let rendered = run_main(source, "main_tree", "[]")
+            .expect("recursive star seq enum should render")
+            .to_json_string();
+        assert!(rendered.contains("Branch"));
+        assert!(rendered.contains("["));
+        assert!(rendered.contains("Leaf"));
+    }
+
+    #[test]
+    fn star_seq_recursive_enum_wasm_runs() {
+        let source = include_str!("../examples/star_seq_tree.simd");
+        assert_eq!(
+            run_wasm_main(source, "main", "[]")
+                .expect("Wasm should support recursive Self[*] consumers")
+                .to_json_string(),
+            "10"
+        );
+        let rendered = run_wasm_main(source, "main_tree", "[]")
+            .expect("Wasm should support recursive Self[*] enum payloads")
+            .to_json_string();
+        assert!(rendered.contains("Branch"));
+        assert!(rendered.contains("["));
+        assert!(rendered.contains("Leaf"));
+    }
+
+    #[test]
+    fn star_seq_wasm_prepared_scalar_result_runs() {
+        let source = include_str!("../examples/star_seq_basics.simd");
+        let value = run_wasm_prepared_main(source, "main", "[[4,5,6]]", 2)
+            .expect("prepared Wasm should support scalar-element T[*] results")
+            .to_json_string();
+        assert_eq!(value, "[15,4,5,6]");
+    }
+
+    #[test]
+    fn star_seq_recursive_enum_wasm_prepared_runs() {
+        let source = include_str!("../examples/star_seq_tree.simd");
+        assert_eq!(
+            run_wasm_prepared_main(source, "main", "[]", 2)
+                .expect("prepared Wasm should support recursive Self[*] consumers")
+                .to_json_string(),
+            "10"
+        );
+        let rendered = run_wasm_prepared_main(source, "main_tree", "[]", 2)
+            .expect("prepared Wasm should support recursive Self[*] enum payloads")
+            .to_json_string();
+        assert!(rendered.contains("Branch"));
+        assert!(rendered.contains("["));
+        assert!(rendered.contains("Leaf"));
+    }
+
+    #[test]
+    fn witnessed_reverse_preserves_signature_shape() {
+        let source = r#"
+main : i64[*n] -> i64[*n]
+main xs = reverse xs
+"#;
+        let (_surface, _module, checked) =
+            compile_frontend(source).expect("witnessed reverse should typecheck");
+        let function = checked
+            .functions
+            .iter()
+            .find(|function| function.name == "main")
+            .expect("main should be checked");
+        let (args, ret) = function.signature.ty.fun_parts();
+        assert!(matches!(
+            args.first(),
+            Some(Type::StarSeqWitnessed(inner, witness))
+                if matches!(inner.as_ref(), Type::Scalar(Prim::I64)) && witness == "n"
+        ));
+        assert!(matches!(
+            ret,
+            Type::StarSeqWitnessed(inner, witness)
+                if matches!(inner.as_ref(), Type::Scalar(Prim::I64)) && witness == "n"
+        ));
+    }
+
+    #[test]
+    fn witnessed_safe_index_runs_in_evaluator() {
+        let source = r#"
+main : i64[*n] -> Index n -> i64
+main xs i = xs[i]
+"#;
+        assert_eq!(
+            run_main(source, "main", "[[10,20,30],1]")
+                .expect("safe index should run in evaluator")
+                .to_json_string(),
+            "20"
+        );
+    }
+
+    #[test]
+    fn checked_index_returns_some_and_none_in_evaluator() {
+        let source = r#"
+main : i64[*n] -> i64 -> Maybe i64
+main xs i = xs[i]?
+"#;
+        assert_eq!(
+            run_main(source, "main", "[[10,20,30],1]")
+                .expect("checked index should return Some in evaluator")
+                .to_json_string(),
+            "{\"$enum\":\"Some\",\"fields\":[20]}"
+        );
+        assert_eq!(
+            run_main(source, "main", "[[10,20,30],5]")
+                .expect("checked index should return None in evaluator")
+                .to_json_string(),
+            "{\"$enum\":\"None\",\"fields\":[]}"
+        );
+    }
+
+    #[test]
+    fn witnessed_helper_builtins_run_in_evaluator() {
+        let get_src = r#"
+main : i64[*n] -> Index n -> i64
+main xs i = get xs i
+"#;
+        assert_eq!(
+            run_main(get_src, "main", "[[10,20,30],1]")
+                .expect("get should run in evaluator")
+                .to_json_string(),
+            "20"
+        );
+
+        let try_get_src = r#"
+main : i64[*n] -> i64 -> Maybe i64
+main xs i = try_get xs i
+"#;
+        assert_eq!(
+            run_main(try_get_src, "main", "[[10,20,30],5]")
+                .expect("try_get should return None in evaluator")
+                .to_json_string(),
+            "{\"$enum\":\"None\",\"fields\":[]}"
+        );
+
+        let check_index_src = r#"
+main : i64[*n] -> i64 -> Maybe (Index n)
+main xs i = check_index xs i
+"#;
+        assert_eq!(
+            run_main(check_index_src, "main", "[[10,20,30],2]")
+                .expect("check_index should return Some in evaluator")
+                .to_json_string(),
+            "{\"$enum\":\"Some\",\"fields\":[2]}"
+        );
+
+        let indices_src = r#"
+main : i64[*n] -> Index n[*n]
+main xs = indices xs
+"#;
+        assert_eq!(
+            run_main(indices_src, "main", "[[10,20,30]]")
+                .expect("indices should run in evaluator")
+                .to_json_string(),
+            "[0,1,2]"
+        );
+    }
+
+    #[test]
+    fn witnessed_safe_index_rejects_mismatched_witnesses() {
+        let source = r#"
+main : i64[*n] -> Index m -> i64
+main xs i = xs[i]
+"#;
+        let error = compile_frontend(source).expect_err("mismatched witnesses should be rejected");
+        assert!(error.to_string().contains("Index(\"n\")"));
+    }
+
+    #[test]
+    fn evaluator_function_profiler_reports_calls_and_time() {
+        let source = r#"
+bump : i64 -> i64
+bump x = x + 1
+
+twice : i64 -> i64
+twice x = bump (bump x)
+
+main : i64 -> i64
+main x = twice x
+"#;
+        let profile =
+            run_profile_fns_main(source, "main", "[7]").expect("evaluator function profile");
+        assert_eq!(profile.result_json, "9");
+        let rows = profile
+            .functions
+            .iter()
+            .map(|row| (row.name.as_str(), (row.calls, row.total_us)))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(rows.get("main").map(|(calls, _)| *calls), Some(1));
+        assert_eq!(rows.get("twice").map(|(calls, _)| *calls), Some(1));
+        assert_eq!(rows.get("bump").map(|(calls, _)| *calls), Some(2));
+        assert!(rows.get("main").is_some_and(|(_, total)| *total > 0));
+        assert!(rows.get("twice").is_some_and(|(_, total)| *total > 0));
+        assert!(rows.get("bump").is_some_and(|(_, total)| *total > 0));
+        for pair in profile.functions.windows(2) {
+            let a = &pair[0];
+            let b = &pair[1];
+            assert!(
+                a.total_us > b.total_us || (a.total_us == b.total_us && a.name <= b.name),
+                "rows should be sorted by total_us desc then name"
+            );
+        }
     }
 }

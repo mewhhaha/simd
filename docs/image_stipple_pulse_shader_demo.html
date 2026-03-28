@@ -1,0 +1,1099 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>simd stipple pulse shader demo</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #071018;
+        --panel: rgba(13, 21, 31, 0.94);
+        --panel-2: rgba(9, 15, 23, 0.9);
+        --border: #24354a;
+        --text: #edf3fb;
+        --muted: #9babc2;
+        --accent: #86d7ff;
+        --paper: #f2eee3;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        font-family: "Avenir Next", "Segoe UI", ui-sans-serif, system-ui, sans-serif;
+        background:
+          radial-gradient(900px 420px at 12% -8%, rgba(55, 99, 156, 0.55), transparent 60%),
+          radial-gradient(760px 460px at 110% 8%, rgba(116, 67, 43, 0.3), transparent 56%),
+          linear-gradient(180deg, #0a1018 0%, var(--bg) 100%);
+        color: var(--text);
+      }
+
+      .app {
+        max-width: 1260px;
+        margin: 0 auto;
+        padding: 18px;
+        display: grid;
+        gap: 12px;
+      }
+
+      .panel {
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 18px;
+        backdrop-filter: blur(18px);
+      }
+
+      .toolbar {
+        padding: 14px;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px 12px;
+        align-items: center;
+      }
+
+      .toolbar strong {
+        font-size: 14px;
+        letter-spacing: 0.03em;
+        text-transform: uppercase;
+      }
+
+      .toolbar .meta {
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      input[type="file"],
+      button {
+        font: inherit;
+        color: var(--text);
+        background: var(--panel-2);
+        border: 1px solid var(--border);
+        border-radius: 999px;
+        padding: 8px 12px;
+      }
+
+      button {
+        cursor: pointer;
+      }
+
+      button:hover {
+        border-color: var(--accent);
+      }
+
+      .layout {
+        display: grid;
+        grid-template-columns: 320px minmax(0, 1fr);
+        gap: 12px;
+      }
+
+      .controls {
+        padding: 14px;
+        display: grid;
+        gap: 10px;
+        align-content: start;
+      }
+
+      .controls h2,
+      .views h2 {
+        margin: 0 0 4px;
+        font-size: 12px;
+        text-transform: uppercase;
+        letter-spacing: 0.09em;
+        color: var(--muted);
+      }
+
+      .control {
+        display: grid;
+        grid-template-columns: 1fr auto;
+        gap: 6px 10px;
+        align-items: center;
+      }
+
+      .control label {
+        font-size: 12px;
+        color: var(--muted);
+      }
+
+      .control output {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 12px;
+        color: #d5e1f6;
+      }
+
+      .control input[type="range"] {
+        grid-column: 1 / -1;
+        width: 100%;
+      }
+
+      .hint {
+        color: var(--muted);
+        font-size: 12px;
+        line-height: 1.45;
+        padding-top: 6px;
+        border-top: 1px solid rgba(255, 255, 255, 0.06);
+      }
+
+      .views {
+        padding: 14px;
+        display: grid;
+        gap: 12px;
+      }
+
+      .grid {
+        display: grid;
+        gap: 12px;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+
+      .view {
+        display: grid;
+        gap: 8px;
+      }
+
+      .view h3 {
+        margin: 0;
+        font-size: 12px;
+        color: var(--muted);
+        font-weight: 600;
+      }
+
+      canvas {
+        width: 100%;
+        height: auto;
+        display: block;
+        border-radius: 16px;
+        border: 1px solid var(--border);
+        background: var(--paper);
+      }
+
+      #outputCanvas {
+        cursor: crosshair;
+        touch-action: none;
+      }
+
+      @media (max-width: 980px) {
+        .layout {
+          grid-template-columns: 1fr;
+        }
+
+        .grid {
+          grid-template-columns: 1fr;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main class="app">
+      <section class="panel toolbar">
+        <strong>simd stipple pulse shader demo</strong>
+        <input id="upload" type="file" accept="image/*" />
+        <button id="resetImage" type="button">reset image</button>
+        <button id="resetControls" type="button">reset controls</button>
+        <button id="download" type="button">download png</button>
+        <span id="status" class="meta">loading wasm...</span>
+      </section>
+
+      <section class="layout">
+        <aside class="panel controls">
+          <h2>Controls</h2>
+          <div id="controls"></div>
+          <div class="hint">
+            This version uses a compiled <code>simd</code> Wasm kernel to update particle positions and
+            velocities every frame. Upload an image, move to repel, and click to fire a pulse wave.
+          </div>
+        </aside>
+
+        <section class="panel views">
+          <h2>Views</h2>
+          <div class="grid">
+            <article class="view">
+              <h3>grayscale source</h3>
+              <canvas id="sourceCanvas" width="640" height="640"></canvas>
+            </article>
+            <article class="view">
+              <h3>simd wasm particle output</h3>
+              <canvas id="outputCanvas" width="640" height="640"></canvas>
+            </article>
+          </div>
+        </section>
+      </section>
+    </main>
+
+    <script>
+      const FIELD_WASM_FILE = "./image_stipple_field_f32.wasm";
+      const MOTION_WASM_FILE = "./image_stipple_force_f32.wasm";
+
+      const CONTROL_SPECS = [
+        { key: "cellSize", label: "Cell Size", min: 4, max: 14, step: 1, digits: 0 },
+        { key: "dotScale", label: "Dot Scale", min: 0.6, max: 1.5, step: 0.01, digits: 2 },
+        { key: "dither", label: "Dither Strength", min: 0, max: 1.4, step: 0.01, digits: 2 },
+        { key: "jitter", label: "Dot Jitter", min: 0, max: 0.9, step: 0.01, digits: 2 },
+        { key: "repelRadius", label: "Repel Radius", min: 24, max: 140, step: 1, digits: 0 },
+        { key: "repelStrength", label: "Repel Strength", min: 8, max: 120, step: 1, digits: 0 },
+        { key: "pulseSpeed", label: "Pulse Speed", min: 140, max: 680, step: 1, digits: 0 },
+        { key: "pulseWidth", label: "Pulse Width", min: 10, max: 120, step: 1, digits: 0 },
+      ];
+
+      const DEFAULTS = {
+        cellSize: 7,
+        dotScale: 1.08,
+        dither: 0.78,
+        jitter: 0.34,
+        repelRadius: 74,
+        repelStrength: 48,
+        pulseSpeed: 360,
+        pulseWidth: 34,
+      };
+
+      const BAYER_8 = [
+        0, 48, 12, 60, 3, 51, 15, 63,
+        32, 16, 44, 28, 35, 19, 47, 31,
+        8, 56, 4, 52, 11, 59, 7, 55,
+        40, 24, 36, 20, 43, 27, 39, 23,
+        2, 50, 14, 62, 1, 49, 13, 61,
+        34, 18, 46, 30, 33, 17, 45, 29,
+        10, 58, 6, 54, 9, 57, 5, 53,
+        42, 26, 38, 22, 41, 25, 37, 21,
+      ];
+
+      const upload = document.getElementById("upload");
+      const reset_image_button = document.getElementById("resetImage");
+      const reset_controls_button = document.getElementById("resetControls");
+      const download_button = document.getElementById("download");
+      const status = document.getElementById("status");
+      const controls_root = document.getElementById("controls");
+      const source_canvas = document.getElementById("sourceCanvas");
+      const output_canvas = document.getElementById("outputCanvas");
+      const source_ctx = source_canvas.getContext("2d", { willReadFrequently: true });
+      const output_ctx = output_canvas.getContext("2d");
+      const offscreen_canvas = document.createElement("canvas");
+      const offscreen_ctx = offscreen_canvas.getContext("2d", { willReadFrequently: true });
+
+      const state = {
+        values: { ...DEFAULTS },
+        gray_data: null,
+        sim: null,
+        pointer: { active: false, x: 0, y: 0 },
+        pulse: null,
+        last_frame_at: null,
+      };
+
+      const field_wasm = {
+        memory: null,
+        leaves: null,
+        count: 0,
+        ptrs: {},
+      };
+
+      const motion_wasm = {
+        memory: null,
+        leaves: null,
+        count: 0,
+        ptrs: {},
+      };
+
+      function clamp(value, min, max) {
+        return Math.min(max, Math.max(min, value));
+      }
+
+      function smoothstep(edge_0, edge_1, value) {
+        const t = clamp((value - edge_0) / (edge_1 - edge_0), 0, 1);
+        return t * t * (3 - 2 * t);
+      }
+
+      function hash_2d(x, y) {
+        const s = Math.sin(x * 127.1 + y * 311.7) * 43758.5453123;
+        return s - Math.floor(s);
+      }
+
+      function align_16(value) {
+        return (value + 15) & ~15;
+      }
+
+      function ensure_memory(memory, bytes) {
+        const page = 65536;
+        const have = memory.buffer.byteLength;
+        if (have >= bytes) {
+          return;
+        }
+        memory.grow(Math.ceil((bytes - have) / page));
+      }
+
+      function float_view(memory, ptr, count) {
+        return new Float32Array(memory.buffer, ptr, count);
+      }
+
+      function i64_view(memory, ptr, count) {
+        return new BigInt64Array(memory.buffer, ptr, count);
+      }
+
+      function build_buffer_layout(specs) {
+        const ptrs = {};
+        let cursor = 0;
+        for (const spec of specs) {
+          cursor = align_16(cursor);
+          ptrs[spec.name] = cursor;
+          cursor += spec.count * spec.bytes;
+        }
+        return { ptrs, total: align_16(cursor) };
+      }
+
+      function draw_rounded_rect(ctx, x, y, width, height, radius) {
+        const r = Math.min(radius, width * 0.5, height * 0.5);
+        ctx.beginPath();
+        ctx.moveTo(x + r, y);
+        ctx.arcTo(x + width, y, x + width, y + height, r);
+        ctx.arcTo(x + width, y + height, x, y + height, r);
+        ctx.arcTo(x, y + height, x, y, r);
+        ctx.arcTo(x, y, x + width, y, r);
+        ctx.closePath();
+      }
+
+      function resize_canvases(width, height) {
+        source_canvas.width = width;
+        source_canvas.height = height;
+        output_canvas.width = width;
+        output_canvas.height = height;
+        offscreen_canvas.width = width;
+        offscreen_canvas.height = height;
+      }
+
+      function create_control(spec) {
+        const wrap = document.createElement("div");
+        wrap.className = "control";
+        const label = document.createElement("label");
+        label.htmlFor = `slider-${spec.key}`;
+        label.textContent = spec.label;
+        const output = document.createElement("output");
+        output.id = `value-${spec.key}`;
+        const input = document.createElement("input");
+        input.id = `slider-${spec.key}`;
+        input.type = "range";
+        input.min = String(spec.min);
+        input.max = String(spec.max);
+        input.step = String(spec.step);
+        input.value = String(state.values[spec.key]);
+        output.textContent = Number(input.value).toFixed(spec.digits);
+        input.addEventListener("input", () => {
+          state.values[spec.key] = Number(input.value);
+          output.textContent = Number(input.value).toFixed(spec.digits);
+          if (
+            spec.key === "cellSize" ||
+            spec.key === "dotScale" ||
+            spec.key === "dither" ||
+            spec.key === "jitter"
+          ) {
+            rebuild_particles();
+          }
+        });
+        wrap.appendChild(label);
+        wrap.appendChild(output);
+        wrap.appendChild(input);
+        controls_root.appendChild(wrap);
+      }
+
+      function sync_controls() {
+        for (const spec of CONTROL_SPECS) {
+          const input = document.getElementById(`slider-${spec.key}`);
+          const output = document.getElementById(`value-${spec.key}`);
+          input.value = String(state.values[spec.key]);
+          output.textContent = Number(input.value).toFixed(spec.digits);
+        }
+      }
+
+      for (const spec of CONTROL_SPECS) {
+        create_control(spec);
+      }
+
+      function set_status(message) {
+        status.textContent = message;
+      }
+
+      function fit_image_dimensions(width, height) {
+        const max_edge = 720;
+        const scale = Math.min(max_edge / Math.max(width, height), 1);
+        return {
+          width: Math.max(1, Math.round(width * scale)),
+          height: Math.max(1, Math.round(height * scale)),
+        };
+      }
+
+      function draw_fallback_image() {
+        resize_canvases(640, 640);
+        offscreen_ctx.clearRect(0, 0, offscreen_canvas.width, offscreen_canvas.height);
+        offscreen_ctx.fillStyle = "#f4f0e6";
+        offscreen_ctx.fillRect(0, 0, offscreen_canvas.width, offscreen_canvas.height);
+
+        const pad = 82;
+        const box_size = offscreen_canvas.width - pad * 2;
+        draw_rounded_rect(offscreen_ctx, pad, pad, box_size, box_size, 112);
+        offscreen_ctx.fillStyle = "#111317";
+        offscreen_ctx.fill();
+
+        offscreen_ctx.save();
+        draw_rounded_rect(offscreen_ctx, pad, pad, box_size, box_size, 112);
+        offscreen_ctx.clip();
+
+        const circle_x = offscreen_canvas.width * 0.62;
+        const circle_y = offscreen_canvas.height * 0.39;
+        const circle_r = offscreen_canvas.width * 0.22;
+
+        offscreen_ctx.fillStyle = "#f8f5ee";
+        offscreen_ctx.beginPath();
+        offscreen_ctx.arc(circle_x, circle_y, circle_r, 0, Math.PI * 2);
+        offscreen_ctx.fill();
+
+        const moon_shade = offscreen_ctx.createRadialGradient(
+          circle_x - circle_r * 0.2,
+          circle_y - circle_r * 0.2,
+          circle_r * 0.1,
+          circle_x,
+          circle_y,
+          circle_r * 1.1
+        );
+        moon_shade.addColorStop(0, "rgba(255,255,255,0)");
+        moon_shade.addColorStop(1, "rgba(0,0,0,0.2)");
+        offscreen_ctx.fillStyle = moon_shade;
+        offscreen_ctx.beginPath();
+        offscreen_ctx.arc(circle_x, circle_y, circle_r * 1.06, 0, Math.PI * 2);
+        offscreen_ctx.fill();
+
+        offscreen_ctx.save();
+        offscreen_ctx.beginPath();
+        offscreen_ctx.arc(circle_x, circle_y, circle_r * 0.98, 0, Math.PI * 2);
+        offscreen_ctx.clip();
+        offscreen_ctx.strokeStyle = "#111317";
+        offscreen_ctx.lineWidth = 24;
+        for (let i = -6; i < 7; i += 1) {
+          const x0 = circle_x - circle_r * 1.35 + i * 34;
+          const y0 = circle_y + circle_r * 1.2;
+          const x1 = x0 + circle_r * 1.7;
+          const y1 = circle_y - circle_r * 1.5;
+          offscreen_ctx.beginPath();
+          offscreen_ctx.moveTo(x0, y0);
+          offscreen_ctx.lineTo(x1, y1);
+          offscreen_ctx.stroke();
+        }
+        offscreen_ctx.restore();
+
+        const trail_gradient = offscreen_ctx.createLinearGradient(
+          offscreen_canvas.width * 0.25,
+          offscreen_canvas.height * 0.68,
+          offscreen_canvas.width * 0.52,
+          offscreen_canvas.height * 0.34
+        );
+        trail_gradient.addColorStop(0, "rgba(255,255,255,0.92)");
+        trail_gradient.addColorStop(1, "rgba(255,255,255,0.18)");
+        offscreen_ctx.strokeStyle = trail_gradient;
+        offscreen_ctx.lineWidth = 18;
+        offscreen_ctx.lineCap = "round";
+        for (let i = 0; i < 4; i += 1) {
+          offscreen_ctx.beginPath();
+          offscreen_ctx.moveTo(180 + i * 16, 455 - i * 8);
+          offscreen_ctx.lineTo(320 + i * 28, 335 - i * 10);
+          offscreen_ctx.stroke();
+        }
+        offscreen_ctx.restore();
+
+        apply_grayscale();
+      }
+
+      function apply_grayscale() {
+        const width = offscreen_canvas.width;
+        const height = offscreen_canvas.height;
+        const image = offscreen_ctx.getImageData(0, 0, width, height);
+        const data = image.data;
+        for (let i = 0; i < data.length; i += 4) {
+          const r = data[i];
+          const g = data[i + 1];
+          const b = data[i + 2];
+          const luminance = Math.pow((0.299 * r + 0.587 * g + 0.114 * b) / 255, 0.92) * 255;
+          data[i] = luminance;
+          data[i + 1] = luminance;
+          data[i + 2] = luminance;
+        }
+        state.gray_data = image;
+        source_ctx.putImageData(image, 0, 0);
+        rebuild_particles();
+      }
+
+      function draw_uploaded_image(image) {
+        const size = fit_image_dimensions(image.width, image.height);
+        resize_canvases(size.width, size.height);
+        offscreen_ctx.clearRect(0, 0, size.width, size.height);
+        offscreen_ctx.fillStyle = "#f4f0e6";
+        offscreen_ctx.fillRect(0, 0, size.width, size.height);
+        offscreen_ctx.drawImage(image, 0, 0, size.width, size.height);
+        apply_grayscale();
+      }
+
+      function sample_index_at(width, height, x, y) {
+        const sx = clamp(Math.round(x), 0, width - 1);
+        const sy = clamp(Math.round(y), 0, height - 1);
+        return BigInt(sy * width + sx);
+      }
+
+      function sample_stipple_inputs() {
+        if (!state.gray_data) {
+          return null;
+        }
+
+        const width = source_canvas.width;
+        const height = source_canvas.height;
+        const cell_size = state.values.cellSize;
+        const jitter_amount = cell_size * state.values.jitter;
+        const data = state.gray_data.data;
+        const pixels = new Float32Array(width * height);
+        const base_x = [];
+        const base_y = [];
+        const sample_0 = [];
+        const sample_1 = [];
+        const sample_2 = [];
+        const threshold = [];
+        const jitter_x = [];
+        const jitter_y = [];
+        const cluster_dir_x = [];
+        const cluster_dir_y = [];
+        const cluster_offset = [];
+
+        for (let i = 0; i < pixels.length; i += 1) {
+          pixels[i] = data[i * 4];
+        }
+
+        for (let y = cell_size * 0.5, gy = 0; y < height; y += cell_size, gy += 1) {
+          for (let x = cell_size * 0.5, gx = 0; x < width; x += cell_size, gx += 1) {
+            const angle = hash_2d(gx + 11.3, gy + 8.6) * Math.PI * 2;
+
+            sample_0.push(sample_index_at(width, height, x, y));
+            sample_1.push(sample_index_at(width, height, x + cell_size * 0.24, y - cell_size * 0.18));
+            sample_2.push(sample_index_at(width, height, x - cell_size * 0.2, y + cell_size * 0.2));
+            threshold.push(BAYER_8[(gy & 7) * 8 + (gx & 7)] / 63);
+            base_x.push(x);
+            base_y.push(y);
+            jitter_x.push((hash_2d(gx + 1.7, gy + 2.3) - 0.5) * jitter_amount);
+            jitter_y.push((hash_2d(gx + 10.2, gy + 4.4) - 0.5) * jitter_amount);
+            cluster_dir_x.push(Math.cos(angle));
+            cluster_dir_y.push(Math.sin(angle));
+            cluster_offset.push(0.2 + hash_2d(gx + 3.4, gy + 9.1) * 0.34);
+          }
+        }
+
+        return {
+          width,
+          height,
+          count: base_x.length,
+          pixels,
+          sample_0: BigInt64Array.from(sample_0),
+          sample_1: BigInt64Array.from(sample_1),
+          sample_2: BigInt64Array.from(sample_2),
+          threshold: Float32Array.from(threshold),
+          base_x: Float32Array.from(base_x),
+          base_y: Float32Array.from(base_y),
+          jitter_x: Float32Array.from(jitter_x),
+          jitter_y: Float32Array.from(jitter_y),
+          cluster_dir_x: Float32Array.from(cluster_dir_x),
+          cluster_dir_y: Float32Array.from(cluster_dir_y),
+          cluster_offset: Float32Array.from(cluster_offset),
+        };
+      }
+
+      function configure_field_buffers(inputs) {
+        const count = inputs.count;
+        field_wasm.count = count;
+        const layout = build_buffer_layout([
+          { name: "pixels", count: inputs.pixels.length, bytes: 4 },
+          { name: "sample_0", count, bytes: 8 },
+          { name: "sample_1", count, bytes: 8 },
+          { name: "sample_2", count, bytes: 8 },
+          { name: "threshold", count, bytes: 4 },
+          { name: "base_x", count, bytes: 4 },
+          { name: "base_y", count, bytes: 4 },
+          { name: "jitter_x", count, bytes: 4 },
+          { name: "jitter_y", count, bytes: 4 },
+          { name: "cluster_dir_x", count, bytes: 4 },
+          { name: "cluster_dir_y", count, bytes: 4 },
+          { name: "cluster_offset", count, bytes: 4 },
+          { name: "home_x", count, bytes: 4 },
+          { name: "home_y", count, bytes: 4 },
+          { name: "radius", count, bytes: 4 },
+          { name: "alpha", count, bytes: 4 },
+          { name: "cluster_scale", count, bytes: 4 },
+          { name: "cluster_dx", count, bytes: 4 },
+          { name: "cluster_dy", count, bytes: 4 },
+        ]);
+        field_wasm.ptrs = layout.ptrs;
+        ensure_memory(field_wasm.memory, layout.total);
+
+        float_view(field_wasm.memory, field_wasm.ptrs.pixels, inputs.pixels.length).set(inputs.pixels);
+        i64_view(field_wasm.memory, field_wasm.ptrs.sample_0, count).set(inputs.sample_0);
+        i64_view(field_wasm.memory, field_wasm.ptrs.sample_1, count).set(inputs.sample_1);
+        i64_view(field_wasm.memory, field_wasm.ptrs.sample_2, count).set(inputs.sample_2);
+        float_view(field_wasm.memory, field_wasm.ptrs.threshold, count).set(inputs.threshold);
+        float_view(field_wasm.memory, field_wasm.ptrs.base_x, count).set(inputs.base_x);
+        float_view(field_wasm.memory, field_wasm.ptrs.base_y, count).set(inputs.base_y);
+        float_view(field_wasm.memory, field_wasm.ptrs.jitter_x, count).set(inputs.jitter_x);
+        float_view(field_wasm.memory, field_wasm.ptrs.jitter_y, count).set(inputs.jitter_y);
+        float_view(field_wasm.memory, field_wasm.ptrs.cluster_dir_x, count).set(inputs.cluster_dir_x);
+        float_view(field_wasm.memory, field_wasm.ptrs.cluster_dir_y, count).set(inputs.cluster_dir_y);
+        float_view(field_wasm.memory, field_wasm.ptrs.cluster_offset, count).set(inputs.cluster_offset);
+      }
+
+      function run_field_leaf(leaf_name, count, inputs) {
+        field_wasm.leaves[leaf_name](
+          state.values.cellSize,
+          state.values.dotScale,
+          state.values.dither,
+          field_wasm.ptrs.pixels,
+          inputs.pixels.length,
+          field_wasm.ptrs.sample_0,
+          count,
+          field_wasm.ptrs.sample_1,
+          count,
+          field_wasm.ptrs.sample_2,
+          count,
+          field_wasm.ptrs.threshold,
+          count,
+          field_wasm.ptrs.base_x,
+          count,
+          field_wasm.ptrs.base_y,
+          count,
+          field_wasm.ptrs.jitter_x,
+          count,
+          field_wasm.ptrs.jitter_y,
+          count,
+          field_wasm.ptrs.cluster_dir_x,
+          count,
+          field_wasm.ptrs.cluster_dir_y,
+          count,
+          field_wasm.ptrs.cluster_offset,
+          count,
+          field_wasm.ptrs[leaf_name],
+          count
+        );
+      }
+
+      function build_sim_from_field(inputs) {
+        const count = inputs.count;
+        if (!field_wasm.memory || !field_wasm.leaves || count === 0) {
+          state.sim = null;
+          return;
+        }
+
+        configure_field_buffers(inputs);
+        run_field_leaf("home_x", count, inputs);
+        run_field_leaf("home_y", count, inputs);
+        run_field_leaf("radius", count, inputs);
+        run_field_leaf("alpha", count, inputs);
+        run_field_leaf("cluster_scale", count, inputs);
+        run_field_leaf("cluster_dx", count, inputs);
+        run_field_leaf("cluster_dy", count, inputs);
+
+        const home_x = Float32Array.from(float_view(field_wasm.memory, field_wasm.ptrs.home_x, count));
+        const home_y = Float32Array.from(float_view(field_wasm.memory, field_wasm.ptrs.home_y, count));
+
+        state.sim = {
+          count,
+          home_x,
+          home_y,
+          pos_x: Float32Array.from(home_x),
+          pos_y: Float32Array.from(home_y),
+          vel_x: new Float32Array(count),
+          vel_y: new Float32Array(count),
+          radius: Float32Array.from(float_view(field_wasm.memory, field_wasm.ptrs.radius, count)),
+          alpha: Float32Array.from(float_view(field_wasm.memory, field_wasm.ptrs.alpha, count)),
+          cluster_scale: Float32Array.from(
+            float_view(field_wasm.memory, field_wasm.ptrs.cluster_scale, count)
+          ),
+          cluster_dx: Float32Array.from(float_view(field_wasm.memory, field_wasm.ptrs.cluster_dx, count)),
+          cluster_dy: Float32Array.from(float_view(field_wasm.memory, field_wasm.ptrs.cluster_dy, count)),
+        };
+        state.pulse = null;
+        state.last_frame_at = null;
+      }
+
+      function configure_motion_buffers() {
+        if (!state.sim || !motion_wasm.memory) {
+          return;
+        }
+
+        const count = state.sim.count;
+        motion_wasm.count = count;
+        if (count === 0) {
+          return;
+        }
+
+        const layout = build_buffer_layout([
+          { name: "home_x", count, bytes: 4 },
+          { name: "home_y", count, bytes: 4 },
+          { name: "current_x", count, bytes: 4 },
+          { name: "current_y", count, bytes: 4 },
+          { name: "current_vx", count, bytes: 4 },
+          { name: "current_vy", count, bytes: 4 },
+          { name: "next_x", count, bytes: 4 },
+          { name: "next_y", count, bytes: 4 },
+          { name: "next_vx", count, bytes: 4 },
+          { name: "next_vy", count, bytes: 4 },
+        ]);
+        motion_wasm.ptrs = layout.ptrs;
+        ensure_memory(motion_wasm.memory, layout.total);
+
+        float_view(motion_wasm.memory, motion_wasm.ptrs.home_x, count).set(state.sim.home_x);
+        float_view(motion_wasm.memory, motion_wasm.ptrs.home_y, count).set(state.sim.home_y);
+        float_view(motion_wasm.memory, motion_wasm.ptrs.current_x, count).set(state.sim.pos_x);
+        float_view(motion_wasm.memory, motion_wasm.ptrs.current_y, count).set(state.sim.pos_y);
+        float_view(motion_wasm.memory, motion_wasm.ptrs.current_vx, count).set(state.sim.vel_x);
+        float_view(motion_wasm.memory, motion_wasm.ptrs.current_vy, count).set(state.sim.vel_y);
+        float_view(motion_wasm.memory, motion_wasm.ptrs.next_x, count).fill(0);
+        float_view(motion_wasm.memory, motion_wasm.ptrs.next_y, count).fill(0);
+        float_view(motion_wasm.memory, motion_wasm.ptrs.next_vx, count).fill(0);
+        float_view(motion_wasm.memory, motion_wasm.ptrs.next_vy, count).fill(0);
+      }
+
+      function rebuild_particles() {
+        if (!state.gray_data) {
+          state.sim = null;
+          field_wasm.count = 0;
+          motion_wasm.count = 0;
+          return;
+        }
+        if (!field_wasm.memory || !motion_wasm.memory) {
+          set_status("waiting for simd wasm kernels...");
+          return;
+        }
+
+        const inputs = sample_stipple_inputs();
+        if (!inputs) {
+          return;
+        }
+
+        build_sim_from_field(inputs);
+        configure_motion_buffers();
+        if (!state.sim) {
+          return;
+        }
+
+        set_status(
+          `${inputs.width}x${inputs.height} | ${inputs.count.toLocaleString()} cells | simd gather field + motion`
+        );
+      }
+
+      function swap_motion_buffers() {
+        [motion_wasm.ptrs.current_x, motion_wasm.ptrs.next_x] = [
+          motion_wasm.ptrs.next_x,
+          motion_wasm.ptrs.current_x,
+        ];
+        [motion_wasm.ptrs.current_y, motion_wasm.ptrs.next_y] = [
+          motion_wasm.ptrs.next_y,
+          motion_wasm.ptrs.current_y,
+        ];
+        [motion_wasm.ptrs.current_vx, motion_wasm.ptrs.next_vx] = [
+          motion_wasm.ptrs.next_vx,
+          motion_wasm.ptrs.current_vx,
+        ];
+        [motion_wasm.ptrs.current_vy, motion_wasm.ptrs.next_vy] = [
+          motion_wasm.ptrs.next_vy,
+          motion_wasm.ptrs.current_vy,
+        ];
+      }
+
+      function get_pointer_position(event) {
+        const rect = output_canvas.getBoundingClientRect();
+        return {
+          x: ((event.clientX - rect.left) / rect.width) * output_canvas.width,
+          y: ((event.clientY - rect.top) / rect.height) * output_canvas.height,
+        };
+      }
+
+      function current_pulse(now) {
+        if (!state.pulse) {
+          return { active: 0, x: 0, y: 0, age: 0 };
+        }
+        const age = (now - state.pulse.start) * 0.001;
+        if (age > 4.5) {
+          state.pulse = null;
+          return { active: 0, x: 0, y: 0, age: 0 };
+        }
+        return { active: 1, x: state.pulse.x, y: state.pulse.y, age };
+      }
+
+      function add_pulse(x, y, now) {
+        state.pulse = { x, y, start: now };
+      }
+
+      function draw_particles(now) {
+        if (!state.sim || motion_wasm.count === 0) {
+          return;
+        }
+
+        const width = output_canvas.width;
+        const height = output_canvas.height;
+        const pos_x = float_view(motion_wasm.memory, motion_wasm.ptrs.current_x, motion_wasm.count);
+        const pos_y = float_view(motion_wasm.memory, motion_wasm.ptrs.current_y, motion_wasm.count);
+        const vel_x = float_view(motion_wasm.memory, motion_wasm.ptrs.current_vx, motion_wasm.count);
+        const vel_y = float_view(motion_wasm.memory, motion_wasm.ptrs.current_vy, motion_wasm.count);
+        const pulse = current_pulse(now);
+
+        const paper = output_ctx.createRadialGradient(
+          width * 0.5,
+          height * 0.35,
+          width * 0.12,
+          width * 0.5,
+          height * 0.45,
+          width * 0.72
+        );
+        paper.addColorStop(0, "#faf7ee");
+        paper.addColorStop(1, "#ece5d6");
+        output_ctx.fillStyle = paper;
+        output_ctx.fillRect(0, 0, width, height);
+
+        output_ctx.fillStyle = "#101114";
+        for (let i = 0; i < motion_wasm.count; i += 1) {
+          const base_radius = state.sim.radius[i];
+          const base_alpha = state.sim.alpha[i];
+          if (base_radius < 0.08 || base_alpha < 0.02) {
+            continue;
+          }
+
+          const x = pos_x[i];
+          const y = pos_y[i];
+          const speed = Math.hypot(vel_x[i], vel_y[i]);
+          let pulse_influence = 0;
+          let pointer_influence = 0;
+
+          if (state.pointer.active) {
+            const dx = x - state.pointer.x;
+            const dy = y - state.pointer.y;
+            const dist = Math.hypot(dx, dy);
+            if (dist < state.values.repelRadius) {
+              pointer_influence = 1 - dist / state.values.repelRadius;
+            }
+          }
+
+          if (pulse.active) {
+            const dx = x - pulse.x;
+            const dy = y - pulse.y;
+            const dist = Math.hypot(dx, dy);
+            const wave_front = pulse.age * state.values.pulseSpeed;
+            const delta = Math.abs(dist - wave_front);
+            if (delta < state.values.pulseWidth * 1.8) {
+              pulse_influence = 1 - delta / (state.values.pulseWidth * 1.8);
+            }
+          }
+
+          const radius_scale =
+            1 + pulse_influence * 0.42 - pointer_influence * 0.16 + clamp(speed * 0.015, 0, 0.3);
+          const alpha =
+            base_alpha +
+            pulse_influence * 0.2 -
+            pointer_influence * 0.08 +
+            clamp(speed * 0.004, 0, 0.16);
+          const radius = Math.max(0.5, base_radius * radius_scale);
+
+          output_ctx.globalAlpha = clamp(alpha, 0.05, 1);
+          output_ctx.beginPath();
+          output_ctx.arc(x, y, radius, 0, Math.PI * 2);
+          output_ctx.fill();
+
+          output_ctx.globalAlpha = clamp(alpha * 0.24, 0.04, 0.28);
+          output_ctx.beginPath();
+          output_ctx.arc(
+            x + state.sim.cluster_dx[i] * radius,
+            y + state.sim.cluster_dy[i] * radius,
+            radius * state.sim.cluster_scale[i],
+            0,
+            Math.PI * 2
+          );
+          output_ctx.fill();
+        }
+
+        output_ctx.globalAlpha = 1;
+
+        if (state.pointer.active) {
+          output_ctx.strokeStyle = "rgba(22, 24, 29, 0.12)";
+          output_ctx.lineWidth = 1.5;
+          output_ctx.beginPath();
+          output_ctx.arc(state.pointer.x, state.pointer.y, state.values.repelRadius, 0, Math.PI * 2);
+          output_ctx.stroke();
+        }
+      }
+
+      function run_motion_leaf(leaf_name, out_name, pointer, pulse, dt, count) {
+        motion_wasm.leaves[leaf_name](
+          dt,
+          pointer.x,
+          pointer.y,
+          pointer.active,
+          state.values.repelRadius,
+          state.values.repelStrength,
+          pulse.x,
+          pulse.y,
+          pulse.age,
+          pulse.active,
+          state.values.pulseSpeed,
+          state.values.pulseWidth,
+          motion_wasm.ptrs.home_x,
+          count,
+          motion_wasm.ptrs.home_y,
+          count,
+          motion_wasm.ptrs.current_x,
+          count,
+          motion_wasm.ptrs.current_y,
+          count,
+          motion_wasm.ptrs.current_vx,
+          count,
+          motion_wasm.ptrs.current_vy,
+          count,
+          motion_wasm.ptrs[out_name],
+          count
+        );
+      }
+
+      function step_simulation(now, dt) {
+        if (!state.sim || !motion_wasm.memory || motion_wasm.count === 0) {
+          return;
+        }
+
+        const pointer = state.pointer.active
+          ? { active: 1, x: state.pointer.x, y: state.pointer.y }
+          : { active: 0, x: 0, y: 0 };
+        const pulse = current_pulse(now);
+        const count = motion_wasm.count;
+
+        run_motion_leaf("x", "next_x", pointer, pulse, dt, count);
+        run_motion_leaf("y", "next_y", pointer, pulse, dt, count);
+        run_motion_leaf("vx", "next_vx", pointer, pulse, dt, count);
+        run_motion_leaf("vy", "next_vy", pointer, pulse, dt, count);
+
+        swap_motion_buffers();
+      }
+
+      function render(now) {
+        requestAnimationFrame(render);
+        if (!motion_wasm.memory || !state.sim) {
+          return;
+        }
+
+        const dt =
+          state.last_frame_at == null
+            ? 1 / 60
+            : clamp((now - state.last_frame_at) * 0.001, 1 / 240, 0.05);
+        state.last_frame_at = now;
+
+        step_simulation(now, dt);
+        draw_particles(now);
+      }
+
+      async function load_kernel(url, leaf_names) {
+        const response = await fetch(url);
+        if (!response.ok) {
+          throw new Error(`failed to fetch ${url} (${response.status})`);
+        }
+        const bytes = await response.arrayBuffer();
+        const { instance } = await WebAssembly.instantiate(bytes, {});
+        const memory = instance.exports.memory;
+        if (!(memory instanceof WebAssembly.Memory)) {
+          throw new Error(`expected WebAssembly memory export in ${url}`);
+        }
+        const leaves = {};
+        for (const name of leaf_names) {
+          const export_name = `main$${name}`;
+          const leaf = instance.exports[export_name];
+          if (typeof leaf !== "function") {
+            throw new Error(`missing leaf export ${export_name} in ${url}`);
+          }
+          leaves[name] = leaf;
+        }
+        return { memory, leaves };
+      }
+
+      async function load_kernels() {
+        set_status("loading simd wasm kernels...");
+        const [field_kernel, motion_kernel] = await Promise.all([
+          load_kernel(FIELD_WASM_FILE, [
+            "home_x",
+            "home_y",
+            "radius",
+            "alpha",
+            "cluster_scale",
+            "cluster_dx",
+            "cluster_dy",
+          ]),
+          load_kernel(MOTION_WASM_FILE, ["x", "y", "vx", "vy"]),
+        ]);
+
+        field_wasm.memory = field_kernel.memory;
+        field_wasm.leaves = field_kernel.leaves;
+        motion_wasm.memory = motion_kernel.memory;
+        motion_wasm.leaves = motion_kernel.leaves;
+
+        rebuild_particles();
+        set_status("simd wasm gather field + motion ready");
+      }
+
+      output_canvas.addEventListener("pointermove", (event) => {
+        const point = get_pointer_position(event);
+        state.pointer.active = true;
+        state.pointer.x = point.x;
+        state.pointer.y = point.y;
+      });
+
+      output_canvas.addEventListener("pointerleave", () => {
+        state.pointer.active = false;
+      });
+
+      output_canvas.addEventListener("pointerdown", (event) => {
+        const point = get_pointer_position(event);
+        state.pointer.active = true;
+        state.pointer.x = point.x;
+        state.pointer.y = point.y;
+        add_pulse(point.x, point.y, performance.now());
+      });
+
+      upload.addEventListener("change", async () => {
+        const file = upload.files?.[0];
+        if (!file) {
+          return;
+        }
+        const url = URL.createObjectURL(file);
+        set_status(`loading ${file.name}...`);
+        try {
+          const image = new Image();
+          image.decoding = "async";
+          image.src = url;
+          await image.decode();
+          draw_uploaded_image(image);
+        } finally {
+          URL.revokeObjectURL(url);
+        }
+      });
+
+      reset_image_button.addEventListener("click", () => {
+        upload.value = "";
+        draw_fallback_image();
+      });
+
+      reset_controls_button.addEventListener("click", () => {
+        state.values = { ...DEFAULTS };
+        sync_controls();
+        rebuild_particles();
+      });
+
+      download_button.addEventListener("click", () => {
+        const link = document.createElement("a");
+        link.href = output_canvas.toDataURL("image/png");
+        link.download = "simd-stipple-pulse.png";
+        link.click();
+      });
+
+      draw_fallback_image();
+      load_kernels().catch((error) => {
+        set_status(`error: ${error.message}`);
+      });
+      requestAnimationFrame(render);
+    </script>
+  </body>
+</html>

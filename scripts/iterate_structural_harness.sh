@@ -202,21 +202,66 @@ log_metric "json_wasm_prepared_total_ms" "$wasm_prepared_total_ms"
 log_metric "json_wasm_prepared_avg_ms" "$wasm_prepared_avg_ms"
 log_metric "json_wasm_prepared_vs_eval_x1000" "$wasm_prepared_vs_eval_milli"
 
-echo "[harness] tracked nested JSON benchmark"
+echo "[harness] tracked common JSON benchmark suite"
 json_bench_iters=25
 if [ "$mode" = "full" ]; then
   json_bench_iters=100
 fi
 json_bench_out="$artifact_dir/structural_harness_$run_id.json_bench.txt"
-run_step_capture "json_perf.bench.nested" "$json_bench_out" \
-  "$simd_bin" bench json-parser-adt-nested --size 4096 --iters "$json_bench_iters" --no-contract
-json_bench_rust_line="$(grep -m1 '^  rust:' "$json_bench_out" || true)"
-json_bench_wasm_hot_line="$(grep -m1 '^  wasm-hot:' "$json_bench_out" || true)"
-json_bench_wasm_prepared_line="$(grep -m1 '^  wasm-prepared-hot:' "$json_bench_out" || true)"
+run_step_capture "json_perf.bench.common" "$json_bench_out" \
+  "$simd_bin" bench json-common --size 4096 --iters "$json_bench_iters" --no-contract
+json_bench_nested_baseline_line="$(awk '/^json-parser-adt-nested$/{flag=1;next} flag && /^  simd-json:/{print; exit}' "$json_bench_out")"
+json_bench_nested_wasm_hot_line="$(awk '/^json-parser-adt-nested$/{flag=1;next} flag && /^  wasm-hot:/{print; exit}' "$json_bench_out")"
+json_bench_nested_wasm_prepared_line="$(awk '/^json-parser-adt-nested$/{flag=1;next} flag && /^  wasm-prepared-hot:/{print; exit}' "$json_bench_out")"
 printf '[harness] nested json bench: %s | %s | %s\n' \
-  "$json_bench_rust_line" "$json_bench_wasm_hot_line" "$json_bench_wasm_prepared_line"
-printf 'json_bench_iters=%s\njson_bench_rust_line=%s\njson_bench_wasm_hot_line=%s\njson_bench_wasm_prepared_line=%s\n' \
-  "$json_bench_iters" "$json_bench_rust_line" "$json_bench_wasm_hot_line" "$json_bench_wasm_prepared_line" >> "$summary_file"
+  "$json_bench_nested_baseline_line" "$json_bench_nested_wasm_hot_line" "$json_bench_nested_wasm_prepared_line"
+printf 'json_bench_iters=%s\njson_bench_nested_baseline_line=%s\njson_bench_nested_wasm_hot_line=%s\njson_bench_nested_wasm_prepared_line=%s\njson_bench_output=%s\n' \
+  "$json_bench_iters" "$json_bench_nested_baseline_line" "$json_bench_nested_wasm_hot_line" "$json_bench_nested_wasm_prepared_line" "$json_bench_out" >> "$summary_file"
+
+parse_slowdown_x() {
+  line="$1"
+  awk '{
+    for (i = 1; i <= NF; i++) {
+      if ($i ~ /^slowdown=/) {
+        value = $i
+        sub(/^slowdown=/, "", value)
+        sub(/x$/, "", value)
+        print value
+        exit
+      }
+    }
+  }' <<EOF
+$line
+EOF
+}
+
+check_json_case_threshold() {
+  case_name="$1"
+  threshold_x="$2"
+  baseline_line="$(awk -v name="$case_name" '$0 == name {flag=1; next} flag && /^  simd-json:/{print; exit}' "$json_bench_out")"
+  prepared_line="$(awk -v name="$case_name" '$0 == name {flag=1; next} flag && /^  wasm-prepared-hot:/{print; exit}' "$json_bench_out")"
+  if [ -z "$baseline_line" ] || [ -z "$prepared_line" ]; then
+    echo "[harness] missing benchmark lines for $case_name" >&2
+    exit 1
+  fi
+  prepared_slowdown_x="$(parse_slowdown_x "$prepared_line")"
+  if [ -z "$prepared_slowdown_x" ]; then
+    echo "[harness] missing slowdown value for $case_name" >&2
+    exit 1
+  fi
+  awk -v slow="$prepared_slowdown_x" -v threshold="$threshold_x" 'BEGIN { exit !(slow <= threshold + 1e-9) }'
+  printf '[harness] gate %s prepared slowdown=%s threshold=%s\n' "$case_name" "$prepared_slowdown_x" "$threshold_x"
+  printf 'json_bench_gate_%s_prepared_slowdown_x=%s\njson_bench_gate_%s_threshold_x=%s\n' \
+    "$case_name" "$prepared_slowdown_x" "$case_name" "$threshold_x" >> "$summary_file"
+}
+
+if [ "$mode" = "full" ]; then
+  check_json_case_threshold "json-parser-adt-flat-numbers" "1.50"
+  check_json_case_threshold "json-parser-adt-flat-strings" "0.40"
+  check_json_case_threshold "json-parser-adt-object-heavy" "1.10"
+  check_json_case_threshold "json-parser-adt-deep" "1.05"
+  check_json_case_threshold "json-parser-adt-nested" "1.00"
+fi
 
 echo "[harness] evaluator stage profile"
 eval_profile_out="$artifact_dir/structural_harness_$run_id.eval_profile.txt"
@@ -390,7 +435,7 @@ if [ "${profile_cached_parser_fallback_functions:-0}" -ne 0 ]; then
 fi
 
 if [ "$mode" = "full" ]; then
-  prepared_slowdown="$(printf '%s\n' "$json_bench_wasm_prepared_line" | sed -n 's/.*slowdown=\([0-9.]*\)x.*/\1/p')"
+  prepared_slowdown="$(printf '%s\n' "$json_bench_nested_wasm_prepared_line" | sed -n 's/.*slowdown=\([0-9.]*\)x.*/\1/p')"
   if [ -n "$prepared_slowdown" ] && awk "BEGIN { exit !($prepared_slowdown <= 1.25) }"; then
     :
   else

@@ -1,0 +1,15 @@
+enum Boxed =
+  | Box i64[*]
+
+sum_seq : i64[*] -> i64
+sum_seq [] = 0
+sum_seq [x, ...xs] = x + sum_seq xs
+
+main : i64[*] -> i64[*]
+main xs = [sum_seq xs, ...xs]
+
+main_boxed : i64[*] -> i64
+main_boxed xs = sum_boxed (Box xs)
+
+sum_boxed : Boxed -> i64
+sum_boxed (Box xs) = sum_seq xs

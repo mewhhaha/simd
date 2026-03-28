@@ -666,6 +666,17 @@ fn collect_expr_local_types(expr: &TypedExpr, map: &mut BTreeMap<String, Vec<Typ
         | TypedExprKind::Char(_)
         | TypedExprKind::String(_)
         | TypedExprKind::TypeToken(_) => {}
+        TypedExprKind::Seq(items) => {
+            for item in items {
+                collect_expr_local_types(item, map);
+            }
+        }
+        TypedExprKind::SeqSplice { prefix, tail } => {
+            for item in prefix {
+                collect_expr_local_types(item, map);
+            }
+            collect_expr_local_types(tail, map);
+        }
         TypedExprKind::Lambda { body, .. } => collect_expr_local_types(body, map),
         TypedExprKind::Let { bindings, body } => {
             for binding in bindings {
@@ -688,6 +699,10 @@ fn collect_expr_local_types(expr: &TypedExpr, map: &mut BTreeMap<String, Vec<Typ
         }
         TypedExprKind::Project { base, .. } | TypedExprKind::TupleProject { base, .. } => {
             collect_expr_local_types(base, map)
+        }
+        TypedExprKind::Index { base, index, .. } => {
+            collect_expr_local_types(base, map);
+            collect_expr_local_types(index, map);
         }
         TypedExprKind::RecordUpdate { base, fields } => {
             collect_expr_local_types(base, map);
